@@ -8,6 +8,8 @@ import http.server
 import json
 import os
 import secrets
+import shlex
+import shutil
 import subprocess
 import time
 import urllib.parse
@@ -15,14 +17,26 @@ import urllib.parse
 # --- Config ---
 SECRET_KEY = os.environ.get("TTYD_SECRET", secrets.token_hex(32))
 SESSION_MAX_AGE = 86400  # 24 hours
-PORT = 7682
+PORT = int(os.environ.get("AUTH_PORT", "7682"))
+
+SSHPASS_BIN = (
+    os.environ.get("SSHPASS_BIN")
+    or shutil.which("sshpass")
+    or "/usr/local/bin/sshpass"
+)
+SSH_BIN = os.environ.get("SSH_BIN") or shutil.which("ssh") or "/usr/bin/ssh"
+TTYD_BIN = (
+    os.environ.get("TTYD_BIN")
+    or shutil.which("ttyd")
+    or "/usr/local/bin/ttyd"
+)
 
 
 def authenticate(username, password):
     """Authenticate a user by attempting SSH to localhost with sshpass."""
     try:
         result = subprocess.run(
-            ["sshpass", "-p", password, "ssh",
+            [SSHPASS_BIN, "-p", password, SSH_BIN,
              "-o", "StrictHostKeyChecking=no",
              "-o", "ConnectTimeout=5",
              "-o", "PreferredAuthentications=password",
@@ -31,7 +45,8 @@ def authenticate(username, password):
             capture_output=True, text=True, timeout=10
         )
         return result.returncode == 0 and "ok" in result.stdout
-    except Exception:
+    except Exception as e:
+        print(f"authenticate error: {e}", flush=True)
         return False
 
 LOGIN_HTML = """<!DOCTYPE html>
@@ -1109,6 +1124,7 @@ function sendKeyToTerminal(key, opts) {
       keyCode: opts.keyCode || 0,
       ctrlKey: !!opts.ctrlKey || modCtrl,
       altKey: !!opts.altKey || modAlt,
+      shiftKey: !!opts.shiftKey,
       bubbles: true,
       cancelable: true
     });
@@ -1117,6 +1133,19 @@ function sendKeyToTerminal(key, opts) {
   // Reset one-shot modifiers
   if (modCtrl) { modCtrl = false; document.getElementById('modCtrl').classList.remove('active'); }
   if (modAlt) { modAlt = false; document.getElementById('modAlt').classList.remove('active'); }
+}
+
+function getCharKeyOptions(ch) {
+  const map = {
+    '/': { code: 'Slash', keyCode: 191 },
+    '\\\\': { code: 'Backslash', keyCode: 220 },
+    '-': { code: 'Minus', keyCode: 189 },
+    '_': { code: 'Minus', keyCode: 189, shiftKey: true },
+    '`': { code: 'Backquote', keyCode: 192 },
+    '~': { code: 'Backquote', keyCode: 192, shiftKey: true },
+    '|': { code: 'Backslash', keyCode: 220, shiftKey: true }
+  };
+  return map[ch] || { keyCode: ch.charCodeAt(0) };
 }
 
 document.getElementById('specialKeys').addEventListener('click', function(e) {
@@ -1147,7 +1176,7 @@ document.getElementById('specialKeys').addEventListener('click', function(e) {
 
   // Character keys
   if (btn.dataset.char !== undefined) {
-    sendKeyToTerminal(btn.dataset.char, { keyCode: btn.dataset.char.charCodeAt(0) });
+    sendKeyToTerminal(btn.dataset.char, getCharKeyOptions(btn.dataset.char));
     return;
   }
 
@@ -1469,13 +1498,14 @@ def spawn_user_ttyd(username, password):
     port = next_port
     next_port += 1
 
+    ttyd_cmd = f"{shlex.quote(TTYD_BIN)} -W -p {port} bash -l"
     proc = subprocess.Popen(
-        ["sshpass", "-p", password, "ssh",
+        [SSHPASS_BIN, "-p", password, SSH_BIN,
          "-o", "StrictHostKeyChecking=no",
          "-o", "PubkeyAuthentication=no",
          "-o", "ServerAliveInterval=30",
          f"{username}@127.0.0.1",
-         f"/usr/local/bin/ttyd -W -p {port} bash -l"],
+         ttyd_cmd],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
     )
     user_instances[username] = {"port": port, "proc": proc, "password": password}
@@ -1530,7 +1560,7 @@ def run_as_user(username, python_script, timeout=10):
     password = info["password"]
     try:
         result = subprocess.run(
-            ["sshpass", "-p", password, "ssh",
+            [SSHPASS_BIN, "-p", password, SSH_BIN,
              "-o", "StrictHostKeyChecking=no",
              "-o", "PubkeyAuthentication=no",
              "-o", "ConnectTimeout=5",
