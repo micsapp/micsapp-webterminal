@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import http.server
 import json
+import mimetypes
 import os
 import secrets
 import shlex
@@ -620,6 +621,41 @@ APP_HTML = """<!DOCTYPE html>
     word-break: break-all;
     margin: 0;
   }
+  .fp-modal-body .fp-modal-note {
+    color: #9a9abf;
+    font-size: 13px;
+    margin-bottom: 10px;
+    display: none;
+  }
+  .fp-modal-body textarea {
+    display: none;
+    width: 100%;
+    min-height: 380px;
+    background: #0f3460;
+    border: 1px solid #1a4a7a;
+    border-radius: 8px;
+    color: #e2e2e2;
+    font-size: 13px;
+    font-family: 'Menlo', 'Monaco', 'Consolas', monospace;
+    line-height: 1.45;
+    padding: 10px 12px;
+    outline: none;
+    resize: vertical;
+  }
+  .fp-modal-body textarea:focus { border-color: #e94560; }
+  .fp-modal-body .fp-modal-image,
+  .fp-modal-body .fp-modal-video,
+  .fp-modal-body .fp-modal-audio {
+    display: none;
+    width: 100%;
+    max-height: 60vh;
+    border-radius: 8px;
+    background: #0f3460;
+    border: 1px solid #1a4a7a;
+  }
+  .fp-modal-body .fp-modal-image {
+    object-fit: contain;
+  }
 
   /* Drag-and-drop overlay */
   .fp-drop-overlay {
@@ -837,11 +873,18 @@ APP_HTML = """<!DOCTYPE html>
   <div class="fp-modal">
     <div class="fp-modal-header">
       <span class="fp-modal-title" id="fpModalTitle"></span>
+      <button class="fp-btn" id="fpModalEdit" style="display:none">&#9998; Edit</button>
+      <button class="fp-btn" id="fpModalSave" style="display:none">&#10003; Save</button>
       <button class="fp-btn" id="fpModalDownload">&#8595; Download</button>
-      <button class="fp-btn" onclick="document.getElementById('fpModal').classList.remove('open')">&#10005;</button>
+      <button class="fp-btn" onclick="closeFileModal()">&#10005;</button>
     </div>
     <div class="fp-modal-body">
+      <div class="fp-modal-note" id="fpModalNote"></div>
       <pre id="fpModalContent"></pre>
+      <textarea id="fpModalEditor" spellcheck="false"></textarea>
+      <img id="fpModalImage" class="fp-modal-image" alt="Image preview">
+      <video id="fpModalVideo" class="fp-modal-video" controls preload="metadata"></video>
+      <audio id="fpModalAudio" class="fp-modal-audio" controls preload="metadata"></audio>
     </div>
   </div>
 </div>
@@ -1091,7 +1134,7 @@ document.addEventListener('keydown', (e) => {
   }
   // Escape = close preview modal
   if (e.key === 'Escape') {
-    document.getElementById('fpModal').classList.remove('open');
+    closeFileModal();
   }
 });
 
@@ -1211,6 +1254,128 @@ function init() {
 
 // --- File Browser ---
 let fpCurrentPath = '~';
+let fpModalPath = '';
+let fpModalText = '';
+let fpModalIsText = false;
+let fpModalEditing = false;
+let fpModalKind = 'binary';
+
+function isImageFile(name) {
+  return /\\.(png|jpe?g|gif|webp|bmp|svg|ico|avif|heic)$/i.test(name || '');
+}
+
+function isVideoFile(name) {
+  return /\\.(mp4|webm|ogg|mov|m4v)$/i.test(name || '');
+}
+
+function isAudioFile(name) {
+  return /\\.(mp3|wav|m4a|aac|flac|ogg|oga|opus)$/i.test(name || '');
+}
+
+function getInlinePreviewUrl(path) {
+  return '/api/files/download?inline=1&path=' + encodeURIComponent(path);
+}
+
+function closeFileModal() {
+  fpModalPath = '';
+  fpModalText = '';
+  fpModalIsText = false;
+  fpModalEditing = false;
+  fpModalKind = 'binary';
+  const img = document.getElementById('fpModalImage');
+  const vid = document.getElementById('fpModalVideo');
+  const aud = document.getElementById('fpModalAudio');
+  img.style.display = 'none';
+  img.src = '';
+  vid.pause();
+  vid.style.display = 'none';
+  vid.removeAttribute('src');
+  vid.load();
+  aud.pause();
+  aud.style.display = 'none';
+  aud.removeAttribute('src');
+  aud.load();
+  document.getElementById('fpModal').classList.remove('open');
+  document.getElementById('fpModalContent').style.display = 'block';
+  document.getElementById('fpModalEditor').style.display = 'none';
+  document.getElementById('fpModalNote').style.display = 'none';
+  document.getElementById('fpModalEdit').style.display = 'none';
+  document.getElementById('fpModalSave').style.display = 'none';
+}
+
+function setModalEditing(editing) {
+  fpModalEditing = !!editing;
+  const pre = document.getElementById('fpModalContent');
+  const editor = document.getElementById('fpModalEditor');
+  const editBtn = document.getElementById('fpModalEdit');
+  const saveBtn = document.getElementById('fpModalSave');
+  const note = document.getElementById('fpModalNote');
+  const img = document.getElementById('fpModalImage');
+  const vid = document.getElementById('fpModalVideo');
+  const aud = document.getElementById('fpModalAudio');
+
+  pre.style.display = 'none';
+  editor.style.display = 'none';
+  img.style.display = 'none';
+  vid.style.display = 'none';
+  aud.style.display = 'none';
+  editBtn.style.display = 'none';
+  saveBtn.style.display = 'none';
+  note.style.display = 'none';
+
+  if (fpModalKind === 'text') {
+    editBtn.style.display = 'inline-block';
+    editBtn.innerHTML = fpModalEditing ? '&#10005; Cancel' : '&#9998; Edit';
+    saveBtn.style.display = fpModalEditing ? 'inline-block' : 'none';
+    pre.style.display = fpModalEditing ? 'none' : 'block';
+    editor.style.display = fpModalEditing ? 'block' : 'none';
+    return;
+  }
+
+  if (fpModalKind === 'image') {
+    img.style.display = 'block';
+    return;
+  }
+
+  if (fpModalKind === 'video') {
+    vid.style.display = 'block';
+    return;
+  }
+
+  if (fpModalKind === 'audio') {
+    aud.style.display = 'block';
+    return;
+  }
+
+  note.style.display = 'block';
+}
+
+function startEditFile() {
+  if (!fpModalIsText) return;
+  document.getElementById('fpModalEditor').value = fpModalText;
+  setModalEditing(true);
+}
+
+async function saveEditedFile() {
+  if (!fpModalIsText || !fpModalPath) return;
+  const editor = document.getElementById('fpModalEditor');
+  const newContent = editor.value;
+  try {
+    const res = await fetch('/api/files/write', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ path: fpModalPath, content: newContent }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || data.error) throw new Error(data.error || ('HTTP ' + res.status));
+    fpModalText = newContent;
+    document.getElementById('fpModalContent').textContent = fpModalText;
+    setModalEditing(false);
+    fetchFiles(fpCurrentPath);
+  } catch (e) {
+    alert('Save failed: ' + e.message);
+  }
+}
 
 function toggleFilePanel() {
   const panel = document.getElementById('filePanel');
@@ -1339,14 +1504,66 @@ function renderFileList(entries) {
 
 async function previewFile(name) {
   const path = fpCurrentPath + '/' + name;
+  const lowerName = (name || '').toLowerCase();
+  fpModalPath = path;
+  document.getElementById('fpModalTitle').textContent = name;
+  document.getElementById('fpModalDownload').onclick = () => downloadFile(name);
+  document.getElementById('fpModalSave').onclick = saveEditedFile;
+  document.getElementById('fpModalEdit').onclick = () => {
+    if (fpModalEditing) {
+      document.getElementById('fpModalEditor').value = fpModalText;
+      setModalEditing(false);
+    } else {
+      startEditFile();
+    }
+  };
+
+  if (isImageFile(lowerName)) {
+    fpModalKind = 'image';
+    fpModalIsText = false;
+    document.getElementById('fpModalNote').textContent = '';
+    document.getElementById('fpModalImage').src = getInlinePreviewUrl(path);
+    setModalEditing(false);
+    document.getElementById('fpModal').classList.add('open');
+    return;
+  }
+
+  if (isVideoFile(lowerName)) {
+    fpModalKind = 'video';
+    fpModalIsText = false;
+    document.getElementById('fpModalNote').textContent = '';
+    const vid = document.getElementById('fpModalVideo');
+    vid.src = getInlinePreviewUrl(path);
+    setModalEditing(false);
+    document.getElementById('fpModal').classList.add('open');
+    return;
+  }
+
+  if (isAudioFile(lowerName)) {
+    fpModalKind = 'audio';
+    fpModalIsText = false;
+    document.getElementById('fpModalNote').textContent = '';
+    const aud = document.getElementById('fpModalAudio');
+    aud.src = getInlinePreviewUrl(path);
+    setModalEditing(false);
+    document.getElementById('fpModal').classList.add('open');
+    return;
+  }
+
   try {
     const res = await fetch('/api/files/read?path=' + encodeURIComponent(path));
     if (!res.ok) throw new Error('HTTP ' + res.status);
     const data = await res.json();
     if (data.error) { alert(data.error); return; }
-    document.getElementById('fpModalTitle').textContent = name;
-    document.getElementById('fpModalContent').textContent = data.content;
-    document.getElementById('fpModalDownload').onclick = () => downloadFile(name);
+    fpModalIsText = !!data.is_text;
+    fpModalKind = fpModalIsText ? 'text' : 'binary';
+    fpModalText = data.content || '';
+    document.getElementById('fpModalContent').textContent = fpModalText;
+    document.getElementById('fpModalEditor').value = fpModalText;
+    document.getElementById('fpModalNote').textContent = fpModalIsText
+      ? ''
+      : 'Binary file preview is disabled. Use Download.';
+    setModalEditing(false);
     document.getElementById('fpModal').classList.add('open');
   } catch (e) {
     alert('Cannot preview: ' + e.message);
@@ -1654,12 +1871,91 @@ try:
     if size > 102400:
         print(json.dumps({{"error": "file too large (>100KB)"}}))
     else:
-        with open(p, "r", errors="replace") as f:
-            print(json.dumps({{"content": f.read(), "size": size}}))
+        with open(p, "rb") as f:
+            data = f.read()
+        is_text = True
+        content = ""
+        if b"\\x00" in data:
+            is_text = False
+        else:
+            try:
+                content = data.decode("utf-8")
+            except UnicodeDecodeError:
+                is_text = False
+        print(json.dumps({{
+            "is_text": is_text,
+            "content": content if is_text else "",
+            "size": size
+        }}))
 except Exception as ex:
     print(json.dumps({{"error": str(ex)}}))
 '''
         rc, out, err = run_as_user(username, script)
+        if rc != 0:
+            self._send_error(500, err.decode(errors="replace"))
+            return
+        try:
+            data = json.loads(out)
+        except Exception:
+            self._send_error(500, out.decode(errors="replace"))
+            return
+        if "error" in data:
+            self._send_error(400, data["error"])
+        else:
+            self._send_json(200, data)
+
+    def _handle_files_write(self):
+        username = self._get_authenticated_user()
+        if not username:
+            self._send_error(401, "not authenticated")
+            return
+
+        length = int(self.headers.get("Content-Length", 0))
+        if length > 512 * 1024:
+            self._send_error(413, "payload too large")
+            return
+        body = self.rfile.read(length)
+        try:
+            req = json.loads(body)
+        except Exception:
+            self._send_error(400, "invalid json")
+            return
+
+        path = req.get("path", "")
+        content = req.get("content")
+        if not path or not isinstance(content, str):
+            self._send_error(400, "missing path or content")
+            return
+
+        content_size = len(content.encode("utf-8"))
+        if content_size > 102400:
+            self._send_error(400, "file too large (>100KB)")
+            return
+
+        script = f'''
+import os, json
+p = os.path.expanduser({path!r})
+content = {content!r}
+try:
+    if os.path.isdir(p):
+        raise Exception("path is a directory")
+    if os.path.exists(p):
+        with open(p, "rb") as f:
+            sample = f.read(8192)
+        if b"\\x00" in sample:
+            raise Exception("binary file cannot be edited here")
+        try:
+            sample.decode("utf-8")
+        except UnicodeDecodeError:
+            raise Exception("non-UTF-8 file cannot be edited here")
+
+    with open(p, "w", encoding="utf-8", newline="") as f:
+        f.write(content)
+    print(json.dumps({{"ok": True, "size": len(content.encode("utf-8"))}}))
+except Exception as ex:
+    print(json.dumps({{"error": str(ex)}}))
+'''
+        rc, out, err = run_as_user(username, script, timeout=20)
         if rc != 0:
             self._send_error(500, err.decode(errors="replace"))
             return
@@ -1679,6 +1975,7 @@ except Exception as ex:
             self._send_error(401, "not authenticated")
             return
         path = params.get("path", [""])[0]
+        inline = params.get("inline", ["0"])[0].lower() in ("1", "true", "yes")
         if not path:
             self._send_error(400, "missing path")
             return
@@ -1708,9 +2005,33 @@ except Exception as ex:
                 self._send_error(500, "decode error")
                 return
             fname = lines[2].decode(errors="replace").strip()
+            ext = os.path.splitext(fname.lower())[1]
+            content_type = mimetypes.guess_type(fname)[0]
+            if not content_type:
+                fallback_types = {
+                    ".mp3": "audio/mpeg",
+                    ".wav": "audio/wav",
+                    ".m4a": "audio/mp4",
+                    ".aac": "audio/aac",
+                    ".flac": "audio/flac",
+                    ".ogg": "audio/ogg",
+                    ".oga": "audio/ogg",
+                    ".opus": "audio/ogg",
+                    ".mp4": "video/mp4",
+                    ".m4v": "video/mp4",
+                    ".webm": "video/webm",
+                    ".mov": "video/quicktime",
+                    ".jpg": "image/jpeg",
+                    ".jpeg": "image/jpeg",
+                    ".png": "image/png",
+                    ".gif": "image/gif",
+                    ".webp": "image/webp",
+                }
+                content_type = fallback_types.get(ext, "application/octet-stream")
             self.send_response(200)
-            self.send_header("Content-Type", "application/octet-stream")
-            self.send_header("Content-Disposition", f'attachment; filename="{fname}"')
+            self.send_header("Content-Type", content_type if inline else "application/octet-stream")
+            disp = "inline" if inline else "attachment"
+            self.send_header("Content-Disposition", f'{disp}; filename="{fname}"')
             self.send_header("Content-Length", str(len(file_data)))
             self.end_headers()
             self.wfile.write(file_data)
@@ -1958,6 +2279,8 @@ except Exception as ex:
                 self.wfile.write(b'{"ok":false}')
         elif path == "/api/files/upload":
             self._handle_files_upload(params)
+        elif path == "/api/files/write":
+            self._handle_files_write()
         elif path == "/api/files/mkdir":
             self._handle_files_mkdir()
         elif path == "/api/files/delete":
