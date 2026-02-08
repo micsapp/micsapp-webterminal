@@ -1303,6 +1303,93 @@ APP_HTML = """<!DOCTYPE html>
   }
   .copy-modal-body textarea:focus { border-color: #e94560; }
 
+  /* Dialog modal (replaces alert/confirm/prompt) */
+  .dlg-overlay {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.6);
+    z-index: 270;
+    align-items: center;
+    justify-content: center;
+  }
+  .dlg-overlay.open { display: flex; }
+  .dlg {
+    background: #16213e;
+    border: 1px solid #0f3460;
+    border-radius: 10px;
+    width: 92%;
+    max-width: 520px;
+    max-height: 80vh;
+    display: flex;
+    flex-direction: column;
+    box-shadow: 0 20px 60px rgba(0,0,0,0.5);
+  }
+  .dlg-header {
+    display: flex;
+    align-items: center;
+    padding: 10px 14px;
+    border-bottom: 1px solid #0f3460;
+    gap: 8px;
+  }
+  .dlg-title {
+    flex: 1;
+    color: #e2e2e2;
+    font-size: 14px;
+    font-weight: 700;
+  }
+  .dlg-body {
+    padding: 12px 14px;
+    overflow: auto;
+    color: #c0c0e0;
+    font-size: 13px;
+    line-height: 1.35;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .dlg-input {
+    margin: 0 14px 12px 14px;
+    padding: 10px 12px;
+    background: #0f3460;
+    border: 1px solid #1a4a7a;
+    border-radius: 8px;
+    color: #e2e2e2;
+    font-size: 13px;
+    outline: none;
+  }
+  .dlg-input:focus { border-color: #e94560; }
+  .dlg-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+    padding: 10px 14px 14px 14px;
+    border-top: 1px solid #0f3460;
+  }
+  .dlg-btn {
+    background: none;
+    border: 1px solid #1a4a7a;
+    color: #9a9abf;
+    font-size: 12px;
+    padding: 6px 10px;
+    border-radius: 6px;
+    cursor: pointer;
+    transition: 0.15s;
+    white-space: nowrap;
+  }
+  .dlg-btn:hover { background: #0f3460; color: #e2e2e2; }
+  .dlg-btn.primary {
+    background: #e94560;
+    border-color: #e94560;
+    color: #fff;
+  }
+  .dlg-btn.primary:hover { background: #c73652; border-color: #c73652; }
+  .dlg-btn.danger {
+    background: rgba(233,69,96,0.15);
+    border-color: #e94560;
+    color: #e94560;
+  }
+  .dlg-btn.danger:hover { background: rgba(233,69,96,0.25); }
+
   /* Drag-and-drop overlay */
   .fp-drop-overlay {
     display: none;
@@ -1566,6 +1653,21 @@ APP_HTML = """<!DOCTYPE html>
   </div>
 </div>
 
+<div class="dlg-overlay" id="dlgOverlay" role="dialog" aria-modal="true">
+  <div class="dlg">
+    <div class="dlg-header">
+      <span class="dlg-title" id="dlgTitle">Dialog</span>
+      <button class="fp-btn" id="dlgClose">&#10005;</button>
+    </div>
+    <div class="dlg-body" id="dlgBody"></div>
+    <input class="dlg-input" id="dlgInput" style="display:none" />
+    <div class="dlg-actions">
+      <button class="dlg-btn" id="dlgCancel">Cancel</button>
+      <button class="dlg-btn primary" id="dlgOk">OK</button>
+    </div>
+  </div>
+</div>
+
 <script>
 const THEMES = {
   'default':    { bg:'#000000', fg:'#ffffff', cursor:'#ffffff', selection:'#4444aa' },
@@ -1736,6 +1838,25 @@ function saveSettingsOnly() {
   localStorage.setItem('ttyd_settings', JSON.stringify(getSettings()));
 }
 
+function bindPersist(id, ev, fn) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.addEventListener(ev, fn || (() => saveSettingsOnly()));
+}
+
+function wireSettingsPersistence() {
+  // Persist basic settings as user changes them (no need to click Apply).
+  bindPersist('fontFamily', 'change');
+  bindPersist('cursorStyle', 'change');
+  bindPersist('cursorBlink', 'change');
+  bindPersist('scrollback', 'change');
+  bindPersist('disableLeaveAlert', 'change');
+  bindPersist('colorBg', 'input');
+  bindPersist('colorFg', 'input');
+  bindPersist('colorCursor', 'input');
+  bindPersist('colorSelection', 'input');
+}
+
 let toastTimer = null;
 
 function showToast(msg, isError) {
@@ -1746,6 +1867,137 @@ function showToast(msg, isError) {
   t.classList.add('show');
   if (toastTimer) clearTimeout(toastTimer);
   toastTimer = setTimeout(() => t.classList.remove('show'), 1400);
+}
+
+// --- Dialog modal helpers (replaces alert/confirm/prompt) ---
+let dlgResolve = null;
+let dlgKind = 'alert'; // alert|confirm|prompt
+
+function dlgSetOpen(open) {
+  const overlay = document.getElementById('dlgOverlay');
+  if (!overlay) return;
+  overlay.classList.toggle('open', !!open);
+}
+
+function dlgClose(result) {
+  dlgSetOpen(false);
+  const r = dlgResolve;
+  dlgResolve = null;
+  dlgKind = 'alert';
+  if (typeof r === 'function') r(result);
+}
+
+function dlgOpen(opts) {
+  opts = opts || {};
+  const titleEl = document.getElementById('dlgTitle');
+  const bodyEl = document.getElementById('dlgBody');
+  const inputEl = document.getElementById('dlgInput');
+  const okEl = document.getElementById('dlgOk');
+  const cancelEl = document.getElementById('dlgCancel');
+  const closeEl = document.getElementById('dlgClose');
+  const overlay = document.getElementById('dlgOverlay');
+
+  if (!titleEl || !bodyEl || !inputEl || !okEl || !cancelEl || !closeEl || !overlay) {
+    // Hard fallback if modal isn't present.
+    if ((opts.kind || 'alert') === 'confirm') return Promise.resolve(window.confirm(opts.message || ''));
+    if ((opts.kind || 'alert') === 'prompt') return Promise.resolve(window.prompt(opts.message || '', opts.defaultValue || ''));
+    window.alert(opts.message || '');
+    return Promise.resolve(true);
+  }
+
+  dlgKind = opts.kind || 'alert';
+  titleEl.textContent = opts.title || (dlgKind === 'confirm' ? 'Confirm' : dlgKind === 'prompt' ? 'Input' : 'Notice');
+  bodyEl.textContent = opts.message || '';
+
+  const showInput = dlgKind === 'prompt';
+  inputEl.style.display = showInput ? 'block' : 'none';
+  if (showInput) {
+    inputEl.type = (opts.inputType || 'text');
+    inputEl.value = (opts.defaultValue !== undefined && opts.defaultValue !== null) ? String(opts.defaultValue) : '';
+  } else {
+    inputEl.value = '';
+  }
+
+  okEl.textContent = opts.okText || (dlgKind === 'confirm' ? 'OK' : 'OK');
+  cancelEl.textContent = opts.cancelText || (dlgKind === 'confirm' || dlgKind === 'prompt' ? 'Cancel' : 'Close');
+  cancelEl.style.display = (dlgKind === 'confirm' || dlgKind === 'prompt') ? 'inline-flex' : 'none';
+
+  okEl.classList.remove('danger');
+  okEl.classList.add('primary');
+  if (opts.danger) {
+    okEl.classList.remove('primary');
+    okEl.classList.add('danger');
+  }
+
+  // Remove previous handlers by cloning buttons (cheap and reliable)
+  const okNew = okEl.cloneNode(true);
+  okEl.parentNode.replaceChild(okNew, okEl);
+  const cancelNew = cancelEl.cloneNode(true);
+  cancelEl.parentNode.replaceChild(cancelNew, cancelEl);
+  const closeNew = closeEl.cloneNode(true);
+  closeEl.parentNode.replaceChild(closeNew, closeEl);
+
+  return new Promise((resolve) => {
+    dlgResolve = resolve;
+    dlgSetOpen(true);
+
+    okNew.addEventListener('click', () => {
+      if (dlgKind === 'prompt') dlgClose(inputEl.value);
+      else dlgClose(true);
+    });
+    cancelNew.addEventListener('click', () => {
+      if (dlgKind === 'prompt') dlgClose(null);
+      else dlgClose(false);
+    });
+    closeNew.addEventListener('click', () => {
+      if (dlgKind === 'prompt') dlgClose(null);
+      else dlgClose(false);
+    });
+    overlay.addEventListener('click', (e) => {
+      if (e.target === overlay) {
+        if (dlgKind === 'prompt') dlgClose(null);
+        else dlgClose(false);
+      }
+    }, { once: true });
+
+    document.addEventListener('keydown', function onKey(e) {
+      if (!document.getElementById('dlgOverlay').classList.contains('open')) {
+        document.removeEventListener('keydown', onKey);
+        return;
+      }
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        document.removeEventListener('keydown', onKey);
+        if (dlgKind === 'prompt') dlgClose(null);
+        else dlgClose(false);
+      } else if (e.key === 'Enter') {
+        if (dlgKind === 'prompt' && document.activeElement === inputEl) {
+          e.preventDefault();
+          document.removeEventListener('keydown', onKey);
+          dlgClose(inputEl.value);
+        }
+      }
+    });
+
+    setTimeout(() => {
+      try {
+        if (showInput) inputEl.focus();
+        else okNew.focus();
+      } catch (e) {}
+    }, 0);
+  });
+}
+
+function modalAlert(message, title) {
+  return dlgOpen({ kind: 'alert', title: title || 'Notice', message: message || '' });
+}
+
+function modalConfirm(message, title, danger) {
+  return dlgOpen({ kind: 'confirm', title: title || 'Confirm', message: message || '', danger: !!danger, okText: 'OK', cancelText: 'Cancel' });
+}
+
+function modalPrompt(message, title, defaultValue) {
+  return dlgOpen({ kind: 'prompt', title: title || 'Input', message: message || '', defaultValue: defaultValue || '' });
 }
 
 function looksLikeTerminal(obj) {
@@ -2077,6 +2329,7 @@ function selectTheme(name) {
   document.getElementById('colorCursor').value = t.cursor;
   document.getElementById('colorSelection').value = t.selection;
   applyThemeUI(name);
+  saveSettingsOnly();
 }
 
 function applyThemeUI(name) {
@@ -2270,6 +2523,8 @@ function init() {
   } catch(e) {}
   updateQuickFontDisplay(parseInt(document.getElementById('fontSize').value || '15', 10) || 15);
 
+  wireSettingsPersistence();
+
   document.getElementById('fontSize').addEventListener('input', () => {
     const input = document.getElementById('fontSize');
     const v = clampFontSize(parseInt(input.value, 10) || 15);
@@ -2441,7 +2696,7 @@ async function saveEditedFile() {
     setModalEditing(false);
     fetchFiles(fpCurrentPathToken);
   } catch (e) {
-    alert('Save failed: ' + e.message);
+    await modalAlert('Save failed: ' + e.message, 'Save Failed');
   }
 }
 
@@ -2637,7 +2892,7 @@ async function previewFile(pathToken, name) {
     const res = await fetch('/api/files/read?path_token=' + encodeURIComponent(pathToken));
     if (!res.ok) throw new Error('HTTP ' + res.status);
     const data = await res.json();
-    if (data.error) { alert(data.error); return; }
+    if (data.error) { await modalAlert(data.error, 'Preview'); return; }
     fpModalIsText = !!data.is_text;
     fpModalKind = fpModalIsText ? 'text' : 'binary';
     fpModalText = data.content || '';
@@ -2649,7 +2904,7 @@ async function previewFile(pathToken, name) {
     setModalEditing(false);
     document.getElementById('fpModal').classList.add('open');
   } catch (e) {
-    alert('Cannot preview: ' + e.message);
+    await modalAlert('Cannot preview: ' + e.message, 'Preview Failed');
   }
 }
 
@@ -2678,17 +2933,17 @@ async function handleUpload(files) {
       });
       if (!res.ok) {
         const d = await res.json().catch(() => ({}));
-        alert('Upload failed: ' + (d.error || res.status));
+        await modalAlert('Upload failed: ' + (d.error || res.status), 'Upload Failed');
       }
     } catch (e) {
-      alert('Upload error: ' + e.message);
+      await modalAlert('Upload error: ' + e.message, 'Upload Failed');
     }
   }
   fetchFiles(fpCurrentPathToken);
 }
 
 async function createFolder() {
-  const name = prompt('New folder name:');
+  const name = await modalPrompt('New folder name:', 'Create Folder', '');
   if (!name) return;
   try {
     const res = await fetch('/api/files/mkdir', {
@@ -2697,13 +2952,14 @@ async function createFolder() {
       body: JSON.stringify({path_token: fpCurrentPathToken, name: name}),
     });
     const data = await res.json();
-    if (data.error) alert(data.error);
+    if (data.error) await modalAlert(data.error, 'Create Folder');
     else fetchFiles(fpCurrentPathToken);
-  } catch (e) { alert('Error: ' + e.message); }
+  } catch (e) { await modalAlert('Error: ' + e.message, 'Create Folder'); }
 }
 
 async function deleteFile(pathToken, name, type) {
-  if (!confirm('Delete ' + (type === 'dir' ? 'folder' : 'file') + ' "' + name + '"?')) return;
+  const ok = await modalConfirm('Delete ' + (type === 'dir' ? 'folder' : 'file') + ' \"' + name + '\"?', 'Delete', true);
+  if (!ok) return;
   try {
     const res = await fetch('/api/files/delete', {
       method: 'POST',
@@ -2711,13 +2967,13 @@ async function deleteFile(pathToken, name, type) {
       body: JSON.stringify({path_token: pathToken}),
     });
     const data = await res.json();
-    if (data.error) alert(data.error);
+    if (data.error) await modalAlert(data.error, 'Delete');
     else fetchFiles(fpCurrentPathToken);
-  } catch (e) { alert('Error: ' + e.message); }
+  } catch (e) { await modalAlert('Error: ' + e.message, 'Delete'); }
 }
 
 async function renameFile(pathToken, name) {
-  const newName = prompt('Rename "' + name + '" to:', name);
+  const newName = await modalPrompt('Rename \"' + name + '\" to:', 'Rename', name);
   if (!newName || newName === name) return;
   try {
     const res = await fetch('/api/files/rename', {
@@ -2726,9 +2982,9 @@ async function renameFile(pathToken, name) {
       body: JSON.stringify({path_token: pathToken, new_name: newName}),
     });
     const data = await res.json();
-    if (data.error) alert(data.error);
+    if (data.error) await modalAlert(data.error, 'Rename');
     else fetchFiles(fpCurrentPathToken);
-  } catch (e) { alert('Error: ' + e.message); }
+  } catch (e) { await modalAlert('Error: ' + e.message, 'Rename'); }
 }
 
 function fileIcon(name) {
