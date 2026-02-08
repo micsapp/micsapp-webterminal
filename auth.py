@@ -65,13 +65,17 @@ TTYD_BIN = (
     or "/usr/local/bin/ttyd"
 )
 
-SECURITY_HEADERS = {
+DEFAULT_SECURITY_HEADERS = {
     "X-Content-Type-Options": "nosniff",
     "Referrer-Policy": "no-referrer",
-    "X-Frame-Options": "SAMEORIGIN",
     "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
     "Cache-Control": "no-store",
     "Pragma": "no-cache",
+}
+
+# Apply only to HTML responses. Applying CSP/XFO to PDFs/media can break built-in viewers (e.g. PDF in iframe).
+HTML_ONLY_SECURITY_HEADERS = {
+    "X-Frame-Options": "SAMEORIGIN",
     "Content-Security-Policy": (
         "default-src 'self'; "
         "script-src 'self' 'unsafe-inline'; "
@@ -759,7 +763,8 @@ APP_HTML = """<!DOCTYPE html>
   .fp-modal-body textarea:focus { border-color: #e94560; }
   .fp-modal-body .fp-modal-image,
   .fp-modal-body .fp-modal-video,
-  .fp-modal-body .fp-modal-audio {
+  .fp-modal-body .fp-modal-audio,
+  .fp-modal-body .fp-modal-pdf {
     display: none;
     width: 100%;
     max-height: 60vh;
@@ -769,6 +774,9 @@ APP_HTML = """<!DOCTYPE html>
   }
   .fp-modal-body .fp-modal-image {
     object-fit: contain;
+  }
+  .fp-modal-body .fp-modal-pdf {
+    height: 70vh;
   }
   .toast {
     position: fixed;
@@ -944,7 +952,6 @@ APP_HTML = """<!DOCTYPE html>
   <button class="nav-btn" onclick="quickAdjustFontSize(-1)" title="Decrease Font Size">A-</button>
   <span class="nav-btn nav-hide-mobile quick-font-readout" id="quickFontSizeDisplay">15px</span>
   <button class="nav-btn" onclick="quickAdjustFontSize(1)" title="Increase Font Size">A+</button>
-  <button class="nav-btn" onclick="copyFromActiveTerminal('smart')" title="Copy terminal text">&#128203; Copy</button>
   <div class="nav-sep nav-hide-mobile"></div>
   <button class="nav-btn nav-hide-mobile" id="filesBtn" onclick="toggleFilePanel()">&#128193; Files</button>
   <button class="nav-btn nav-hide-mobile" id="settingsBtn" onclick="toggleSettings()">&#9881; Settings</button>
@@ -1110,8 +1117,9 @@ APP_HTML = """<!DOCTYPE html>
       <img id="fpModalImage" class="fp-modal-image" alt="Image preview">
       <video id="fpModalVideo" class="fp-modal-video" controls preload="metadata"></video>
       <audio id="fpModalAudio" class="fp-modal-audio" controls preload="metadata"></audio>
+      <iframe id="fpModalPdf" class="fp-modal-pdf" title="PDF preview"></iframe>
     </div>
-</div>
+  </div>
 </div>
 <div id="toast" class="toast"></div>
 
@@ -1889,6 +1897,10 @@ function isAudioFile(name) {
   return /\\.(mp3|wav|m4a|aac|flac|ogg|oga|opus)$/i.test(name || '');
 }
 
+function isPdfFile(name) {
+  return /\\.(pdf)$/i.test(name || '');
+}
+
 function getInlinePreviewUrl(pathToken) {
   return '/api/files/download?inline=1&path_token=' + encodeURIComponent(pathToken);
 }
@@ -1902,6 +1914,7 @@ function closeFileModal() {
   const img = document.getElementById('fpModalImage');
   const vid = document.getElementById('fpModalVideo');
   const aud = document.getElementById('fpModalAudio');
+  const pdf = document.getElementById('fpModalPdf');
   img.style.display = 'none';
   img.src = '';
   vid.pause();
@@ -1912,6 +1925,8 @@ function closeFileModal() {
   aud.style.display = 'none';
   aud.removeAttribute('src');
   aud.load();
+  pdf.style.display = 'none';
+  pdf.removeAttribute('src');
   document.getElementById('fpModal').classList.remove('open');
   document.getElementById('fpModalContent').style.display = 'block';
   document.getElementById('fpModalEditor').style.display = 'none';
@@ -1930,12 +1945,14 @@ function setModalEditing(editing) {
   const img = document.getElementById('fpModalImage');
   const vid = document.getElementById('fpModalVideo');
   const aud = document.getElementById('fpModalAudio');
+  const pdf = document.getElementById('fpModalPdf');
 
   pre.style.display = 'none';
   editor.style.display = 'none';
   img.style.display = 'none';
   vid.style.display = 'none';
   aud.style.display = 'none';
+  pdf.style.display = 'none';
   editBtn.style.display = 'none';
   saveBtn.style.display = 'none';
   note.style.display = 'none';
@@ -1961,6 +1978,11 @@ function setModalEditing(editing) {
 
   if (fpModalKind === 'audio') {
     aud.style.display = 'block';
+    return;
+  }
+
+  if (fpModalKind === 'pdf') {
+    pdf.style.display = 'block';
     return;
   }
 
@@ -2158,6 +2180,25 @@ async function previewFile(pathToken, name) {
     document.getElementById('fpModalNote').textContent = '';
     const aud = document.getElementById('fpModalAudio');
     aud.src = getInlinePreviewUrl(pathToken);
+    setModalEditing(false);
+    document.getElementById('fpModal').classList.add('open');
+    return;
+  }
+
+  if (isPdfFile(lowerName)) {
+    const url = getInlinePreviewUrl(pathToken);
+    if (isCoarsePointer && isCoarsePointer()) {
+      // iOS Safari commonly blocks PDFs inside iframes ("content is blocked").
+      // Opening directly in a new tab/window is the most reliable fallback.
+      try { window.open(url, '_blank', 'noopener'); } catch (e) {}
+      showToast('Opened PDF in a new tab', false);
+      return;
+    }
+    fpModalKind = 'pdf';
+    fpModalIsText = false;
+    document.getElementById('fpModalNote').textContent = '';
+    const pdf = document.getElementById('fpModalPdf');
+    pdf.src = url;
     setModalEditing(false);
     document.getElementById('fpModal').classList.add('open');
     return;
@@ -2455,9 +2496,23 @@ class AuthHandler(http.server.BaseHTTPRequestHandler):
         if ACCESS_LOG_ENABLED:
             super().log_message(fmt, *args)
 
+    def send_header(self, keyword, value):
+        # Track response content-type for conditional security headers.
+        if keyword.lower() == "content-type":
+            try:
+                self._resp_content_type = str(value)
+            except Exception:
+                self._resp_content_type = ""
+        super().send_header(keyword, value)
+
     def end_headers(self):
-        for k, v in SECURITY_HEADERS.items():
+        for k, v in DEFAULT_SECURITY_HEADERS.items():
             self.send_header(k, v)
+        ct = getattr(self, "_resp_content_type", "") or ""
+        ct_main = ct.split(";", 1)[0].strip().lower()
+        if ct_main == "text/html":
+            for k, v in HTML_ONLY_SECURITY_HEADERS.items():
+                self.send_header(k, v)
         super().end_headers()
 
     def _get_authenticated_user(self):
@@ -2702,6 +2757,7 @@ except Exception as ex:
             content_type = mimetypes.guess_type(fname)[0]
             if not content_type:
                 fallback_types = {
+                    ".pdf": "application/pdf",
                     ".mp3": "audio/mpeg",
                     ".wav": "audio/wav",
                     ".m4a": "audio/mp4",
