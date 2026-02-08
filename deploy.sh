@@ -74,11 +74,24 @@ install_nginx_conf() {
     mkdir -p "$dest_dir"
   fi
 
+  # Clean up legacy backups that may get included by brew nginx configs that do
+  # `include servers/*;`. Those backups can create duplicate/conflicting servers.
+  local legacy
+  for legacy in "${dest_dir}/$(basename "$dest_conf").bak."*; do
+    [ -f "$legacy" ] || continue
+    local hidden="${dest_dir}/.$(basename "$legacy")"
+    mv "$legacy" "$hidden" 2>/dev/null || rm -f "$legacy" 2>/dev/null || true
+  done
+
   if [ -f "$dest_conf" ] && cmp -s "${NGINX_SRC_CONF}" "$dest_conf"; then
     say "nginx config unchanged."
   else
     if [ -f "$dest_conf" ]; then
-      local backup="${dest_conf}.bak.$(date +%Y%m%d_%H%M%S)"
+      # IMPORTANT: brew nginx often does `include servers/*;` so backups inside that dir
+      # can get loaded as live config. Use a dotfile backup name to avoid inclusion.
+      local backup_dir
+      backup_dir="$(dirname "$dest_conf")"
+      local backup="${backup_dir}/.$(basename "$dest_conf").bak.$(date +%Y%m%d_%H%M%S)"
       say "Backing up existing config -> ${backup}"
       cp "$dest_conf" "$backup"
     fi

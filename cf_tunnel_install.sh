@@ -367,6 +367,13 @@ server {
         proxy_set_header Upgrade \$http_upgrade;
         proxy_set_header Connection "upgrade";
         proxy_set_header Host \$host;
+        # Allow sub_filter to operate (disable upstream compression).
+        proxy_set_header Accept-Encoding "";
+
+        # Inject a small helper into ttyd HTML so the iframe exposes the xterm instance.
+        # This enables reliable buffer readback for mobile copy/select.
+        sub_filter_once on;
+        sub_filter '</body>' '<script>(function(){function L(o){return o&&typeof o.setOption==="function"&&(typeof o.write==="function"||typeof o.paste==="function"||typeof o.open==="function");}function F(w){try{var c=[w.term,w.terminal,w.xterm,w.ttyd&&w.ttyd.term,w.app&&w.app.term,w.app&&w.app.terminal];for(var i=0;i<c.length;i++){if(L(c[i]))return c[i];}var k=Object.getOwnPropertyNames(w);for(var j=0;j<k.length;j++){var n=k[j],v;try{v=w[n];}catch(e){continue;}if(L(v))return v;if(v&&typeof v==="object"){try{if(L(v.term))return v.term;if(L(v.terminal))return v.terminal;}catch(e2){}}}}catch(e3){}return null;}function E(){var t=F(window);if(t){window.term=t;window.terminal=t;window.xterm=t;return true;}return false;}if(!E()){var n=0,iv=setInterval(function(){n++;if(E()||n>50)clearInterval(iv);},200);}})();</script></body>';
         proxy_read_timeout 86400s;
         proxy_send_timeout 86400s;
     }
@@ -644,6 +651,60 @@ document.getElementById('form').addEventListener('submit', async (e) => {
 </body>
 </html>"""
 
+TERM_HOOK_JS = r"""// ttyd term hook (injected by nginx into /ut/... HTML)
+(function () {
+  function looksLikeTerminal(obj) {
+    return !!obj && typeof obj.setOption === 'function' &&
+      (typeof obj.write === 'function' || typeof obj.paste === 'function' || typeof obj.open === 'function');
+  }
+
+  function findTerminalObject(win) {
+    try {
+      const direct = [
+        win.term, win.terminal, win.xterm,
+        win.app && win.app.term,
+        win.app && win.app.terminal,
+        win.ttyd && win.ttyd.term,
+      ];
+      for (const c of direct) {
+        if (looksLikeTerminal(c)) return c;
+      }
+
+      const keys = Object.getOwnPropertyNames(win);
+      for (const key of keys) {
+        let v;
+        try { v = win[key]; } catch (e) { continue; }
+        if (looksLikeTerminal(v)) return v;
+        if (v && typeof v === 'object') {
+          try {
+            if (looksLikeTerminal(v.term)) return v.term;
+            if (looksLikeTerminal(v.terminal)) return v.terminal;
+          } catch (e2) {}
+        }
+      }
+    } catch (e3) {}
+    return null;
+  }
+
+  function expose() {
+    const t = findTerminalObject(window);
+    if (!t) return false;
+    window.term = t;
+    window.terminal = t;
+    window.xterm = t;
+    return true;
+  }
+
+  if (!expose()) {
+    let n = 0;
+    const iv = setInterval(() => {
+      n++;
+      if (expose() || n > 60) clearInterval(iv);
+    }, 200);
+  }
+})();
+"""
+
 APP_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -710,6 +771,12 @@ APP_HTML = """<!DOCTYPE html>
     flex-shrink: 0;
   }
   .nav-btn:hover { background: #0f3460; color: #e2e2e2; }
+  .quick-font-readout {
+    cursor: default;
+    min-width: 42px;
+    justify-content: center;
+    pointer-events: none;
+  }
   .nav-btn.active { background: #0f3460; border-color: #1a4a7a; color: #e2e2e2; }
   .nav-right { margin-left: auto; display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
 
@@ -1132,6 +1199,101 @@ APP_HTML = """<!DOCTYPE html>
   .fp-modal-body .fp-modal-image {
     object-fit: contain;
   }
+  .toast {
+    position: fixed;
+    left: 50%;
+    bottom: calc(70px + env(safe-area-inset-bottom, 0px));
+    transform: translateX(-50%) translateY(16px);
+    background: rgba(15,52,96,0.96);
+    border: 1px solid #1a4a7a;
+    color: #e2e2e2;
+    font-size: 12px;
+    padding: 7px 12px;
+    border-radius: 999px;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.18s ease, transform 0.18s ease;
+    z-index: 260;
+    max-width: calc(100vw - 24px);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .toast.show {
+    opacity: 1;
+    transform: translateX(-50%) translateY(0);
+  }
+  .toast.error {
+    background: rgba(128,25,46,0.96);
+    border-color: #b53250;
+  }
+
+  /* Copy/select modal (mobile-friendly selection) */
+  .copy-modal-overlay {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.6);
+    z-index: 240;
+    align-items: center;
+    justify-content: center;
+  }
+  .copy-modal-overlay.open { display: flex; }
+  .copy-modal {
+    background: #16213e;
+    border: 1px solid #0f3460;
+    border-radius: 10px;
+    width: 92%;
+    max-width: 760px;
+    max-height: 90vh;
+    display: flex;
+    flex-direction: column;
+    box-shadow: 0 20px 60px rgba(0,0,0,0.5);
+  }
+  .copy-modal-header {
+    display: flex;
+    align-items: center;
+    padding: 10px 14px;
+    border-bottom: 1px solid #0f3460;
+    gap: 8px;
+  }
+  .copy-modal-title {
+    flex: 1;
+    color: #e2e2e2;
+    font-size: 14px;
+    font-weight: 600;
+  }
+  .copy-modal-body {
+    flex: 1;
+    padding: 12px 14px;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+  .copy-modal-hint {
+    color: #9a9abf;
+    font-size: 12px;
+    line-height: 1.35;
+  }
+  .copy-modal-body textarea {
+    flex: 1;
+    width: 100%;
+    background: #0f3460;
+    border: 1px solid #1a4a7a;
+    border-radius: 8px;
+    color: #e2e2e2;
+    font-size: 12px;
+    font-family: 'Menlo', 'Monaco', 'Consolas', monospace;
+    line-height: 1.45;
+    padding: 10px 12px;
+    outline: none;
+    resize: none;
+    white-space: pre;
+    user-select: text;
+    -webkit-user-select: text;
+  }
+  .copy-modal-body textarea:focus { border-color: #e94560; }
 
   /* Drag-and-drop overlay */
   .fp-drop-overlay {
@@ -1183,6 +1345,17 @@ APP_HTML = """<!DOCTYPE html>
       border-right: none;
     }
     .fp-item-actions { display: flex; }
+
+    /* Fullscreen copy modal on mobile for easier selection */
+    .copy-modal {
+      width: 100%;
+      height: 100%;
+      max-height: none;
+      border-radius: 0;
+    }
+    .copy-modal-body textarea {
+      font-size: 13px;
+    }
   }
   /* Touch devices (tablets etc) */
   @media (pointer: coarse) {
@@ -1197,6 +1370,10 @@ APP_HTML = """<!DOCTYPE html>
   <div class="title"><span>&#9611;</span> __USERNAME__</div>
   <div class="nav-sep"></div>
   <button class="nav-btn" onclick="addTab()">&#43; New Tab</button>
+  <button class="nav-btn" onclick="quickAdjustFontSize(-1)" title="Decrease Font Size">A-</button>
+  <span class="nav-btn nav-hide-mobile quick-font-readout" id="quickFontSizeDisplay">15px</span>
+  <button class="nav-btn" onclick="quickAdjustFontSize(1)" title="Increase Font Size">A+</button>
+  <button class="nav-btn" onclick="copyFromActiveTerminal('smart')" title="Copy terminal text">&#128203; Copy</button>
   <div class="nav-sep nav-hide-mobile"></div>
   <button class="nav-btn nav-hide-mobile" id="filesBtn" onclick="toggleFilePanel()">&#128193; Files</button>
   <button class="nav-btn nav-hide-mobile" id="settingsBtn" onclick="toggleSettings()">&#9881; Settings</button>
@@ -1220,6 +1397,7 @@ APP_HTML = """<!DOCTYPE html>
 <div class="tab-bar" id="tabBar"></div>
 
 <div class="special-keys" id="specialKeys">
+  <button class="skey" data-action="copy">&#128203;</button>
   <button class="skey" data-key="Escape">Esc</button>
   <button class="skey" data-key="Tab">Tab</button>
   <div class="skey-sep"></div>
@@ -1242,7 +1420,7 @@ APP_HTML = """<!DOCTYPE html>
   <button class="skey" data-char="-">-</button>
   <button class="skey" data-char="_">_</button>
   <button class="skey" data-char="/">/</button>
-  <button class="skey" data-char="\\">\\</button>
+  <button class="skey" data-char="&#92;">&#92;</button>
 </div>
 
 <div class="settings-panel" id="settingsPanel">
@@ -1362,6 +1540,21 @@ APP_HTML = """<!DOCTYPE html>
       <video id="fpModalVideo" class="fp-modal-video" controls preload="metadata"></video>
       <audio id="fpModalAudio" class="fp-modal-audio" controls preload="metadata"></audio>
     </div>
+</div>
+</div>
+<div id="toast" class="toast"></div>
+
+<div class="copy-modal-overlay" id="copyModal">
+  <div class="copy-modal">
+    <div class="copy-modal-header">
+      <span class="copy-modal-title">&#128203; Copy and Select</span>
+      <button class="fp-btn" id="copyModalCopy">Copy</button>
+      <button class="fp-btn" id="copyModalClose">&#10005;</button>
+    </div>
+    <div class="copy-modal-body">
+      <div class="copy-modal-hint">Long-press to select text on mobile. Tap Copy to copy selection (or all if nothing selected).</div>
+      <textarea id="copyModalText" spellcheck="false" autocomplete="off" autocapitalize="off" autocorrect="off"></textarea>
+    </div>
   </div>
 </div>
 
@@ -1382,8 +1575,11 @@ let tabs = [];
 let activeTabId = null;
 let tabCounter = 0;
 
-function buildTermUrl() {
+function buildTermUrl(overrides) {
   const s = getSettings();
+  if (overrides && typeof overrides === 'object') {
+    Object.assign(s, overrides);
+  }
   const params = new URLSearchParams();
   if (s.fontSize && s.fontSize !== '15') params.set('fontSize', s.fontSize);
   if (s.fontFamily) params.set('fontFamily', s.fontFamily);
@@ -1391,6 +1587,8 @@ function buildTermUrl() {
   if (!s.cursorBlink) params.set('cursorBlink', 'false');
   if (s.scrollback && s.scrollback !== '10000') params.set('scrollback', s.scrollback);
   if (s.disableLeaveAlert) params.set('disableLeaveAlert', 'true');
+  // Mobile/touch: use DOM renderer so terminal text exists in the DOM (enables selection/copy readback).
+  if (isCoarsePointer && isCoarsePointer()) params.set('rendererType', 'dom');
   params.set('theme', JSON.stringify({
     background: s.colorBg,
     foreground: s.colorFg,
@@ -1517,11 +1715,344 @@ function getSettings() {
   };
 }
 
+function clampFontSize(v) {
+  return Math.max(8, Math.min(36, v));
+}
+
+function updateQuickFontDisplay(v) {
+  const el = document.getElementById('quickFontSizeDisplay');
+  if (el) el.textContent = String(v) + 'px';
+}
+
+function saveSettingsOnly() {
+  localStorage.setItem('ttyd_settings', JSON.stringify(getSettings()));
+}
+
+let toastTimer = null;
+
+function showToast(msg, isError) {
+  const t = document.getElementById('toast');
+  if (!t) return;
+  t.textContent = msg;
+  t.classList.toggle('error', !!isError);
+  t.classList.add('show');
+  if (toastTimer) clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => t.classList.remove('show'), 1400);
+}
+
+function looksLikeTerminal(obj) {
+  return !!obj && typeof obj.setOption === 'function' && (
+    typeof obj.write === 'function' || typeof obj.paste === 'function'
+  );
+}
+
+function findTerminalObject(win) {
+  try {
+    const direct = [
+      win.term, win.terminal, win.xterm,
+      win.app && win.app.term,
+      win.app && win.app.terminal,
+      win.ttyd && win.ttyd.term,
+    ];
+    for (const c of direct) {
+      if (looksLikeTerminal(c)) return c;
+    }
+
+    // Best-effort scan top-level globals for ttyd's internal terminal object.
+    const keys = Object.getOwnPropertyNames(win);
+    for (const key of keys) {
+      let v;
+      try { v = win[key]; } catch (e) { continue; }
+      if (looksLikeTerminal(v)) return v;
+      if (v && typeof v === 'object') {
+        try {
+          if (looksLikeTerminal(v.term)) return v.term;
+          if (looksLikeTerminal(v.terminal)) return v.terminal;
+        } catch (e) {}
+      }
+    }
+  } catch (e) {}
+  return null;
+}
+
+function applyFontSizeToFrame(frame, size) {
+  try {
+    const w = frame.contentWindow;
+    const term = w ? findTerminalObject(w) : null;
+    if (term) {
+      term.setOption('fontSize', size);
+      if (typeof term.refresh === 'function' && typeof term.rows === 'number') {
+        term.refresh(0, Math.max(0, term.rows - 1));
+      }
+      try { w.dispatchEvent(new Event('resize')); } catch (e) {}
+      return true;
+    }
+
+    const doc = frame.contentDocument;
+    if (!doc) return false;
+    const xterm = doc.querySelector('.xterm');
+    if (!xterm) return false;
+    xterm.style.fontSize = String(size) + 'px';
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+function applyFontSizeToAllLiveSessions(size) {
+  const frames = document.querySelectorAll('#termContainer iframe');
+  let applied = 0;
+  frames.forEach((f) => {
+    if (applyFontSizeToFrame(f, size)) applied++;
+  });
+  return { applied, total: frames.length };
+}
+
+function getActiveTerminal() {
+  const frame = document.getElementById('frame-' + activeTabId);
+  if (!frame || !frame.contentWindow) return null;
+  const term = findTerminalObject(frame.contentWindow);
+  return term || null;
+}
+
+function getActiveFrame() {
+  const frame = document.getElementById('frame-' + activeTabId);
+  return frame || null;
+}
+
+function collectTerminalBuffer(term, maxLines) {
+  try {
+    const buf = term && term.buffer && term.buffer.active;
+    if (!buf || typeof buf.length !== 'number' || typeof buf.getLine !== 'function') return '';
+    const keep = Math.max(1, maxLines || 4000);
+    const start = Math.max(0, buf.length - keep);
+    const lines = [];
+    for (let i = start; i < buf.length; i++) {
+      const line = buf.getLine(i);
+      lines.push(line && typeof line.translateToString === 'function'
+        ? line.translateToString(true)
+        : '');
+    }
+    // NOTE: This script is embedded in a Python string; backslashes are double-escaped.
+    return lines.join('\\n').replace(/\\n+$/g, '');
+  } catch (e) {
+    return '';
+  }
+}
+
+function collectTerminalTextFromDOM(frame, maxLines) {
+  // Fallback when we can't access ttyd's internal terminal object: read rendered rows.
+  try {
+    if (!frame) return '';
+    const doc = frame.contentDocument;
+    if (!doc) return '';
+
+    // Prefer container innerText: it preserves line breaks in many browsers.
+    const rowsEl = doc.querySelector('.xterm-rows');
+    if (rowsEl) {
+      const t = (rowsEl.innerText || rowsEl.textContent || '').replace(/\\s+$/g, '');
+      if (t) {
+        // Keep only last N lines if requested.
+        if (maxLines && typeof maxLines === 'number') {
+          const parts = t.split('\\n');
+          const keep = Math.max(1, maxLines);
+          return parts.slice(Math.max(0, parts.length - keep)).join('\\n').replace(/\\n+$/g, '');
+        }
+        return t;
+      }
+    }
+
+    let rows = doc.querySelectorAll('.xterm-rows > div');
+    if ((!rows || !rows.length) && doc.querySelector('.xterm-rows')) {
+      rows = doc.querySelectorAll('.xterm-rows div');
+    }
+    if (!rows || !rows.length) {
+      const xterm = doc.querySelector('.xterm');
+      if (xterm) {
+        const t = (xterm.innerText || xterm.textContent || '').trim();
+        return t ? t : '';
+      }
+      const bt = (doc.body && (doc.body.innerText || doc.body.textContent) || '').trim();
+      return bt ? bt : '';
+    }
+    const keep = Math.max(1, maxLines || 4000);
+    const start = Math.max(0, rows.length - keep);
+    const lines = [];
+    for (let i = start; i < rows.length; i++) {
+      const t = rows[i].textContent || '';
+      lines.push(t.replace(/\\s+$/g, ''));
+    }
+    return lines.join('\\n').replace(/\\n+$/g, '');
+  } catch (e) {
+    return '';
+  }
+}
+
+function snapshotTerminalText(mode) {
+  const frame = getActiveFrame();
+  const term = getActiveTerminal();
+
+  // 1) Selection via terminal API
+  if (term) {
+    try {
+      if (typeof term.getSelection === 'function') {
+        const s = term.getSelection() || '';
+        if (s) return { text: s, source: 'term.selection' };
+      }
+    } catch (e) {}
+  }
+
+  // 2) Selection inside iframe
+  if (frame && frame.contentWindow) {
+    try {
+      const sel = frame.contentWindow.getSelection && frame.contentWindow.getSelection();
+      const s = sel ? String(sel.toString() || '') : '';
+      if (s) return { text: s, source: 'iframe.selection' };
+    } catch (e) {}
+  }
+
+  // 3) Full buffer via terminal API (best)
+  if (term) {
+    const t = collectTerminalBuffer(term, 4000);
+    if (t) return { text: t, source: 'term.buffer' };
+  }
+
+  // 4) DOM rows text
+  const dom = collectTerminalTextFromDOM(frame, 1200);
+  if (dom) return { text: dom, source: 'dom.rows' };
+
+  return { text: '', source: 'none' };
+}
+
+async function copyTextToClipboard(text) {
+  if (!text) return false;
+  try {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch (e) {}
+  try {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    ta.style.left = '-9999px';
+    document.body.appendChild(ta);
+    ta.focus();
+    ta.select();
+    const ok = document.execCommand('copy');
+    ta.remove();
+    return !!ok;
+  } catch (e) {
+    return false;
+  }
+}
+
+function isCoarsePointer() {
+  try {
+    return !!(window.matchMedia && window.matchMedia('(pointer: coarse)').matches);
+  } catch (e) {
+    return false;
+  }
+}
+
+function openCopyModal(text) {
+  const overlay = document.getElementById('copyModal');
+  const ta = document.getElementById('copyModalText');
+  if (!overlay || !ta) return;
+  ta.value = text || '';
+  overlay.classList.add('open');
+  setTimeout(() => {
+    try { ta.focus(); } catch (e) {}
+  }, 0);
+}
+
+function closeCopyModal() {
+  const overlay = document.getElementById('copyModal');
+  if (overlay) overlay.classList.remove('open');
+}
+
+async function copyFromActiveTerminal(mode) {
+  // On mobile, text selection inside xterm-in-iframe is unreliable. Always open the
+  // selectable modal, then populate it (with retries while the iframe is loading).
+  if (isCoarsePointer()) {
+    openCopyModal('Loading terminal text...');
+    let tries = 0;
+    const timer = setInterval(() => {
+      tries++;
+      const snap = snapshotTerminalText(mode);
+      if (snap.text) {
+        const ta = document.getElementById('copyModalText');
+        if (ta) ta.value = snap.text;
+        clearInterval(timer);
+        return;
+      }
+      if (tries >= 12) { // ~2.4s
+        const ta = document.getElementById('copyModalText');
+        if (ta && (ta.value || '').startsWith('Loading')) {
+          ta.value = 'Copy unavailable: terminal not ready or not accessible for readback.\\n\\nTip: wait a moment and tap Copy again.';
+        }
+        clearInterval(timer);
+      }
+    }, 200);
+    return;
+  }
+
+  const snap = snapshotTerminalText(mode);
+  if (!snap.text) {
+    showToast('Copy unavailable (terminal not ready)', true);
+    return;
+  }
+
+  const ok = await copyTextToClipboard(snap.text);
+  if (!ok) openCopyModal(snap.text);
+  else showToast('Copied to clipboard', false);
+}
+
+function suppressLeaveAlertInFrame(frame) {
+  try {
+    const w = frame.contentWindow;
+    if (!w) return;
+    // Clear common handlers first.
+    w.onbeforeunload = null;
+    if (w.document) w.document.onbeforeunload = null;
+    // Capture-phase blocker to prevent existing listeners from firing.
+    w.addEventListener('beforeunload', (e) => {
+      try {
+        e.stopImmediatePropagation();
+        e.stopPropagation();
+      } catch (err) {}
+    }, true);
+  } catch (e) {}
+}
+
+function reconnectAllTabsNoLeaveAlert() {
+  // Fallback path: apply without browser "leave alert".
+  const url = buildTermUrl({ disableLeaveAlert: true });
+  document.querySelectorAll('#termContainer iframe').forEach((f) => {
+    suppressLeaveAlertInFrame(f);
+    f.src = url;
+  });
+}
+
+function quickAdjustFontSize(delta) {
+  const input = document.getElementById('fontSize');
+  const cur = parseInt(input.value, 10) || 15;
+  const next = clampFontSize(cur + delta);
+  if (next === cur) return;
+  input.value = String(next);
+  updateQuickFontDisplay(next);
+  saveSettingsOnly();
+  reconnectAllTabsNoLeaveAlert();
+}
+
 function applySettings(initial) {
   const s = getSettings();
   localStorage.setItem('ttyd_settings', JSON.stringify(s));
   const url = buildTermUrl();
   document.querySelectorAll('#termContainer iframe').forEach(f => { f.src = url; });
+  updateQuickFontDisplay(parseInt(s.fontSize, 10) || 15);
   if (!initial) {
     document.getElementById('settingsPanel').classList.remove('open');
     document.getElementById('themePanel').classList.remove('open');
@@ -1655,22 +2186,26 @@ function sendKeyToTerminal(key, opts) {
 }
 
 function getCharKeyOptions(ch) {
-  const map = {
-    '/': { code: 'Slash', keyCode: 191 },
-    '\\\\': { code: 'Backslash', keyCode: 220 },
-    '-': { code: 'Minus', keyCode: 189 },
-    '_': { code: 'Minus', keyCode: 189, shiftKey: true },
-    '`': { code: 'Backquote', keyCode: 192 },
-    '~': { code: 'Backquote', keyCode: 192, shiftKey: true },
-    '|': { code: 'Backslash', keyCode: 220, shiftKey: true }
-  };
-  return map[ch] || { keyCode: ch.charCodeAt(0) };
+  // Avoid object literal keys with tricky escaping inside this embedded script.
+  if (ch === '/') return { code: 'Slash', keyCode: 191 };
+  if (ch === '\\\\') return { code: 'Backslash', keyCode: 220 };
+  if (ch === '-') return { code: 'Minus', keyCode: 189 };
+  if (ch === '_') return { code: 'Minus', keyCode: 189, shiftKey: true };
+  if (ch && ch.length === 1 && ch.charCodeAt(0) === 96) return { code: 'Backquote', keyCode: 192 };          // `
+  if (ch && ch.length === 1 && ch.charCodeAt(0) === 126) return { code: 'Backquote', keyCode: 192, shiftKey: true }; // ~
+  if (ch === '|') return { code: 'Backslash', keyCode: 220, shiftKey: true };
+  return { keyCode: (ch && ch.length ? ch.charCodeAt(0) : 0) };
 }
 
 document.getElementById('specialKeys').addEventListener('click', function(e) {
   var btn = e.target.closest('.skey');
   if (!btn) return;
   e.preventDefault();
+
+  if (btn.dataset.action === 'copy') {
+    copyFromActiveTerminal('smart');
+    return;
+  }
 
   // Modifier toggle
   if (btn.dataset.mod === 'ctrl') {
@@ -1725,7 +2260,40 @@ function init() {
     if (s.colorCursor) document.getElementById('colorCursor').value = s.colorCursor;
     if (s.colorSelection) document.getElementById('colorSelection').value = s.colorSelection;
   } catch(e) {}
+  updateQuickFontDisplay(parseInt(document.getElementById('fontSize').value || '15', 10) || 15);
+
+  document.getElementById('fontSize').addEventListener('input', () => {
+    const input = document.getElementById('fontSize');
+    const v = clampFontSize(parseInt(input.value, 10) || 15);
+    input.value = String(v);
+    updateQuickFontDisplay(v);
+    saveSettingsOnly();
+    const r = applyFontSizeToAllLiveSessions(v);
+    if (r.applied < r.total) {
+      reconnectAllTabsNoLeaveAlert();
+    }
+  });
+
   addTab();
+
+  // Copy modal wiring
+  const cmClose = document.getElementById('copyModalClose');
+  const cmCopy = document.getElementById('copyModalCopy');
+  const cmOverlay = document.getElementById('copyModal');
+  if (cmClose) cmClose.addEventListener('click', closeCopyModal);
+  if (cmOverlay) cmOverlay.addEventListener('click', (e) => {
+    if (e.target === cmOverlay) closeCopyModal();
+  });
+  if (cmCopy) cmCopy.addEventListener('click', async () => {
+    const ta = document.getElementById('copyModalText');
+    if (!ta) return;
+    const s = ta.selectionStart || 0;
+    const e = ta.selectionEnd || 0;
+    const sel = (e > s) ? ta.value.slice(s, e) : '';
+    const payload = sel || ta.value;
+    const ok = await copyTextToClipboard(payload);
+    showToast(ok ? 'Copied to clipboard' : 'Copy failed', !ok);
+  });
 }
 
 // --- File Browser ---
@@ -2822,6 +3390,17 @@ except Exception as ex:
             self.send_header("Content-Type", "text/html")
             self.end_headers()
             self.wfile.write(html.encode())
+        elif path == "/api/term-hook.js":
+            token = get_cookie_token(self.headers)
+            if not verify_token(token):
+                self.send_response(401)
+                self.end_headers()
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "application/javascript; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(TERM_HOOK_JS.encode("utf-8"))
         elif path == "/api/auth":
             token = get_cookie_token(self.headers)
             if verify_token(token):
