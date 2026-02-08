@@ -428,23 +428,92 @@ import hashlib
 import hmac
 import http.server
 import json
+import mimetypes
 import os
 import secrets
+import shlex
+import shutil
 import subprocess
 import time
 import urllib.parse
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def load_dotenv(path):
+    """Load KEY=VALUE pairs from .env into os.environ if not already set."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for raw in f:
+                line = raw.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key = key.strip()
+                if not key:
+                    continue
+                value = value.strip().strip('"').strip("'")
+                os.environ.setdefault(key, value)
+    except FileNotFoundError:
+        pass
+
+
+def env_bool(name, default=False):
+    val = os.environ.get(name)
+    if val is None:
+        return default
+    return val.strip().lower() in ("1", "true", "yes", "on")
+
+
+load_dotenv(os.path.join(BASE_DIR, ".env"))
+
 # --- Config ---
 SECRET_KEY = os.environ.get("TTYD_SECRET", secrets.token_hex(32))
-SESSION_MAX_AGE = 86400  # 24 hours
-PORT = 7682
+SESSION_MAX_AGE = int(os.environ.get("SESSION_MAX_AGE", "86400"))  # 24h default
+PORT = int(os.environ.get("AUTH_PORT", "7682"))
+ACCESS_LOG_ENABLED = env_bool("ACCESS_LOG_ENABLED", False)
+COOKIE_NAME = os.environ.get("SESSION_COOKIE_NAME", "__Host-ttyd_session")
+COOKIE_SECURE = env_bool("COOKIE_SECURE", True)
+
+SSHPASS_BIN = (
+    os.environ.get("SSHPASS_BIN")
+    or shutil.which("sshpass")
+    or "/usr/local/bin/sshpass"
+)
+SSH_BIN = os.environ.get("SSH_BIN") or shutil.which("ssh") or "/usr/bin/ssh"
+TTYD_BIN = (
+    os.environ.get("TTYD_BIN")
+    or shutil.which("ttyd")
+    or "/usr/local/bin/ttyd"
+)
+
+SECURITY_HEADERS = {
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "no-referrer",
+    "X-Frame-Options": "SAMEORIGIN",
+    "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
+    "Cache-Control": "no-store",
+    "Pragma": "no-cache",
+    "Content-Security-Policy": (
+        "default-src 'self'; "
+        "script-src 'self' 'unsafe-inline'; "
+        "style-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data: blob:; "
+        "media-src 'self' data: blob:; "
+        "connect-src 'self'; "
+        "frame-src 'self'; "
+        "object-src 'none'; "
+        "base-uri 'none'; "
+        "frame-ancestors 'self'"
+    ),
+}
 
 
 def authenticate(username, password):
     """Authenticate a user by attempting SSH to localhost with sshpass."""
     try:
         result = subprocess.run(
-            ["sshpass", "-p", password, "ssh",
+            [SSHPASS_BIN, "-p", password, SSH_BIN,
              "-o", "StrictHostKeyChecking=no",
              "-o", "ConnectTimeout=5",
              "-o", "PreferredAuthentications=password",
@@ -453,7 +522,8 @@ def authenticate(username, password):
             capture_output=True, text=True, timeout=10
         )
         return result.returncode == 0 and "ok" in result.stdout
-    except Exception:
+    except Exception as e:
+        print(f"authenticate error: {e}", flush=True)
         return False
 
 LOGIN_HTML = """<!DOCTYPE html>
@@ -1027,6 +1097,41 @@ APP_HTML = """<!DOCTYPE html>
     word-break: break-all;
     margin: 0;
   }
+  .fp-modal-body .fp-modal-note {
+    color: #9a9abf;
+    font-size: 13px;
+    margin-bottom: 10px;
+    display: none;
+  }
+  .fp-modal-body textarea {
+    display: none;
+    width: 100%;
+    min-height: 380px;
+    background: #0f3460;
+    border: 1px solid #1a4a7a;
+    border-radius: 8px;
+    color: #e2e2e2;
+    font-size: 13px;
+    font-family: 'Menlo', 'Monaco', 'Consolas', monospace;
+    line-height: 1.45;
+    padding: 10px 12px;
+    outline: none;
+    resize: vertical;
+  }
+  .fp-modal-body textarea:focus { border-color: #e94560; }
+  .fp-modal-body .fp-modal-image,
+  .fp-modal-body .fp-modal-video,
+  .fp-modal-body .fp-modal-audio {
+    display: none;
+    width: 100%;
+    max-height: 60vh;
+    border-radius: 8px;
+    background: #0f3460;
+    border: 1px solid #1a4a7a;
+  }
+  .fp-modal-body .fp-modal-image {
+    object-fit: contain;
+  }
 
   /* Drag-and-drop overlay */
   .fp-drop-overlay {
@@ -1244,11 +1349,18 @@ APP_HTML = """<!DOCTYPE html>
   <div class="fp-modal">
     <div class="fp-modal-header">
       <span class="fp-modal-title" id="fpModalTitle"></span>
+      <button class="fp-btn" id="fpModalEdit" style="display:none">&#9998; Edit</button>
+      <button class="fp-btn" id="fpModalSave" style="display:none">&#10003; Save</button>
       <button class="fp-btn" id="fpModalDownload">&#8595; Download</button>
-      <button class="fp-btn" onclick="document.getElementById('fpModal').classList.remove('open')">&#10005;</button>
+      <button class="fp-btn" onclick="closeFileModal()">&#10005;</button>
     </div>
     <div class="fp-modal-body">
+      <div class="fp-modal-note" id="fpModalNote"></div>
       <pre id="fpModalContent"></pre>
+      <textarea id="fpModalEditor" spellcheck="false"></textarea>
+      <img id="fpModalImage" class="fp-modal-image" alt="Image preview">
+      <video id="fpModalVideo" class="fp-modal-video" controls preload="metadata"></video>
+      <audio id="fpModalAudio" class="fp-modal-audio" controls preload="metadata"></audio>
     </div>
   </div>
 </div>
@@ -1471,7 +1583,7 @@ function reconnect() {
 }
 
 function logout() {
-  document.cookie = 'ttyd_session=; Path=/; Max-Age=0';
+  document.cookie = '__COOKIE_NAME__=; Path=/; Max-Age=0';
   localStorage.removeItem('ttyd_settings');
   window.location.href = '/login';
 }
@@ -1498,7 +1610,7 @@ document.addEventListener('keydown', (e) => {
   }
   // Escape = close preview modal
   if (e.key === 'Escape') {
-    document.getElementById('fpModal').classList.remove('open');
+    closeFileModal();
   }
 });
 
@@ -1531,6 +1643,7 @@ function sendKeyToTerminal(key, opts) {
       keyCode: opts.keyCode || 0,
       ctrlKey: !!opts.ctrlKey || modCtrl,
       altKey: !!opts.altKey || modAlt,
+      shiftKey: !!opts.shiftKey,
       bubbles: true,
       cancelable: true
     });
@@ -1539,6 +1652,19 @@ function sendKeyToTerminal(key, opts) {
   // Reset one-shot modifiers
   if (modCtrl) { modCtrl = false; document.getElementById('modCtrl').classList.remove('active'); }
   if (modAlt) { modAlt = false; document.getElementById('modAlt').classList.remove('active'); }
+}
+
+function getCharKeyOptions(ch) {
+  const map = {
+    '/': { code: 'Slash', keyCode: 191 },
+    '\\\\': { code: 'Backslash', keyCode: 220 },
+    '-': { code: 'Minus', keyCode: 189 },
+    '_': { code: 'Minus', keyCode: 189, shiftKey: true },
+    '`': { code: 'Backquote', keyCode: 192 },
+    '~': { code: 'Backquote', keyCode: 192, shiftKey: true },
+    '|': { code: 'Backslash', keyCode: 220, shiftKey: true }
+  };
+  return map[ch] || { keyCode: ch.charCodeAt(0) };
 }
 
 document.getElementById('specialKeys').addEventListener('click', function(e) {
@@ -1569,7 +1695,7 @@ document.getElementById('specialKeys').addEventListener('click', function(e) {
 
   // Character keys
   if (btn.dataset.char !== undefined) {
-    sendKeyToTerminal(btn.dataset.char, { keyCode: btn.dataset.char.charCodeAt(0) });
+    sendKeyToTerminal(btn.dataset.char, getCharKeyOptions(btn.dataset.char));
     return;
   }
 
@@ -1604,6 +1730,130 @@ function init() {
 
 // --- File Browser ---
 let fpCurrentPath = '~';
+let fpCurrentPathToken = '';
+let fpParentToken = '';
+let fpModalPath = '';
+let fpModalText = '';
+let fpModalIsText = false;
+let fpModalEditing = false;
+let fpModalKind = 'binary';
+
+function isImageFile(name) {
+  return /\\.(png|jpe?g|gif|webp|bmp|svg|ico|avif|heic)$/i.test(name || '');
+}
+
+function isVideoFile(name) {
+  return /\\.(mp4|webm|ogg|mov|m4v)$/i.test(name || '');
+}
+
+function isAudioFile(name) {
+  return /\\.(mp3|wav|m4a|aac|flac|ogg|oga|opus)$/i.test(name || '');
+}
+
+function getInlinePreviewUrl(pathToken) {
+  return '/api/files/download?inline=1&path_token=' + encodeURIComponent(pathToken);
+}
+
+function closeFileModal() {
+  fpModalPath = '';
+  fpModalText = '';
+  fpModalIsText = false;
+  fpModalEditing = false;
+  fpModalKind = 'binary';
+  const img = document.getElementById('fpModalImage');
+  const vid = document.getElementById('fpModalVideo');
+  const aud = document.getElementById('fpModalAudio');
+  img.style.display = 'none';
+  img.src = '';
+  vid.pause();
+  vid.style.display = 'none';
+  vid.removeAttribute('src');
+  vid.load();
+  aud.pause();
+  aud.style.display = 'none';
+  aud.removeAttribute('src');
+  aud.load();
+  document.getElementById('fpModal').classList.remove('open');
+  document.getElementById('fpModalContent').style.display = 'block';
+  document.getElementById('fpModalEditor').style.display = 'none';
+  document.getElementById('fpModalNote').style.display = 'none';
+  document.getElementById('fpModalEdit').style.display = 'none';
+  document.getElementById('fpModalSave').style.display = 'none';
+}
+
+function setModalEditing(editing) {
+  fpModalEditing = !!editing;
+  const pre = document.getElementById('fpModalContent');
+  const editor = document.getElementById('fpModalEditor');
+  const editBtn = document.getElementById('fpModalEdit');
+  const saveBtn = document.getElementById('fpModalSave');
+  const note = document.getElementById('fpModalNote');
+  const img = document.getElementById('fpModalImage');
+  const vid = document.getElementById('fpModalVideo');
+  const aud = document.getElementById('fpModalAudio');
+
+  pre.style.display = 'none';
+  editor.style.display = 'none';
+  img.style.display = 'none';
+  vid.style.display = 'none';
+  aud.style.display = 'none';
+  editBtn.style.display = 'none';
+  saveBtn.style.display = 'none';
+  note.style.display = 'none';
+
+  if (fpModalKind === 'text') {
+    editBtn.style.display = 'inline-block';
+    editBtn.innerHTML = fpModalEditing ? '&#10005; Cancel' : '&#9998; Edit';
+    saveBtn.style.display = fpModalEditing ? 'inline-block' : 'none';
+    pre.style.display = fpModalEditing ? 'none' : 'block';
+    editor.style.display = fpModalEditing ? 'block' : 'none';
+    return;
+  }
+
+  if (fpModalKind === 'image') {
+    img.style.display = 'block';
+    return;
+  }
+
+  if (fpModalKind === 'video') {
+    vid.style.display = 'block';
+    return;
+  }
+
+  if (fpModalKind === 'audio') {
+    aud.style.display = 'block';
+    return;
+  }
+
+  note.style.display = 'block';
+}
+
+function startEditFile() {
+  if (!fpModalIsText) return;
+  document.getElementById('fpModalEditor').value = fpModalText;
+  setModalEditing(true);
+}
+
+async function saveEditedFile() {
+  if (!fpModalIsText || !fpModalPath) return;
+  const editor = document.getElementById('fpModalEditor');
+  const newContent = editor.value;
+  try {
+    const res = await fetch('/api/files/write', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ path_token: fpModalPath, content: newContent }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || data.error) throw new Error(data.error || ('HTTP ' + res.status));
+    fpModalText = newContent;
+    document.getElementById('fpModalContent').textContent = fpModalText;
+    setModalEditing(false);
+    fetchFiles(fpCurrentPathToken);
+  } catch (e) {
+    alert('Save failed: ' + e.message);
+  }
+}
 
 function toggleFilePanel() {
   const panel = document.getElementById('filePanel');
@@ -1613,20 +1863,25 @@ function toggleFilePanel() {
   document.getElementById('settingsBtn').classList.remove('active');
   document.getElementById('themePanel').classList.remove('open');
   document.getElementById('themeBtn').classList.remove('active');
-  if (open) fetchFiles(fpCurrentPath);
+  if (open) fetchFiles(fpCurrentPathToken);
 }
 
-async function fetchFiles(path) {
-  fpCurrentPath = path;
+async function fetchFiles(pathToken) {
   const list = document.getElementById('fpList');
   list.innerHTML = '<div style="padding:20px;color:#7a7a9e;text-align:center;">Loading...</div>';
   try {
-    const res = await fetch('/api/files/list?path=' + encodeURIComponent(path));
+    let url = '/api/files/list';
+    if (pathToken) {
+      url += '?path_token=' + encodeURIComponent(pathToken);
+    }
+    const res = await fetch(url);
     if (!res.ok) throw new Error('HTTP ' + res.status);
     const data = await res.json();
     if (data.error) { list.innerHTML = '<div style="padding:12px;color:#e94560;">' + escHtml(data.error) + '</div>'; return; }
     fpCurrentPath = data.path;
-    renderBreadcrumbs(data.path);
+    fpCurrentPathToken = data.path_token || '';
+    fpParentToken = data.parent_token || '';
+    renderBreadcrumbs(data.breadcrumbs || []);
     renderFileList(data.entries);
   } catch (e) {
     list.innerHTML = '<div style="padding:12px;color:#e94560;">Error: ' + escHtml(e.message) + '</div>';
@@ -1639,28 +1894,20 @@ function escHtml(s) {
   return d.innerHTML;
 }
 
-function renderBreadcrumbs(absPath) {
+function renderBreadcrumbs(breadcrumbs) {
   const bc = document.getElementById('fpBreadcrumbs');
   bc.innerHTML = '';
-  const parts = absPath.split('/').filter(Boolean);
-  // Root
-  const root = document.createElement('span');
-  root.className = 'fp-crumb';
-  root.textContent = '/';
-  root.onclick = () => fetchFiles('/');
-  bc.appendChild(root);
-  let built = '';
-  parts.forEach((p, i) => {
-    built += '/' + p;
-    const sep = document.createElement('span');
-    sep.textContent = ' / ';
-    sep.style.color = '#3a3a5a';
-    bc.appendChild(sep);
+  (breadcrumbs || []).forEach((c, i) => {
+    if (i > 0) {
+      const sep = document.createElement('span');
+      sep.textContent = ' / ';
+      sep.style.color = '#3a3a5a';
+      bc.appendChild(sep);
+    }
     const crumb = document.createElement('span');
     crumb.className = 'fp-crumb';
-    crumb.textContent = p;
-    const target = built;
-    crumb.onclick = () => fetchFiles(target);
+    crumb.textContent = c.name || '/';
+    crumb.onclick = () => fetchFiles(c.token || '');
     bc.appendChild(crumb);
   });
   // Scroll to end
@@ -1671,11 +1918,11 @@ function renderFileList(entries) {
   const list = document.getElementById('fpList');
   list.innerHTML = '';
   // Parent directory link
-  if (fpCurrentPath !== '/') {
+  if (fpParentToken) {
     const parent = document.createElement('div');
     parent.className = 'fp-item';
     parent.innerHTML = '<span class="fp-item-icon">&#128193;</span><span class="fp-item-name">..</span>';
-    parent.onclick = () => fetchFiles(fpCurrentPath + '/..');
+    parent.onclick = () => fetchFiles(fpParentToken);
     list.appendChild(parent);
   }
   entries.forEach(e => {
@@ -1704,52 +1951,102 @@ function renderFileList(entries) {
       dl.className = 'fp-act';
       dl.innerHTML = '&#8595;';
       dl.title = 'Download';
-      dl.onclick = (ev) => { ev.stopPropagation(); downloadFile(e.name); };
+      dl.onclick = (ev) => { ev.stopPropagation(); downloadFile(e.token, e.name); };
       actions.appendChild(dl);
     }
     const ren = document.createElement('button');
     ren.className = 'fp-act';
     ren.innerHTML = '&#9998;';
     ren.title = 'Rename';
-    ren.onclick = (ev) => { ev.stopPropagation(); renameFile(e.name); };
+    ren.onclick = (ev) => { ev.stopPropagation(); renameFile(e.token, e.name); };
     actions.appendChild(ren);
     const del = document.createElement('button');
     del.className = 'fp-act';
     del.innerHTML = '&#128465;';
     del.title = 'Delete';
     del.style.color = '#e94560';
-    del.onclick = (ev) => { ev.stopPropagation(); deleteFile(e.name, e.type); };
+    del.onclick = (ev) => { ev.stopPropagation(); deleteFile(e.token, e.name, e.type); };
     actions.appendChild(del);
     item.appendChild(actions);
     // Click handler
     item.onclick = () => {
-      if (e.type === 'dir') fetchFiles(fpCurrentPath + '/' + e.name);
-      else previewFile(e.name);
+      if (e.type === 'dir') fetchFiles(e.token);
+      else previewFile(e.token, e.name);
     };
     list.appendChild(item);
   });
 }
 
-async function previewFile(name) {
-  const path = fpCurrentPath + '/' + name;
+async function previewFile(pathToken, name) {
+  const lowerName = (name || '').toLowerCase();
+  fpModalPath = pathToken;
+  document.getElementById('fpModalTitle').textContent = name;
+  document.getElementById('fpModalDownload').onclick = () => downloadFile(pathToken, name);
+  document.getElementById('fpModalSave').onclick = saveEditedFile;
+  document.getElementById('fpModalEdit').onclick = () => {
+    if (fpModalEditing) {
+      document.getElementById('fpModalEditor').value = fpModalText;
+      setModalEditing(false);
+    } else {
+      startEditFile();
+    }
+  };
+
+  if (isImageFile(lowerName)) {
+    fpModalKind = 'image';
+    fpModalIsText = false;
+    document.getElementById('fpModalNote').textContent = '';
+    document.getElementById('fpModalImage').src = getInlinePreviewUrl(pathToken);
+    setModalEditing(false);
+    document.getElementById('fpModal').classList.add('open');
+    return;
+  }
+
+  if (isVideoFile(lowerName)) {
+    fpModalKind = 'video';
+    fpModalIsText = false;
+    document.getElementById('fpModalNote').textContent = '';
+    const vid = document.getElementById('fpModalVideo');
+    vid.src = getInlinePreviewUrl(pathToken);
+    setModalEditing(false);
+    document.getElementById('fpModal').classList.add('open');
+    return;
+  }
+
+  if (isAudioFile(lowerName)) {
+    fpModalKind = 'audio';
+    fpModalIsText = false;
+    document.getElementById('fpModalNote').textContent = '';
+    const aud = document.getElementById('fpModalAudio');
+    aud.src = getInlinePreviewUrl(pathToken);
+    setModalEditing(false);
+    document.getElementById('fpModal').classList.add('open');
+    return;
+  }
+
   try {
-    const res = await fetch('/api/files/read?path=' + encodeURIComponent(path));
+    const res = await fetch('/api/files/read?path_token=' + encodeURIComponent(pathToken));
     if (!res.ok) throw new Error('HTTP ' + res.status);
     const data = await res.json();
     if (data.error) { alert(data.error); return; }
-    document.getElementById('fpModalTitle').textContent = name;
-    document.getElementById('fpModalContent').textContent = data.content;
-    document.getElementById('fpModalDownload').onclick = () => downloadFile(name);
+    fpModalIsText = !!data.is_text;
+    fpModalKind = fpModalIsText ? 'text' : 'binary';
+    fpModalText = data.content || '';
+    document.getElementById('fpModalContent').textContent = fpModalText;
+    document.getElementById('fpModalEditor').value = fpModalText;
+    document.getElementById('fpModalNote').textContent = fpModalIsText
+      ? ''
+      : 'Binary file preview is disabled. Use Download.';
+    setModalEditing(false);
     document.getElementById('fpModal').classList.add('open');
   } catch (e) {
     alert('Cannot preview: ' + e.message);
   }
 }
 
-function downloadFile(name) {
-  const path = fpCurrentPath + '/' + name;
+function downloadFile(pathToken, name) {
   const a = document.createElement('a');
-  a.href = '/api/files/download?path=' + encodeURIComponent(path);
+  a.href = '/api/files/download?path_token=' + encodeURIComponent(pathToken);
   a.download = name;
   document.body.appendChild(a);
   a.click();
@@ -1761,8 +2058,13 @@ async function handleUpload(files) {
   for (const file of files) {
     try {
       const body = await file.arrayBuffer();
-      const res = await fetch('/api/files/upload?path=' + encodeURIComponent(fpCurrentPath) + '&name=' + encodeURIComponent(file.name), {
+      const nameB64 = btoa(unescape(encodeURIComponent(file.name))).replace(/\\+/g, '-').replace(/\\//g, '_').replace(/=+$/, '');
+      const res = await fetch('/api/files/upload?path_token=' + encodeURIComponent(fpCurrentPathToken), {
         method: 'POST',
+        headers: {
+          'X-Path-Token': fpCurrentPathToken,
+          'X-File-Name-B64': nameB64,
+        },
         body: body,
       });
       if (!res.ok) {
@@ -1773,7 +2075,7 @@ async function handleUpload(files) {
       alert('Upload error: ' + e.message);
     }
   }
-  fetchFiles(fpCurrentPath);
+  fetchFiles(fpCurrentPathToken);
 }
 
 async function createFolder() {
@@ -1783,40 +2085,40 @@ async function createFolder() {
     const res = await fetch('/api/files/mkdir', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({path: fpCurrentPath + '/' + name}),
+      body: JSON.stringify({path_token: fpCurrentPathToken, name: name}),
     });
     const data = await res.json();
     if (data.error) alert(data.error);
-    else fetchFiles(fpCurrentPath);
+    else fetchFiles(fpCurrentPathToken);
   } catch (e) { alert('Error: ' + e.message); }
 }
 
-async function deleteFile(name, type) {
+async function deleteFile(pathToken, name, type) {
   if (!confirm('Delete ' + (type === 'dir' ? 'folder' : 'file') + ' "' + name + '"?')) return;
   try {
     const res = await fetch('/api/files/delete', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({path: fpCurrentPath + '/' + name}),
+      body: JSON.stringify({path_token: pathToken}),
     });
     const data = await res.json();
     if (data.error) alert(data.error);
-    else fetchFiles(fpCurrentPath);
+    else fetchFiles(fpCurrentPathToken);
   } catch (e) { alert('Error: ' + e.message); }
 }
 
-async function renameFile(name) {
+async function renameFile(pathToken, name) {
   const newName = prompt('Rename "' + name + '" to:', name);
   if (!newName || newName === name) return;
   try {
     const res = await fetch('/api/files/rename', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({old: fpCurrentPath + '/' + name, new: fpCurrentPath + '/' + newName}),
+      body: JSON.stringify({path_token: pathToken, new_name: newName}),
     });
     const data = await res.json();
     if (data.error) alert(data.error);
-    else fetchFiles(fpCurrentPath);
+    else fetchFiles(fpCurrentPathToken);
   } catch (e) { alert('Error: ' + e.message); }
 }
 
@@ -1891,13 +2193,14 @@ def spawn_user_ttyd(username, password):
     port = next_port
     next_port += 1
 
+    ttyd_cmd = f"{shlex.quote(TTYD_BIN)} -W -p {port} bash -l"
     proc = subprocess.Popen(
-        ["sshpass", "-p", password, "ssh",
+        [SSHPASS_BIN, "-p", password, SSH_BIN,
          "-o", "StrictHostKeyChecking=no",
          "-o", "PubkeyAuthentication=no",
          "-o", "ServerAliveInterval=30",
          f"{username}@127.0.0.1",
-         f"/usr/local/bin/ttyd -W -p {port} bash -l"],
+         ttyd_cmd],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
     )
     user_instances[username] = {"port": port, "proc": proc, "password": password}
@@ -1939,9 +2242,51 @@ def get_cookie_token(headers):
     cookie = headers.get("Cookie", "")
     for part in cookie.split(";"):
         part = part.strip()
-        if part.startswith("ttyd_session="):
+        if part.startswith(f"{COOKIE_NAME}="):
             return part.split("=", 1)[1]
     return ""
+
+
+def make_path_token(username, path):
+    """Return opaque signed token for an absolute path."""
+    raw_path = os.path.abspath(path)
+    path_b64 = base64.urlsafe_b64encode(raw_path.encode()).decode().rstrip("=")
+    sig = hmac.new(
+        SECRET_KEY.encode(),
+        f"{username}:{raw_path}".encode(),
+        hashlib.sha256,
+    ).hexdigest()
+    return f"{path_b64}.{sig}"
+
+
+def parse_path_token(username, token):
+    """Decode/verify a path token; return abs path or None."""
+    try:
+        path_b64, sig = token.rsplit(".", 1)
+        pad = "=" * ((4 - len(path_b64) % 4) % 4)
+        raw_path = base64.urlsafe_b64decode((path_b64 + pad).encode()).decode()
+        raw_path = os.path.abspath(raw_path)
+        expected = hmac.new(
+            SECRET_KEY.encode(),
+            f"{username}:{raw_path}".encode(),
+            hashlib.sha256,
+        ).hexdigest()
+        if not hmac.compare_digest(sig, expected):
+            return None
+        return raw_path
+    except Exception:
+        return None
+
+
+def breadcrumb_tokens(username, abs_path):
+    """Return breadcrumb list with opaque tokens for navigation."""
+    parts = abs_path.strip("/").split("/") if abs_path != "/" else []
+    crumbs = [{"name": "/", "token": make_path_token(username, "/")}]
+    built = ""
+    for p in parts:
+        built += "/" + p
+        crumbs.append({"name": p, "token": make_path_token(username, built)})
+    return crumbs
 
 
 def run_as_user(username, python_script, timeout=10):
@@ -1952,7 +2297,7 @@ def run_as_user(username, python_script, timeout=10):
     password = info["password"]
     try:
         result = subprocess.run(
-            ["sshpass", "-p", password, "ssh",
+            [SSHPASS_BIN, "-p", password, SSH_BIN,
              "-o", "StrictHostKeyChecking=no",
              "-o", "PubkeyAuthentication=no",
              "-o", "ConnectTimeout=5",
@@ -1968,7 +2313,13 @@ def run_as_user(username, python_script, timeout=10):
 
 class AuthHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
-        pass  # quiet
+        if ACCESS_LOG_ENABLED:
+            super().log_message(fmt, *args)
+
+    def end_headers(self):
+        for k, v in SECURITY_HEADERS.items():
+            self.send_header(k, v)
+        super().end_headers()
 
     def _get_authenticated_user(self):
         token = get_cookie_token(self.headers)
@@ -1985,6 +2336,21 @@ class AuthHandler(http.server.BaseHTTPRequestHandler):
     def _send_error(self, code, msg):
         self._send_json(code, {"error": msg})
 
+    def _path_from_params(self, username, params):
+        token = params.get("path_token", [""])[0]
+        if token:
+            p = parse_path_token(username, token)
+            return p
+        raw = params.get("path", [""])[0]
+        return os.path.expanduser(raw) if raw else None
+
+    def _path_from_body(self, username, req):
+        token = req.get("path_token", "")
+        if token:
+            return parse_path_token(username, token)
+        raw = req.get("path", "")
+        return os.path.expanduser(raw) if raw else None
+
     # --- File API handlers ---
 
     def _handle_files_list(self, params):
@@ -1992,7 +2358,7 @@ class AuthHandler(http.server.BaseHTTPRequestHandler):
         if not username:
             self._send_error(401, "not authenticated")
             return
-        path = params.get("path", ["~"])[0]
+        path = self._path_from_params(username, params) or "~"
         script = f'''
 import os, json, stat
 p = os.path.expanduser({path!r})
@@ -2027,6 +2393,19 @@ except Exception as ex:
         if "error" in data:
             self._send_error(400, data["error"])
         else:
+            abs_path = os.path.abspath(data.get("path", "/"))
+            parent_token = None
+            if abs_path != "/":
+                parent = os.path.dirname(abs_path.rstrip("/")) or "/"
+                parent_token = make_path_token(username, parent)
+
+            for e in data.get("entries", []):
+                epath = os.path.join(abs_path, e.get("name", ""))
+                e["token"] = make_path_token(username, epath)
+
+            data["path_token"] = make_path_token(username, abs_path)
+            data["parent_token"] = parent_token
+            data["breadcrumbs"] = breadcrumb_tokens(username, abs_path)
             self._send_json(200, data)
 
     def _handle_files_read(self, params):
@@ -2034,7 +2413,7 @@ except Exception as ex:
         if not username:
             self._send_error(401, "not authenticated")
             return
-        path = params.get("path", [""])[0]
+        path = self._path_from_params(username, params)
         if not path:
             self._send_error(400, "missing path")
             return
@@ -2046,12 +2425,91 @@ try:
     if size > 102400:
         print(json.dumps({{"error": "file too large (>100KB)"}}))
     else:
-        with open(p, "r", errors="replace") as f:
-            print(json.dumps({{"content": f.read(), "size": size}}))
+        with open(p, "rb") as f:
+            data = f.read()
+        is_text = True
+        content = ""
+        if b"\\x00" in data:
+            is_text = False
+        else:
+            try:
+                content = data.decode("utf-8")
+            except UnicodeDecodeError:
+                is_text = False
+        print(json.dumps({{
+            "is_text": is_text,
+            "content": content if is_text else "",
+            "size": size
+        }}))
 except Exception as ex:
     print(json.dumps({{"error": str(ex)}}))
 '''
         rc, out, err = run_as_user(username, script)
+        if rc != 0:
+            self._send_error(500, err.decode(errors="replace"))
+            return
+        try:
+            data = json.loads(out)
+        except Exception:
+            self._send_error(500, out.decode(errors="replace"))
+            return
+        if "error" in data:
+            self._send_error(400, data["error"])
+        else:
+            self._send_json(200, data)
+
+    def _handle_files_write(self):
+        username = self._get_authenticated_user()
+        if not username:
+            self._send_error(401, "not authenticated")
+            return
+
+        length = int(self.headers.get("Content-Length", 0))
+        if length > 512 * 1024:
+            self._send_error(413, "payload too large")
+            return
+        body = self.rfile.read(length)
+        try:
+            req = json.loads(body)
+        except Exception:
+            self._send_error(400, "invalid json")
+            return
+
+        path = self._path_from_body(username, req)
+        content = req.get("content")
+        if not path or not isinstance(content, str):
+            self._send_error(400, "missing path or content")
+            return
+
+        content_size = len(content.encode("utf-8"))
+        if content_size > 102400:
+            self._send_error(400, "file too large (>100KB)")
+            return
+
+        script = f'''
+import os, json
+p = os.path.expanduser({path!r})
+content = {content!r}
+try:
+    if os.path.isdir(p):
+        raise Exception("path is a directory")
+    if os.path.exists(p):
+        with open(p, "rb") as f:
+            sample = f.read(8192)
+        if b"\\x00" in sample:
+            raise Exception("binary file cannot be edited here")
+        try:
+            sample.decode("utf-8")
+        except UnicodeDecodeError:
+            raise Exception("non-UTF-8 file cannot be edited here")
+
+    with open(p, "w", encoding="utf-8", newline="") as f:
+        f.write(content)
+    print(json.dumps({{"ok": True, "size": len(content.encode("utf-8"))}}))
+except Exception as ex:
+    print(json.dumps({{"error": str(ex)}}))
+'''
+        rc, out, err = run_as_user(username, script, timeout=20)
         if rc != 0:
             self._send_error(500, err.decode(errors="replace"))
             return
@@ -2070,7 +2528,8 @@ except Exception as ex:
         if not username:
             self._send_error(401, "not authenticated")
             return
-        path = params.get("path", [""])[0]
+        path = self._path_from_params(username, params)
+        inline = params.get("inline", ["0"])[0].lower() in ("1", "true", "yes")
         if not path:
             self._send_error(400, "missing path")
             return
@@ -2100,9 +2559,33 @@ except Exception as ex:
                 self._send_error(500, "decode error")
                 return
             fname = lines[2].decode(errors="replace").strip()
+            ext = os.path.splitext(fname.lower())[1]
+            content_type = mimetypes.guess_type(fname)[0]
+            if not content_type:
+                fallback_types = {
+                    ".mp3": "audio/mpeg",
+                    ".wav": "audio/wav",
+                    ".m4a": "audio/mp4",
+                    ".aac": "audio/aac",
+                    ".flac": "audio/flac",
+                    ".ogg": "audio/ogg",
+                    ".oga": "audio/ogg",
+                    ".opus": "audio/ogg",
+                    ".mp4": "video/mp4",
+                    ".m4v": "video/mp4",
+                    ".webm": "video/webm",
+                    ".mov": "video/quicktime",
+                    ".jpg": "image/jpeg",
+                    ".jpeg": "image/jpeg",
+                    ".png": "image/png",
+                    ".gif": "image/gif",
+                    ".webp": "image/webp",
+                }
+                content_type = fallback_types.get(ext, "application/octet-stream")
             self.send_response(200)
-            self.send_header("Content-Type", "application/octet-stream")
-            self.send_header("Content-Disposition", f'attachment; filename="{fname}"')
+            self.send_header("Content-Type", content_type if inline else "application/octet-stream")
+            disp = "inline" if inline else "attachment"
+            self.send_header("Content-Disposition", f'{disp}; filename="{fname}"')
             self.send_header("Content-Length", str(len(file_data)))
             self.end_headers()
             self.wfile.write(file_data)
@@ -2115,8 +2598,28 @@ except Exception as ex:
         if not username:
             self._send_error(401, "not authenticated")
             return
-        dir_path = params.get("path", [""])[0]
-        file_name = params.get("name", [""])[0]
+
+        dir_path = self._path_from_params(username, params)
+        if not dir_path:
+            dir_token = self.headers.get("X-Path-Token", "")
+            if dir_token:
+                dir_path = parse_path_token(username, dir_token)
+
+        name_b64 = self.headers.get("X-File-Name-B64", "")
+        file_name = ""
+        if name_b64:
+            try:
+                pad = "=" * ((4 - len(name_b64) % 4) % 4)
+                file_name = base64.urlsafe_b64decode((name_b64 + pad).encode()).decode()
+            except Exception:
+                file_name = ""
+        if not file_name:
+            file_name = params.get("name", [""])[0]
+
+        file_name = os.path.basename(file_name)
+        if file_name in ("", ".", ".."):
+            self._send_error(400, "invalid file name")
+            return
         if not dir_path or not file_name:
             self._send_error(400, "missing path or name")
             return
@@ -2164,7 +2667,14 @@ except Exception as ex:
         except Exception:
             self._send_error(400, "invalid json")
             return
+        parent = self._path_from_body(username, req)
+        name = os.path.basename(req.get("name", ""))
+        if name in (".", ".."):
+            self._send_error(400, "invalid folder name")
+            return
         path = req.get("path", "")
+        if parent and name:
+            path = os.path.join(parent, name)
         if not path:
             self._send_error(400, "missing path")
             return
@@ -2203,7 +2713,7 @@ except Exception as ex:
         except Exception:
             self._send_error(400, "invalid json")
             return
-        path = req.get("path", "")
+        path = self._path_from_body(username, req)
         if not path:
             self._send_error(400, "missing path")
             return
@@ -2245,8 +2755,15 @@ except Exception as ex:
         except Exception:
             self._send_error(400, "invalid json")
             return
-        old = req.get("old", "")
-        new = req.get("new", "")
+        old = self._path_from_body(username, req) or req.get("old", "")
+        new_name = os.path.basename(req.get("new_name", ""))
+        if new_name in (".", ".."):
+            self._send_error(400, "invalid new name")
+            return
+        if old and new_name:
+            new = os.path.join(os.path.dirname(old), new_name)
+        else:
+            new = req.get("new", "")
         if not old or not new:
             self._send_error(400, "missing old or new")
             return
@@ -2295,7 +2812,12 @@ except Exception as ex:
                 self.end_headers()
                 return
             # Inject the user's ttyd port into the app HTML
-            html = APP_HTML.replace("__TTYD_PORT__", str(port)).replace("__USERNAME__", username)
+            html = (
+                APP_HTML
+                .replace("__TTYD_PORT__", str(port))
+                .replace("__USERNAME__", username)
+                .replace("__COOKIE_NAME__", COOKIE_NAME)
+            )
             self.send_response(200)
             self.send_header("Content-Type", "text/html")
             self.end_headers()
@@ -2338,8 +2860,16 @@ except Exception as ex:
                 port = spawn_user_ttyd(username, password)
                 token = make_token(username)
                 self.send_response(200)
-                self.send_header("Set-Cookie",
-                    f"ttyd_session={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={SESSION_MAX_AGE}")
+                cookie_parts = [
+                    f"{COOKIE_NAME}={token}",
+                    "Path=/",
+                    "HttpOnly",
+                    "SameSite=Strict",
+                    f"Max-Age={SESSION_MAX_AGE}",
+                ]
+                if COOKIE_SECURE:
+                    cookie_parts.append("Secure")
+                self.send_header("Set-Cookie", "; ".join(cookie_parts))
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
                 self.wfile.write(json.dumps({"ok": True, "port": port}).encode())
@@ -2350,6 +2880,8 @@ except Exception as ex:
                 self.wfile.write(b'{"ok":false}')
         elif path == "/api/files/upload":
             self._handle_files_upload(params)
+        elif path == "/api/files/write":
+            self._handle_files_write()
         elif path == "/api/files/mkdir":
             self._handle_files_mkdir()
         elif path == "/api/files/delete":
