@@ -11,6 +11,7 @@ import os
 import secrets
 import shlex
 import shutil
+import socket
 import subprocess
 import time
 import urllib.parse
@@ -65,6 +66,29 @@ TTYD_BIN = (
     or "/usr/local/bin/ttyd"
 )
 
+def _safe_ascii_filename(name):
+    # Header values must be latin-1 encodable. Provide an ASCII fallback for
+    # Content-Disposition and add a UTF-8 filename* parameter separately.
+    if not isinstance(name, str):
+        name = ""
+    name = name.replace("\\", "_").replace('"', "_")
+    # Strip control chars.
+    name = "".join(ch for ch in name if 32 <= ord(ch) < 127)
+    name = name.strip() or "download"
+    return name
+
+
+def content_disposition(disp, filename):
+    # RFC 6266 + RFC 5987: ASCII filename fallback plus UTF-8 filename*.
+    disp = "inline" if str(disp).lower() == "inline" else "attachment"
+    fname_ascii = _safe_ascii_filename(filename)
+    try:
+        fname_utf8 = str(filename)
+    except Exception:
+        fname_utf8 = fname_ascii
+    fname_star = urllib.parse.quote(fname_utf8.encode("utf-8"), safe=b"")
+    return f"{disp}; filename=\"{fname_ascii}\"; filename*=UTF-8''{fname_star}"
+
 DEFAULT_SECURITY_HEADERS = {
     "X-Content-Type-Options": "nosniff",
     "Referrer-Policy": "no-referrer",
@@ -100,6 +124,7 @@ def authenticate(username, password):
              "-o", "ConnectTimeout=5",
              "-o", "PreferredAuthentications=password",
              "-o", "PubkeyAuthentication=no",
+             "-o", "PasswordAuthentication=yes",
              f"{username}@127.0.0.1", "echo", "ok"],
             capture_output=True, text=True, timeout=10
         )
@@ -219,6 +244,10 @@ document.getElementById('form').addEventListener('submit', async (e) => {
   if (res.ok) {
     window.location.href = '/';
   } else {
+    try {
+      const data = await res.json();
+      if (data && data.error) err.textContent = data.error;
+    } catch (e2) {}
     err.style.display = 'block';
   }
 });
@@ -2612,7 +2641,50 @@ init();
 
 # --- Per-user ttyd instance management ---
 user_instances = {}  # {username: {"port": int, "proc": Popen}}
-next_port = 7700
+next_port = int(os.environ.get("TTYD_START_PORT", "7700"))
+
+
+def port_is_free(port):
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(("127.0.0.1", int(port)))
+        return True
+    except OSError:
+        return False
+    finally:
+        try:
+            s.close()
+        except Exception:
+            pass
+
+
+def allocate_port():
+    global next_port
+    for _ in range(2000):
+        p = next_port
+        next_port += 1
+        if port_is_free(p):
+            return p
+    raise RuntimeError("unable to allocate free port")
+
+def wait_for_ttyd_ready(port, timeout=4.0):
+    """Return True if something is listening/responding on 127.0.0.1:port."""
+    deadline = time.time() + float(timeout)
+    while time.time() < deadline:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            s.settimeout(0.5)
+            s.connect(("127.0.0.1", int(port)))
+            return True
+        except OSError:
+            time.sleep(0.1)
+        finally:
+            try:
+                s.close()
+            except Exception:
+                pass
+    return False
 
 def spawn_user_ttyd(username, password):
     """Spawn a ttyd instance for the user via SSH. Returns the port."""
@@ -2626,20 +2698,33 @@ def spawn_user_ttyd(username, password):
         # Dead, clean up
         del user_instances[username]
 
-    port = next_port
-    next_port += 1
+    port = allocate_port()
 
-    ttyd_cmd = f"{shlex.quote(TTYD_BIN)} -W -p {port} bash -l"
+    # Bind ttyd to localhost only, so the per-user port isn't reachable directly from the LAN/Internet.
+    ttyd_cmd = f"{shlex.quote(TTYD_BIN)} -W -i 127.0.0.1 -p {port} bash -l"
     proc = subprocess.Popen(
         [SSHPASS_BIN, "-p", password, SSH_BIN,
          "-o", "StrictHostKeyChecking=no",
+         "-o", "ConnectTimeout=5",
+         "-o", "PreferredAuthentications=password",
          "-o", "PubkeyAuthentication=no",
+         "-o", "PasswordAuthentication=yes",
          "-o", "ServerAliveInterval=30",
          f"{username}@127.0.0.1",
          ttyd_cmd],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
     )
     user_instances[username] = {"port": port, "proc": proc, "password": password}
+    if not wait_for_ttyd_ready(port, timeout=4.0):
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+        try:
+            user_instances.pop(username, None)
+        except Exception:
+            pass
+        raise RuntimeError("ttyd failed to start")
     return port
 
 
@@ -2653,25 +2738,37 @@ def get_user_port(username):
     return None
 
 
-def make_token(username):
+def make_token(username, port):
     ts = str(int(time.time()))
-    msg = f"{username}:{ts}"
+    msg = f"{username}:{int(port)}:{ts}"
     sig = hmac.new(SECRET_KEY.encode(), msg.encode(), hashlib.sha256).hexdigest()
-    return f"{username}:{ts}:{sig}"
+    return f"{username}:{int(port)}:{ts}:{sig}"
 
 
 def verify_token(token):
-    """Verify token and return username if valid, else None."""
+    """Verify token and return (username, port) if valid, else (None, None)."""
     try:
-        username, ts, sig = token.split(":")
-        expected = hmac.new(SECRET_KEY.encode(), f"{username}:{ts}".encode(), hashlib.sha256).hexdigest()
+        parts = token.split(":")
+        if len(parts) == 4:
+            username, port_s, ts, sig = parts
+            msg = f"{username}:{int(port_s)}:{ts}"
+        elif len(parts) == 3:
+            # Legacy tokens (pre port-binding): treat as invalid for /ut authorization.
+            username, ts, sig = parts
+            port_s = ""
+            msg = f"{username}:{ts}"
+        else:
+            return None, None
+
+        expected = hmac.new(SECRET_KEY.encode(), msg.encode(), hashlib.sha256).hexdigest()
         if not hmac.compare_digest(sig, expected):
-            return None
+            return None, None
         if time.time() - int(ts) > SESSION_MAX_AGE:
-            return None
-        return username
+            return None, None
+        port = int(port_s) if port_s else None
+        return username, port
     except Exception:
-        return None
+        return None, None
 
 
 def get_cookie_token(headers):
@@ -2773,7 +2870,8 @@ class AuthHandler(http.server.BaseHTTPRequestHandler):
 
     def _get_authenticated_user(self):
         token = get_cookie_token(self.headers)
-        return verify_token(token)
+        username, _port = verify_token(token)
+        return username
 
     def _send_json(self, code, data):
         body = json.dumps(data).encode()
@@ -3036,7 +3134,7 @@ except Exception as ex:
             self.send_response(200)
             self.send_header("Content-Type", content_type if inline else "application/octet-stream")
             disp = "inline" if inline else "attachment"
-            self.send_header("Content-Disposition", f'{disp}; filename="{fname}"')
+            self.send_header("Content-Disposition", content_disposition(disp, fname))
             self.send_header("Content-Length", str(len(file_data)))
             self.end_headers()
             self.wfile.write(file_data)
@@ -3255,8 +3353,7 @@ except Exception as ex:
         elif path == "/app":
             # Extract username and port from session
             token = get_cookie_token(self.headers)
-            username = verify_token(token)
-            port = get_user_port(username) if username else None
+            username, port = verify_token(token)
             if not username or not port:
                 self.send_response(302)
                 self.send_header("Location", "/login")
@@ -3275,7 +3372,8 @@ except Exception as ex:
             self.wfile.write(html.encode())
         elif path == "/api/term-hook.js":
             token = get_cookie_token(self.headers)
-            if not verify_token(token):
+            username, _port = verify_token(token)
+            if not username:
                 self.send_response(401)
                 self.end_headers()
                 return
@@ -3286,12 +3384,30 @@ except Exception as ex:
             self.wfile.write(TERM_HOOK_JS.encode("utf-8"))
         elif path == "/api/auth":
             token = get_cookie_token(self.headers)
-            if verify_token(token):
-                self.send_response(200)
-                self.end_headers()
-            else:
+            username, token_port = verify_token(token)
+            if not username:
                 self.send_response(401)
                 self.end_headers()
+                return
+
+            # Optional authorization for /ut/<port>/ access.
+            # nginx passes the requested port in X-TTYD-Port (inherited var from /ut location).
+            req_port = (self.headers.get("X-TTYD-Port") or "").strip()
+            if req_port:
+                try:
+                    req_port_i = int(req_port)
+                except ValueError:
+                    self.send_response(401)
+                    self.end_headers()
+                    return
+                # Enforce that the cookie is bound to the requested ttyd port.
+                if token_port != req_port_i:
+                    self.send_response(401)
+                    self.end_headers()
+                    return
+
+            self.send_response(200)
+            self.end_headers()
         elif path == "/api/files/list":
             self._handle_files_list(params)
         elif path == "/api/files/read":
@@ -3319,8 +3435,15 @@ except Exception as ex:
             username = data.get("username", "")
             password = data.get("password", "")
             if authenticate(username, password):
-                port = spawn_user_ttyd(username, password)
-                token = make_token(username)
+                try:
+                    port = spawn_user_ttyd(username, password)
+                except Exception:
+                    self.send_response(500)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(b'{"ok":false,"error":"terminal startup failed"}')
+                    return
+                token = make_token(username, port)
                 self.send_response(200)
                 cookie_parts = [
                     f"{COOKIE_NAME}={token}",
@@ -3339,7 +3462,7 @@ except Exception as ex:
                 self.send_response(401)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
-                self.wfile.write(b'{"ok":false}')
+                self.wfile.write(b'{"ok":false,"error":"invalid username or password"}')
         elif path == "/api/files/upload":
             self._handle_files_upload(params)
         elif path == "/api/files/write":
