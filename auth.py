@@ -1817,6 +1817,15 @@ function isCoarsePointer() {
   }
 }
 
+function isIOS() {
+  try {
+    const ua = navigator.userAgent || '';
+    return /iPad|iPhone|iPod/.test(ua) || (ua.includes('Mac') && 'ontouchend' in document);
+  } catch (e) {
+    return false;
+  }
+}
+
 function openCopyModal(text) {
   const overlay = document.getElementById('copyModal');
   const ta = document.getElementById('copyModalText');
@@ -2480,23 +2489,69 @@ async function previewFile(pathToken, name) {
     const note = document.getElementById('fpModalNote');
     note.textContent = '';
     note.innerHTML = '';
-    if (isCoarsePointer && isCoarsePointer()) {
-      // Best-effort: keep it in the modal, but provide a one-tap fallback.
-      const msg = document.createElement('span');
-      msg.textContent = 'If the PDF preview is blank or says blocked, ';
-      const btn = document.createElement('button');
-      btn.className = 'fp-btn';
-      btn.style.padding = '4px 8px';
-      btn.style.marginLeft = '6px';
-      btn.textContent = 'Open in new tab';
-      btn.onclick = (ev) => {
-        ev.preventDefault();
-        try { window.open(url, '_blank', 'noopener'); } catch (e) {}
-      };
-      note.appendChild(msg);
-      note.appendChild(btn);
-    }
     const pdf = document.getElementById('fpModalPdf');
+
+    // iOS Safari often cannot display PDFs inside iframes and shows "content is blocked".
+    // Keep the user in the modal and provide explicit open actions instead.
+    if (isIOS()) {
+      const msg = document.createElement('div');
+      msg.textContent = 'PDF preview is blocked by iOS Safari when embedded. Open it instead:';
+      msg.style.marginBottom = '8px';
+
+      const row = document.createElement('div');
+      row.style.display = 'flex';
+      row.style.gap = '8px';
+      row.style.flexWrap = 'wrap';
+
+      const aNew = document.createElement('a');
+      aNew.className = 'fp-btn';
+      aNew.href = url;
+      aNew.target = '_blank';
+      aNew.rel = 'noopener';
+      aNew.textContent = 'Open in new tab';
+
+      const aHere = document.createElement('a');
+      aHere.className = 'fp-btn';
+      aHere.href = url;
+      aHere.textContent = 'Open here';
+
+      row.appendChild(aNew);
+      row.appendChild(aHere);
+      note.appendChild(msg);
+      note.appendChild(row);
+
+      // Don't try to set iframe src on iOS.
+      pdf.removeAttribute('src');
+      setModalEditing(false);
+      document.getElementById('fpModal').classList.add('open');
+      return;
+    }
+
+    // Android Chrome and other mobile browsers may not render PDFs reliably inside iframes.
+    // Try the embedded viewer, but always show a one-tap fallback to open directly.
+    if (isCoarsePointer && isCoarsePointer()) {
+      const msg = document.createElement('div');
+      msg.textContent = 'If the embedded PDF viewer is blank or blocked, open it directly:';
+      msg.style.marginBottom = '8px';
+
+      const row = document.createElement('div');
+      row.style.display = 'flex';
+      row.style.gap = '8px';
+      row.style.flexWrap = 'wrap';
+
+      const aNew = document.createElement('a');
+      aNew.className = 'fp-btn';
+      aNew.href = url;
+      aNew.target = '_blank';
+      aNew.rel = 'noopener';
+      aNew.textContent = 'Open in new tab';
+
+      row.appendChild(aNew);
+      note.appendChild(msg);
+      note.appendChild(row);
+    }
+
+    // Non-iOS: render inline in modal.
     pdf.src = url;
     setModalEditing(false);
     document.getElementById('fpModal').classList.add('open');
