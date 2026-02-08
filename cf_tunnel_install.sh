@@ -2258,6 +2258,22 @@ function isIOS() {
   }
 }
 
+function openInNewTab(url) {
+  try {
+    const a = document.createElement('a');
+    a.href = url;
+    a.target = '_blank';
+    a.rel = 'noopener';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    return true;
+  } catch (e) {
+    try { window.open(url, '_blank', 'noopener'); return true; } catch (e2) {}
+    return false;
+  }
+}
+
 function openCopyModal(text) {
   const overlay = document.getElementById('copyModal');
   const ta = document.getElementById('copyModalText');
@@ -2912,6 +2928,12 @@ async function previewFile(pathToken, name) {
 
   if (isPdfFile(lowerName)) {
     const url = getInlinePreviewUrl(pathToken);
+    // Mobile: don't embed PDFs (commonly blocked/blank). Open directly in a new tab.
+    if (isCoarsePointer && isCoarsePointer()) {
+      openInNewTab(url);
+      showToast('Opened PDF in a new tab', false);
+      return;
+    }
     fpModalKind = 'pdf';
     fpModalIsText = false;
     const note = document.getElementById('fpModalNote');
@@ -2953,30 +2975,6 @@ async function previewFile(pathToken, name) {
       setModalEditing(false);
       document.getElementById('fpModal').classList.add('open');
       return;
-    }
-
-    // Android Chrome and other mobile browsers may not render PDFs reliably inside iframes.
-    // Try the embedded viewer, but always show a one-tap fallback to open directly.
-    if (isCoarsePointer && isCoarsePointer()) {
-      const msg = document.createElement('div');
-      msg.textContent = 'If the embedded PDF viewer is blank or blocked, open it directly:';
-      msg.style.marginBottom = '8px';
-
-      const row = document.createElement('div');
-      row.style.display = 'flex';
-      row.style.gap = '8px';
-      row.style.flexWrap = 'wrap';
-
-      const aNew = document.createElement('a');
-      aNew.className = 'fp-btn';
-      aNew.href = url;
-      aNew.target = '_blank';
-      aNew.rel = 'noopener';
-      aNew.textContent = 'Open in new tab';
-
-      row.appendChild(aNew);
-      note.appendChild(msg);
-      note.appendChild(row);
     }
 
     // Non-iOS: render inline in modal.
