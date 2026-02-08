@@ -2195,6 +2195,9 @@ function closeFileModal() {
   fpModalIsText = false;
   fpModalEditing = false;
   fpModalKind = 'binary';
+  const note = document.getElementById('fpModalNote');
+  note.textContent = '';
+  note.innerHTML = '';
   const img = document.getElementById('fpModalImage');
   const vid = document.getElementById('fpModalVideo');
   const aud = document.getElementById('fpModalAudio');
@@ -2267,6 +2270,7 @@ function setModalEditing(editing) {
 
   if (fpModalKind === 'pdf') {
     pdf.style.display = 'block';
+    if ((note.textContent || '').trim()) note.style.display = 'block';
     return;
   }
 
@@ -2471,16 +2475,27 @@ async function previewFile(pathToken, name) {
 
   if (isPdfFile(lowerName)) {
     const url = getInlinePreviewUrl(pathToken);
-    if (isCoarsePointer && isCoarsePointer()) {
-      // iOS Safari commonly blocks PDFs inside iframes ("content is blocked").
-      // Opening directly in a new tab/window is the most reliable fallback.
-      try { window.open(url, '_blank', 'noopener'); } catch (e) {}
-      showToast('Opened PDF in a new tab', false);
-      return;
-    }
     fpModalKind = 'pdf';
     fpModalIsText = false;
-    document.getElementById('fpModalNote').textContent = '';
+    const note = document.getElementById('fpModalNote');
+    note.textContent = '';
+    note.innerHTML = '';
+    if (isCoarsePointer && isCoarsePointer()) {
+      // Best-effort: keep it in the modal, but provide a one-tap fallback.
+      const msg = document.createElement('span');
+      msg.textContent = 'If the PDF preview is blank or says blocked, ';
+      const btn = document.createElement('button');
+      btn.className = 'fp-btn';
+      btn.style.padding = '4px 8px';
+      btn.style.marginLeft = '6px';
+      btn.textContent = 'Open in new tab';
+      btn.onclick = (ev) => {
+        ev.preventDefault();
+        try { window.open(url, '_blank', 'noopener'); } catch (e) {}
+      };
+      note.appendChild(msg);
+      note.appendChild(btn);
+    }
     const pdf = document.getElementById('fpModalPdf');
     pdf.src = url;
     setModalEditing(false);
