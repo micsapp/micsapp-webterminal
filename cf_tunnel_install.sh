@@ -56,6 +56,15 @@ EOF
 say() { printf '%s\n' "$*"; }
 err() { printf 'ERROR: %s\n' "$*" >&2; }
 
+# Ensure Homebrew paths are available (Apple Silicon: /opt/homebrew, Intel: /usr/local)
+for _brew_prefix in /opt/homebrew /usr/local; do
+  [ -d "$_brew_prefix/bin" ] && case ":$PATH:" in
+    *":$_brew_prefix/bin:"*) ;;
+    *) export PATH="$_brew_prefix/bin:$PATH" ;;
+  esac
+done
+unset _brew_prefix
+
 need_cmd() {
   command -v "$1" >/dev/null 2>&1 || { err "Missing required command: $1"; return 1; }
 }
