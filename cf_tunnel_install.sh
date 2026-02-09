@@ -1750,6 +1750,10 @@ function buildTermUrl(overrides) {
   return '/ut/__TTYD_PORT__/' + (qs ? '?' + qs : '');
 }
 
+function saveTabs() {
+  try { localStorage.setItem('ttyd_tabs', JSON.stringify(tabs.map(t => ({ name: t.name })))); } catch(e) {}
+}
+
 function addTab() {
   tabCounter++;
   const id = 'tab-' + tabCounter;
@@ -1760,6 +1764,7 @@ function addTab() {
   tabs.push({ id, name: 'Shell ' + tabCounter });
   switchTab(id);
   renderTabs();
+  saveTabs();
 }
 
 function closeTab(id, e) {
@@ -1774,6 +1779,7 @@ function closeTab(id, e) {
     switchTab(tabs[newIdx].id);
   }
   renderTabs();
+  saveTabs();
 }
 
 function switchTab(id) {
@@ -1832,6 +1838,7 @@ function startRename(id, labelEl) {
     const val = input.value.trim();
     if (val) t.name = val;
     renderTabs();
+    saveTabs();
   };
   input.addEventListener('blur', finish);
   input.addEventListener('keydown', (e) => {
@@ -2603,7 +2610,30 @@ function init() {
     }
   });
 
-  addTab();
+  // Restore tabs from localStorage, or create one new tab
+  let saved = [];
+  try { saved = JSON.parse(localStorage.getItem('ttyd_tabs') || '[]'); } catch(e) {}
+  if (saved.length > 0) {
+    saved.forEach(t => {
+      tabCounter++;
+      tabs.push({ id: 'tab-' + tabCounter, name: t.name || ('Shell ' + tabCounter) });
+    });
+    renderTabs();
+    switchTab(tabs[0].id);
+    // Create iframes with staggered delays so each tmux grouped session
+    // can register before the next one counts existing sessions
+    tabs.forEach((t, i) => {
+      setTimeout(() => {
+        const iframe = document.createElement('iframe');
+        iframe.id = 'frame-' + t.id;
+        iframe.src = buildTermUrl();
+        document.getElementById('termContainer').appendChild(iframe);
+        if (t.id === activeTabId) iframe.classList.add('active');
+      }, i * 300);
+    });
+  } else {
+    addTab();
+  }
 
   // Copy modal wiring
   const cmClose = document.getElementById('copyModalClose');
@@ -3206,7 +3236,20 @@ def spawn_user_ttyd(username, password):
     port = allocate_port()
 
     # Bind ttyd to localhost only, so the per-user port isn't reachable directly from the LAN/Internet.
-    ttyd_cmd = f"{shlex.quote(TTYD_BIN)} -W -i 127.0.0.1 -p {port} bash -l"
+    # Use tmux so terminal sessions persist across page refreshes and re-logins.
+    # Each tab gets a grouped session pointing at a distinct tmux window.
+    # Grouped sessions have destroy-unattached so they auto-clean on disconnect,
+    # while the base "main" session (and its windows) persist to keep processes alive.
+    # On reconnect, tabs reattach to existing windows instead of creating new ones.
+    tmux_cmd = (
+        r'tmux has-session -t main 2>/dev/null || exec tmux new-session -s main;'
+        r' IDX=$(tmux list-sessions -F "#{session_name}" | grep -cv "^main$" || true);'
+        r' NWIN=$(tmux list-windows -t main -F x | wc -l | tr -d " ");'
+        r' while [ $NWIN -le $IDX ]; do tmux new-window -t main; NWIN=$((NWIN + 1)); done;'
+        r' TARGET=$(tmux list-windows -t main -F "#{window_index}" | sort -n | head -n $((IDX+1)) | tail -n 1);'
+        r' exec tmux new-session -t main \; set-option destroy-unattached on \; select-window -t :${TARGET:-0}'
+    )
+    ttyd_cmd = f"{shlex.quote(TTYD_BIN)} -W -i 127.0.0.1 -p {port} bash -lc {shlex.quote(tmux_cmd)}"
     proc = subprocess.Popen(
         [SSHPASS_BIN, "-p", password, SSH_BIN,
          "-o", "StrictHostKeyChecking=no",
