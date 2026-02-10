@@ -58,6 +58,50 @@ _priv() {
   fi
 }
 
+ensure_linux_deps() {
+  is_linux || return 0
+
+  local need_apt=false
+
+  if ! command -v nginx >/dev/null 2>&1; then
+    say "nginx not found, will install..."
+    need_apt=true
+  fi
+  if ! command -v sshpass >/dev/null 2>&1; then
+    say "sshpass not found, will install..."
+    need_apt=true
+  fi
+  if ! command -v tmux >/dev/null 2>&1; then
+    say "tmux not found, will install..."
+    need_apt=true
+  fi
+
+  if $need_apt && command -v apt-get >/dev/null 2>&1; then
+    local pkgs=()
+    command -v nginx   >/dev/null 2>&1 || pkgs+=(nginx)
+    command -v sshpass >/dev/null 2>&1 || pkgs+=(sshpass)
+    command -v tmux    >/dev/null 2>&1 || pkgs+=(tmux)
+    sudo apt-get update -qq
+    sudo apt-get install -y "${pkgs[@]}"
+  fi
+
+  if ! command -v ttyd >/dev/null 2>&1; then
+    say "ttyd not found, installing native binary..."
+    local arch
+    arch="$(uname -m)"
+    case "$arch" in
+      x86_64)  arch="x86_64" ;;
+      aarch64) arch="aarch64" ;;
+      armv7l)  arch="armhf" ;;
+      *)       err "Unsupported architecture: $arch"; exit 1 ;;
+    esac
+    sudo curl -fSL -o /usr/local/bin/ttyd \
+      "https://github.com/tsl0922/ttyd/releases/latest/download/ttyd.${arch}"
+    sudo chmod +x /usr/local/bin/ttyd
+    say "ttyd installed: $(ttyd --version)"
+  fi
+}
+
 detect_nginx_conf_dest() {
   if [ -d "/usr/local/etc/nginx/servers" ]; then
     printf '%s\n' "/usr/local/etc/nginx/servers/ttyd.conf"
@@ -460,6 +504,7 @@ main() {
       ;;
   esac
 
+  ensure_linux_deps
   need_cmd python3
   need_cmd nginx
   need_cmd sshpass
