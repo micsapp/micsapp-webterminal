@@ -9,7 +9,11 @@ set -euo pipefail
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 NGINX_SRC_CONF="${PROJECT_DIR}/nginx/ttyd.conf"
 AUTH_PY="${PROJECT_DIR}/auth.py"
-AUTH_LOG="${HOME}/Library/Logs/ttyd-auth.log"
+if [ "$(uname -s)" = "Darwin" ]; then
+  AUTH_LOG="${HOME}/Library/Logs/ttyd-auth.log"
+else
+  AUTH_LOG="${PROJECT_DIR}/auth.log"
+fi
 AUTH_PID_FILE="${PROJECT_DIR}/.auth.pid"
 AUTH_PORT="7682"
 NGINX_PORT="7680"
@@ -40,6 +44,20 @@ is_macos() {
   [ "$(uname -s)" = "Darwin" ]
 }
 
+is_linux() {
+  [ "$(uname -s)" = "Linux" ]
+}
+
+# Run a command with sudo when on Linux (for nginx/system operations).
+# On macOS, Homebrew services run as the current user so sudo is not needed.
+_priv() {
+  if is_linux; then
+    sudo "$@"
+  else
+    "$@"
+  fi
+}
+
 detect_nginx_conf_dest() {
   if [ -d "/usr/local/etc/nginx/servers" ]; then
     printf '%s\n' "/usr/local/etc/nginx/servers/ttyd.conf"
@@ -53,8 +71,13 @@ detect_nginx_conf_dest() {
     printf '%s\n' "/etc/nginx/sites-available/ttyd.conf"
     return 0
   fi
+  # RHEL/CentOS/Fedora use conf.d instead of sites-available.
+  if [ -d "/etc/nginx/conf.d" ]; then
+    printf '%s\n' "/etc/nginx/conf.d/ttyd.conf"
+    return 0
+  fi
   err "Cannot find nginx config directory."
-  err "Expected one of: /usr/local/etc/nginx/servers, /opt/homebrew/etc/nginx/servers, /etc/nginx/sites-available"
+  err "Expected one of: /usr/local/etc/nginx/servers, /opt/homebrew/etc/nginx/servers, /etc/nginx/sites-available, /etc/nginx/conf.d"
   exit 1
 }
 
@@ -71,7 +94,7 @@ install_nginx_conf() {
   fi
 
   if [ ! -d "$dest_dir" ]; then
-    mkdir -p "$dest_dir"
+    _priv mkdir -p "$dest_dir"
   fi
 
   # Clean up legacy backups that may get included by brew nginx configs that do
@@ -80,7 +103,7 @@ install_nginx_conf() {
   for legacy in "${dest_dir}/$(basename "$dest_conf").bak."*; do
     [ -f "$legacy" ] || continue
     local hidden="${dest_dir}/.$(basename "$legacy")"
-    mv "$legacy" "$hidden" 2>/dev/null || rm -f "$legacy" 2>/dev/null || true
+    _priv mv "$legacy" "$hidden" 2>/dev/null || _priv rm -f "$legacy" 2>/dev/null || true
   done
 
   if [ -f "$dest_conf" ] && cmp -s "${NGINX_SRC_CONF}" "$dest_conf"; then
@@ -93,29 +116,38 @@ install_nginx_conf() {
       backup_dir="$(dirname "$dest_conf")"
       local backup="${backup_dir}/.$(basename "$dest_conf").bak.$(date +%Y%m%d_%H%M%S)"
       say "Backing up existing config -> ${backup}"
-      cp "$dest_conf" "$backup"
+      _priv cp "$dest_conf" "$backup"
     fi
-    cp "${NGINX_SRC_CONF}" "$dest_conf"
+    _priv cp "${NGINX_SRC_CONF}" "$dest_conf"
     say "nginx config updated."
   fi
 
   # Debian/Ubuntu: ensure site is enabled.
   if [ -d "/etc/nginx/sites-enabled" ] && [ "$dest_conf" = "/etc/nginx/sites-available/ttyd.conf" ]; then
-    ln -sf "$dest_conf" "/etc/nginx/sites-enabled/ttyd.conf"
+    _priv ln -sf "$dest_conf" "/etc/nginx/sites-enabled/ttyd.conf"
   fi
 }
 
 reload_nginx() {
   say "Testing nginx config..."
-  nginx -t
+  _priv nginx -t
   say "Reloading nginx..."
-  nginx -s reload
+  if is_linux; then
+    sudo systemctl reload nginx
+  else
+    nginx -s reload
+  fi
 }
 
 stop_auth_service() {
   # macOS launchd-managed auth service.
   if is_macos && [ -f "$AUTH_PLIST" ] && command -v launchctl >/dev/null 2>&1; then
     launchctl unload "$AUTH_PLIST" 2>/dev/null || true
+  fi
+
+  # Linux systemd user service.
+  if is_linux && command -v systemctl >/dev/null 2>&1; then
+    systemctl --user stop ttyd-auth.service 2>/dev/null || true
   fi
 
   # Best-effort stop by PID file first.
@@ -207,6 +239,38 @@ write_auth_plist() {
 PLISTEOF
 }
 
+write_auth_systemd_unit() {
+  local svc_dir="${HOME}/.config/systemd/user"
+  mkdir -p "$svc_dir"
+
+  local pybin sshpass_bin ttyd_bin
+  pybin="$(command -v python3)"
+  sshpass_bin="$(command -v sshpass)"
+  ttyd_bin="$(command -v ttyd)"
+
+  cat > "${svc_dir}/ttyd-auth.service" <<SVCEOF
+[Unit]
+Description=ttyd web terminal auth service
+After=network.target
+
+[Service]
+Type=simple
+Environment=PYTHONUNBUFFERED=1
+Environment=AUTH_PORT=${AUTH_PORT}
+Environment=SSHPASS_BIN=${sshpass_bin}
+Environment=TTYD_BIN=${ttyd_bin}
+WorkingDirectory=${PROJECT_DIR}
+ExecStart=${pybin} ${AUTH_PY}
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:${AUTH_LOG}
+StandardError=append:${AUTH_LOG}
+
+[Install]
+WantedBy=default.target
+SVCEOF
+}
+
 start_auth_service() {
   [ -f "${AUTH_PY}" ] || { err "Missing ${AUTH_PY}"; exit 1; }
 
@@ -226,7 +290,20 @@ start_auth_service() {
     exit 1
   fi
 
-  # Fallback mode for non-macOS environments.
+  if is_linux && command -v systemctl >/dev/null 2>&1; then
+    write_auth_systemd_unit
+    systemctl --user daemon-reload
+    systemctl --user restart ttyd-auth.service
+    if wait_for_auth_ready; then
+      say "Auth service running via systemd (ttyd-auth.service)"
+      rm -f "$AUTH_PID_FILE"
+      return 0
+    fi
+    err "Auth service failed to become ready via systemd. Check log: ${AUTH_LOG}"
+    exit 1
+  fi
+
+  # Fallback mode (no launchd/systemd).
   nohup python3 "${AUTH_PY}" >>"${AUTH_LOG}" 2>&1 &
   local pid=$!
   printf '%s\n' "$pid" > "$AUTH_PID_FILE"
@@ -259,6 +336,14 @@ status_report() {
     fi
   fi
 
+  if is_linux && command -v systemctl >/dev/null 2>&1; then
+    if systemctl --user is-active --quiet ttyd-auth.service 2>/dev/null; then
+      say "systemd auth : OK (ttyd-auth.service active)"
+    else
+      say "systemd auth : WARN (ttyd-auth.service not active)"
+    fi
+  fi
+
   if dest_conf="$(detect_nginx_conf_dest 2>/dev/null)"; then
     say "nginx conf : ${dest_conf}"
     if [ -f "$dest_conf" ]; then
@@ -272,7 +357,7 @@ status_report() {
     rc=1
   fi
 
-  if nginx -t >/dev/null 2>&1; then
+  if _priv nginx -t >/dev/null 2>&1; then
     say "nginx test : OK"
   else
     say "nginx test : FAIL"
@@ -280,7 +365,7 @@ status_report() {
   fi
 
   if command -v lsof >/dev/null 2>&1; then
-    if lsof -nP -iTCP:7680 -sTCP:LISTEN >/dev/null 2>&1; then
+    if _priv lsof -nP -iTCP:7680 -sTCP:LISTEN >/dev/null 2>&1; then
       say "port ${NGINX_PORT} : OK (nginx listening)"
     else
       say "port ${NGINX_PORT} : FAIL (not listening)"
