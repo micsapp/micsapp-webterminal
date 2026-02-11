@@ -593,7 +593,8 @@ def authenticate(username, password):
              "-o", "PubkeyAuthentication=no",
              "-o", "PasswordAuthentication=yes",
              f"{username}@127.0.0.1", "echo", "ok"],
-            capture_output=True, text=True, timeout=10
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            universal_newlines=True, timeout=10
         )
         return result.returncode == 0 and "ok" in result.stdout
     except Exception as e:
@@ -3499,7 +3500,8 @@ def run_as_user(username, python_script, timeout=10):
              "-o", "PubkeyAuthentication=no",
              "-o", "ConnectTimeout=5",
              f"{username}@127.0.0.1", "python3", "-"],
-            input=python_script.encode(), capture_output=True, timeout=timeout
+            input=python_script.encode(),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout
         )
         return (result.returncode, result.stdout, result.stderr)
     except subprocess.TimeoutExpired:
