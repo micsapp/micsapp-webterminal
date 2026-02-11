@@ -1184,6 +1184,30 @@ APP_HTML = """<!DOCTYPE html>
   }
   .fp-act:hover { color: #e2e2e2; background: #0f3460; }
 
+  /* Sort bar */
+  .fp-sort-bar {
+    display: flex;
+    align-items: center;
+    padding: 4px 10px;
+    gap: 2px;
+    border-bottom: 1px solid #0f3460;
+    flex-shrink: 0;
+  }
+  .fp-sort-btn {
+    background: none;
+    border: none;
+    color: #5a5a7a;
+    font-size: 11px;
+    padding: 2px 6px;
+    border-radius: 3px;
+    cursor: pointer;
+    transition: 0.15s;
+    white-space: nowrap;
+  }
+  .fp-sort-btn:hover { color: #9a9abf; }
+  .fp-sort-btn.active { color: #e2e2e2; background: #0f3460; }
+  .fp-item-date { color: #5a5a7a; font-size: 11px; flex-shrink: 0; }
+
   /* File preview modal */
   .fp-modal-overlay {
     display: none;
@@ -1677,6 +1701,7 @@ APP_HTML = """<!DOCTYPE html>
       <button class="fp-btn" onclick="toggleFilePanel()">&#10005;</button>
     </div>
     <div class="fp-breadcrumbs" id="fpBreadcrumbs"></div>
+    <div class="fp-sort-bar" id="fpSortBar"></div>
     <div class="fp-list" id="fpList"></div>
     <input type="file" id="fpUploadInput" multiple style="display:none" onchange="handleUpload(this.files);this.value='';">
     <div class="fp-drop-overlay">Drop files to upload</div>
@@ -2690,6 +2715,9 @@ let fpModalText = '';
 let fpModalIsText = false;
 let fpModalEditing = false;
 let fpModalKind = 'binary';
+let fpSortBy = 'name';
+let fpSortAsc = true;
+let fpCurrentEntries = [];
 
 function isImageFile(name) {
   return /\\.(png|jpe?g|gif|webp|bmp|svg|ico|avif|heic)$/i.test(name || '');
@@ -2849,7 +2877,9 @@ async function fetchFiles(pathToken) {
     fpCurrentPathToken = data.path_token || '';
     fpParentToken = data.parent_token || '';
     renderBreadcrumbs(data.breadcrumbs || []);
-    renderFileList(data.entries);
+    fpCurrentEntries = data.entries || [];
+    renderSortBar();
+    renderFileList(fpCurrentEntries);
   } catch (e) {
     list.innerHTML = '<div style="padding:12px;color:#e94560;">Error: ' + escHtml(e.message) + '</div>';
   }
@@ -2884,6 +2914,7 @@ function renderBreadcrumbs(breadcrumbs) {
 function renderFileList(entries) {
   const list = document.getElementById('fpList');
   list.innerHTML = '';
+  const sorted = sortEntries(entries);
   // Parent directory link
   if (fpParentToken) {
     const parent = document.createElement('div');
@@ -2892,7 +2923,7 @@ function renderFileList(entries) {
     parent.onclick = () => fetchFiles(fpParentToken);
     list.appendChild(parent);
   }
-  entries.forEach(e => {
+  sorted.forEach(e => {
     const item = document.createElement('div');
     item.className = 'fp-item';
     const icon = document.createElement('span');
@@ -2904,6 +2935,12 @@ function renderFileList(entries) {
     name.textContent = e.name;
     if (e.link) name.style.fontStyle = 'italic';
     item.appendChild(name);
+    if (e.mtime) {
+      const dt = document.createElement('span');
+      dt.className = 'fp-item-date';
+      dt.textContent = formatDate(e.mtime);
+      item.appendChild(dt);
+    }
     if (e.type !== 'dir') {
       const sz = document.createElement('span');
       sz.className = 'fp-item-size';
@@ -3162,6 +3199,59 @@ function fileIcon(name) {
     sh:'&#128187;', bash:'&#128187;', zsh:'&#128187;',
   };
   return map[ext] || '&#128196;';
+}
+
+function formatDate(ts) {
+  if (!ts) return '';
+  const d = new Date(ts * 1000);
+  const now = new Date();
+  const pad = n => String(n).padStart(2, '0');
+  const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  const today = now.toDateString() === d.toDateString();
+  if (today) return pad(d.getHours()) + ':' + pad(d.getMinutes());
+  if (d.getFullYear() === now.getFullYear()) return months[d.getMonth()] + ' ' + d.getDate();
+  return months[d.getMonth()] + ' \'' + String(d.getFullYear()).slice(2);
+}
+
+function sortEntries(entries) {
+  const sorted = entries.slice();
+  sorted.sort((a, b) => {
+    if (a.type === 'dir' && b.type !== 'dir') return -1;
+    if (a.type !== 'dir' && b.type === 'dir') return 1;
+    let cmp = 0;
+    if (fpSortBy === 'name') {
+      cmp = a.name.toLowerCase().localeCompare(b.name.toLowerCase());
+    } else if (fpSortBy === 'date') {
+      cmp = (a.mtime || 0) - (b.mtime || 0);
+    } else if (fpSortBy === 'size') {
+      cmp = (a.size || 0) - (b.size || 0);
+    }
+    return fpSortAsc ? cmp : -cmp;
+  });
+  return sorted;
+}
+
+function setSortBy(field) {
+  if (fpSortBy === field) {
+    fpSortAsc = !fpSortAsc;
+  } else {
+    fpSortBy = field;
+    fpSortAsc = field === 'name';
+  }
+  renderSortBar();
+  renderFileList(fpCurrentEntries);
+}
+
+function renderSortBar() {
+  const bar = document.getElementById('fpSortBar');
+  bar.innerHTML = '';
+  [{key:'name',label:'Name'},{key:'date',label:'Date'},{key:'size',label:'Size'}].forEach(f => {
+    const btn = document.createElement('button');
+    btn.className = 'fp-sort-btn' + (fpSortBy === f.key ? ' active' : '');
+    btn.textContent = f.label + (fpSortBy === f.key ? (fpSortAsc ? ' \u25B2' : ' \u25BC') : '');
+    btn.onclick = () => setSortBy(f.key);
+    bar.appendChild(btn);
+  });
 }
 
 function formatSize(bytes) {
