@@ -397,6 +397,59 @@ check_sshd() {
   pgrep -x sshd >/dev/null 2>&1
 }
 
+# Ensure sshd allows password auth on localhost (required by auth.py)
+# while keeping it disabled for external connections.
+check_sshd_localhost_password_auth() {
+  is_linux || return 0
+  local needs_fix=false
+
+  # Check if password auth is globally disabled.
+  local global_off=false
+  if grep -rqE '^\s*PasswordAuthentication\s+no' /etc/ssh/sshd_config /etc/ssh/sshd_config.d/ 2>/dev/null; then
+    global_off=true
+  fi
+
+  if ! $global_off; then
+    return 0
+  fi
+
+  # Password auth is off globally. Check if there's a Match block for localhost.
+  if grep -A2 -E '^\s*Match\s+Address\s+127\.0\.0\.1' /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf 2>/dev/null \
+    | grep -qE '^\s*PasswordAuthentication\s+yes'; then
+    return 0
+  fi
+
+  # Need to fix: add localhost Match block.
+  say "  Fixing sshd: enabling password auth on localhost only (required by auth.py)..."
+  local conf="/etc/ssh/sshd_config.d/60-cloudimg-settings.conf"
+  if [ ! -f "$conf" ]; then
+    conf="/etc/ssh/sshd_config.d/99-webterminal.conf"
+  fi
+  sudo tee "$conf" >/dev/null <<'SSHEOF'
+PasswordAuthentication no
+
+Match Address 127.0.0.1,::1
+    PasswordAuthentication yes
+SSHEOF
+
+  sudo sshd -t 2>/dev/null || { err "sshd config test failed after edit"; return 1; }
+  restart_sshd
+}
+
+restart_sshd() {
+  if pidof systemd >/dev/null 2>&1; then
+    local sshd_name="sshd"
+    if ! systemctl list-unit-files "${sshd_name}.service" >/dev/null 2>&1; then
+      sshd_name="ssh"
+    fi
+    sudo systemctl restart "$sshd_name"
+  elif command -v service >/dev/null 2>&1; then
+    sudo service ssh restart
+  else
+    sudo kill -HUP "$(cat /var/run/sshd.pid 2>/dev/null || pgrep -x sshd | head -1)" 2>/dev/null || sudo /usr/sbin/sshd
+  fi
+}
+
 start_sshd() {
   say "Starting sshd..."
   if is_macos; then
@@ -568,6 +621,25 @@ status_report() {
   else
     say "sshd         : FAIL (not running)"
     rc=1
+  fi
+
+  # Check localhost password auth (needed by auth.py).
+  if is_linux; then
+    local pw_off=false
+    if grep -rqE '^\s*PasswordAuthentication\s+no' /etc/ssh/sshd_config /etc/ssh/sshd_config.d/ 2>/dev/null; then
+      pw_off=true
+    fi
+    if $pw_off; then
+      if grep -A2 -rE '^\s*Match\s+Address\s+127\.0\.0\.1' /etc/ssh/sshd_config /etc/ssh/sshd_config.d/ 2>/dev/null \
+        | grep -qE 'PasswordAuthentication\s+yes'; then
+        say "sshd pw-auth : OK (localhost only)"
+      else
+        say "sshd pw-auth : FAIL (password auth disabled, login will fail)"
+        rc=1
+      fi
+    else
+      say "sshd pw-auth : OK"
+    fi
   fi
 
   # ── nginx ──
@@ -774,6 +846,7 @@ main() {
   else
     say "[OK]  sshd"
   fi
+  check_sshd_localhost_password_auth || had_failure=true
 
   # ── 2. nginx config + process ──
   install_nginx_conf "$dest_conf"

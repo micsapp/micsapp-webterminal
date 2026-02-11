@@ -314,6 +314,37 @@ enable_ssh_server() {
         sudo /usr/sbin/sshd
       fi
     fi
+
+    # Ensure password auth is allowed on localhost (auth.py needs it)
+    # while keeping it disabled for external SSH connections.
+    local _pw_off=false
+    if grep -rqE '^\s*PasswordAuthentication\s+no' /etc/ssh/sshd_config /etc/ssh/sshd_config.d/ 2>/dev/null; then
+      _pw_off=true
+    fi
+    if $_pw_off; then
+      if ! grep -A2 -rE '^\s*Match\s+Address\s+127\.0\.0\.1' /etc/ssh/sshd_config /etc/ssh/sshd_config.d/ 2>/dev/null \
+        | grep -qE 'PasswordAuthentication\s+yes'; then
+        say "Enabling password auth on localhost only (required for web terminal login)..."
+        local _conf="/etc/ssh/sshd_config.d/60-cloudimg-settings.conf"
+        [ -f "$_conf" ] || _conf="/etc/ssh/sshd_config.d/99-webterminal.conf"
+        sudo tee "$_conf" >/dev/null <<'SSHEOF'
+PasswordAuthentication no
+
+Match Address 127.0.0.1,::1
+    PasswordAuthentication yes
+SSHEOF
+        if sudo sshd -t 2>/dev/null; then
+          if pidof systemd >/dev/null 2>&1; then
+            sudo systemctl restart "$sshd_name" 2>/dev/null || sudo service ssh restart
+          elif command -v service >/dev/null 2>&1; then
+            sudo service ssh restart
+          fi
+          say "sshd restarted with localhost password auth."
+        else
+          err "sshd config test failed after edit. Check /etc/ssh/sshd_config.d/"
+        fi
+      fi
+    fi
   fi
 }
 
