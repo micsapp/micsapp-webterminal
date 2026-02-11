@@ -521,16 +521,19 @@ ACCESS_LOG_ENABLED = env_bool("ACCESS_LOG_ENABLED", False)
 COOKIE_NAME = os.environ.get("SESSION_COOKIE_NAME", "__Host-ttyd_session")
 COOKIE_SECURE = env_bool("COOKIE_SECURE", True)
 
+import platform as _platform
+_IS_LINUX = _platform.system() == "Linux"
+
 SSHPASS_BIN = (
     os.environ.get("SSHPASS_BIN")
     or shutil.which("sshpass")
-    or "/usr/local/bin/sshpass"
+    or ("/usr/bin/sshpass" if _IS_LINUX else "/usr/local/bin/sshpass")
 )
 SSH_BIN = os.environ.get("SSH_BIN") or shutil.which("ssh") or "/usr/bin/ssh"
 TTYD_BIN = (
     os.environ.get("TTYD_BIN")
     or shutil.which("ttyd")
-    or "/usr/local/bin/ttyd"
+    or ("/usr/bin/ttyd" if _IS_LINUX else "/usr/local/bin/ttyd")
 )
 
 def _safe_ascii_filename(name):
@@ -569,7 +572,7 @@ HTML_ONLY_SECURITY_HEADERS = {
     "X-Frame-Options": "SAMEORIGIN",
     "Content-Security-Policy": (
         "default-src 'self'; "
-        "script-src 'self' 'unsafe-inline'; "
+        "script-src 'self' 'unsafe-inline' https://static.cloudflareinsights.com; "
         "style-src 'self' 'unsafe-inline'; "
         "img-src 'self' data: blob:; "
         "media-src 'self' data: blob:; "
@@ -3211,7 +3214,7 @@ function formatDate(ts) {
   const today = now.toDateString() === d.toDateString();
   if (today) return pad(d.getHours()) + ':' + pad(d.getMinutes());
   if (d.getFullYear() === now.getFullYear()) return months[d.getMonth()] + ' ' + d.getDate();
-  return months[d.getMonth()] + ' \'' + String(d.getFullYear()).slice(2);
+  return months[d.getMonth()] + ' \\'' + String(d.getFullYear()).slice(2);
 }
 
 function sortEntries(entries) {

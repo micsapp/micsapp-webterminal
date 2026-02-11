@@ -54,20 +54,16 @@ ACCESS_LOG_ENABLED = env_bool("ACCESS_LOG_ENABLED", False)
 COOKIE_NAME = os.environ.get("SESSION_COOKIE_NAME", "__Host-ttyd_session")
 COOKIE_SECURE = env_bool("COOKIE_SECURE", True)
 
-import platform as _platform
-
-_IS_LINUX = _platform.system() == "Linux"
-
 SSHPASS_BIN = (
     os.environ.get("SSHPASS_BIN")
     or shutil.which("sshpass")
-    or ("/usr/bin/sshpass" if _IS_LINUX else "/usr/local/bin/sshpass")
+    or "/usr/local/bin/sshpass"
 )
 SSH_BIN = os.environ.get("SSH_BIN") or shutil.which("ssh") or "/usr/bin/ssh"
 TTYD_BIN = (
     os.environ.get("TTYD_BIN")
     or shutil.which("ttyd")
-    or ("/usr/bin/ttyd" if _IS_LINUX else "/usr/local/bin/ttyd")
+    or "/usr/local/bin/ttyd"
 )
 
 def _safe_ascii_filename(name):
@@ -106,7 +102,7 @@ HTML_ONLY_SECURITY_HEADERS = {
     "X-Frame-Options": "SAMEORIGIN",
     "Content-Security-Policy": (
         "default-src 'self'; "
-        "script-src 'self' 'unsafe-inline'; "
+        "script-src 'self' 'unsafe-inline' https://static.cloudflareinsights.com; "
         "style-src 'self' 'unsafe-inline'; "
         "img-src 'self' data: blob:; "
         "media-src 'self' data: blob:; "
@@ -2283,9 +2279,6 @@ function closeFileModal() {
   fpModalIsText = false;
   fpModalEditing = false;
   fpModalKind = 'binary';
-  const note = document.getElementById('fpModalNote');
-  note.textContent = '';
-  note.innerHTML = '';
   const img = document.getElementById('fpModalImage');
   const vid = document.getElementById('fpModalVideo');
   const aud = document.getElementById('fpModalAudio');
@@ -2358,7 +2351,6 @@ function setModalEditing(editing) {
 
   if (fpModalKind === 'pdf') {
     pdf.style.display = 'block';
-    if ((note.textContent || '').trim()) note.style.display = 'block';
     return;
   }
 
@@ -2790,7 +2782,7 @@ function renderSortBar() {
   [{key:'name',label:'Name'},{key:'date',label:'Date'},{key:'size',label:'Size'}].forEach(f => {
     const btn = document.createElement('button');
     btn.className = 'fp-sort-btn' + (fpSortBy === f.key ? ' active' : '');
-    btn.textContent = f.label + (fpSortBy === f.key ? (fpSortAsc ? ' \\u25B2' : ' \\u25BC') : '');
+    btn.textContent = f.label + (fpSortBy === f.key ? (fpSortAsc ? ' \u25B2' : ' \u25BC') : '');
     btn.onclick = () => setSortBy(f.key);
     bar.appendChild(btn);
   });
@@ -2879,31 +2871,13 @@ def wait_for_ttyd_ready(port, timeout=4.0):
                 pass
     return False
 
-def _port_is_listening(port):
-    """Check if something is actively listening on 127.0.0.1:port."""
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    try:
-        s.settimeout(0.5)
-        s.connect(("127.0.0.1", int(port)))
-        return True
-    except OSError:
-        return False
-    finally:
-        try:
-            s.close()
-        except Exception:
-            pass
-
-
 def spawn_user_ttyd(username, password):
     """Spawn a ttyd instance for the user via SSH. Returns the port."""
     global next_port
-    # Reuse existing instance if its port is still listening.
-    # Note: sshpass exits after passing the password to SSH, so proc.poll()
-    # is unreliable.  Check the port instead.
+    # Reuse existing instance if still alive
     if username in user_instances:
         info = user_instances[username]
-        if _port_is_listening(info["port"]):
+        if info["proc"].poll() is None:
             info["password"] = password  # refresh password
             return info["port"]
         # Dead, clean up
@@ -2939,7 +2913,7 @@ def spawn_user_ttyd(username, password):
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
     )
     user_instances[username] = {"port": port, "proc": proc, "password": password}
-    if not wait_for_ttyd_ready(port, timeout=30.0):
+    if not wait_for_ttyd_ready(port, timeout=4.0):
         try:
             proc.terminate()
         except Exception:
@@ -2956,7 +2930,7 @@ def get_user_port(username):
     """Get the ttyd port for a user, or None if not running."""
     if username in user_instances:
         info = user_instances[username]
-        if _port_is_listening(info["port"]):
+        if info["proc"].poll() is None:
             return info["port"]
         del user_instances[username]
     return None
