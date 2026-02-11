@@ -8,6 +8,9 @@ set -euo pipefail
 #
 # NOTE: `cloudflared tunnel login` requires an interactive browser/URL step.
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+AUTH_DIR="${SCRIPT_DIR}"
+
 usage() {
   cat <<'EOF'
 Usage:
@@ -210,22 +213,20 @@ install_web_terminal_deps() {
     if is_macos; then
       brew install ttyd
     else
-      if command -v snap >/dev/null 2>&1; then
-        sudo snap install ttyd --classic
-      elif command -v apt-get >/dev/null 2>&1; then
-        sudo apt-get install -y ttyd 2>/dev/null || {
-          say "ttyd not in apt repos. Downloading binary..."
-          local arch
-          arch="$(uname -m)"
-          [ "$arch" = "x86_64" ] && arch="x86_64" || arch="aarch64"
-          curl -fsSL "https://github.com/nicm/ttyd/releases/latest/download/ttyd.${arch}" -o /tmp/ttyd
-          chmod +x /tmp/ttyd
-          sudo mv /tmp/ttyd /usr/local/bin/ttyd
-        }
-      else
-        err "Cannot auto-install ttyd. Install manually: https://github.com/nicm/ttyd"
-        return 1
-      fi
+      # Install native binary directly (works on WSL and headless Linux where snap/apt may lack ttyd)
+      say "Downloading ttyd native binary..."
+      local arch
+      arch="$(uname -m)"
+      case "$arch" in
+        x86_64)  arch="x86_64" ;;
+        aarch64) arch="aarch64" ;;
+        armv7l)  arch="armhf" ;;
+        *)       err "Unsupported architecture: $arch"; return 1 ;;
+      esac
+      sudo curl -fSL -o /usr/local/bin/ttyd \
+        "https://github.com/tsl0922/ttyd/releases/latest/download/ttyd.${arch}"
+      sudo chmod +x /usr/local/bin/ttyd
+      say "ttyd installed: $(ttyd --version)"
     fi
   fi
 
@@ -281,16 +282,37 @@ enable_ssh_server() {
       sudo systemsetup -setremotelogin on
     fi
   else
-    # Linux: enable sshd via systemd
+    # Linux: start sshd via systemd or fallback to service/sshd binary
     local sshd_name="sshd"
     if ! systemctl list-unit-files "${sshd_name}.service" >/dev/null 2>&1; then
       sshd_name="ssh"  # Debian/Ubuntu uses 'ssh' not 'sshd'
     fi
-    if systemctl is-active --quiet "$sshd_name" 2>/dev/null; then
-      say "SSH server ($sshd_name) is already running."
+
+    # Check if systemd is running as PID 1
+    if pidof systemd >/dev/null 2>&1; then
+      if systemctl is-active --quiet "$sshd_name" 2>/dev/null; then
+        say "SSH server ($sshd_name) is already running."
+      else
+        say "Enabling and starting SSH server ($sshd_name)..."
+        sudo systemctl enable --now "$sshd_name" 2>/dev/null \
+          || sudo systemctl start "$sshd_name"
+      fi
+    elif command -v service >/dev/null 2>&1; then
+      # WSL2 or non-systemd: use SysVinit service command
+      if service ssh status >/dev/null 2>&1; then
+        say "SSH server is already running."
+      else
+        say "Starting SSH server via service command..."
+        sudo service ssh start
+      fi
     else
-      say "Enabling and starting SSH server ($sshd_name)..."
-      sudo systemctl enable --now "$sshd_name"
+      # Last resort: start sshd directly
+      if pgrep -x sshd >/dev/null 2>&1; then
+        say "SSH server is already running."
+      else
+        say "Starting sshd directly..."
+        sudo /usr/sbin/sshd
+      fi
     fi
   fi
 }
@@ -412,7 +434,11 @@ NGINXEOF
   if is_macos; then
     nginx -t && nginx -s reload
   else
-    sudo nginx -t && sudo systemctl reload nginx
+    if pidof systemd >/dev/null 2>&1; then
+      sudo nginx -t && sudo systemctl reload nginx
+    else
+      sudo nginx -t && sudo service nginx reload
+    fi
   fi
   say "nginx reloaded successfully."
 }
@@ -423,7 +449,7 @@ deploy_auth_service() {
   say ""
   say "=== Deploying auth service ==="
 
-  local auth_dir="$HOME/ttyd-auth"
+  local auth_dir="$AUTH_DIR"
   mkdir -p "$auth_dir"
 
   # Resolve ttyd full path at install time
@@ -4064,10 +4090,10 @@ start_auth_service() {
     mkdir -p "$HOME/Library/Logs"
     log_file="$HOME/Library/Logs/ttyd-auth.log"
   else
-    log_file="$HOME/ttyd-auth/auth.log"
+    log_file="$AUTH_DIR/auth.log"
   fi
 
-  AUTH_PORT="$auth_port" python3 "$HOME/ttyd-auth/auth.py" > "$log_file" 2>&1 &
+  AUTH_PORT="$auth_port" python3 "$AUTH_DIR/auth.py" > "$log_file" 2>&1 &
   local pid=$!
   sleep 2
 
@@ -4098,7 +4124,7 @@ install_auth_plist() {
     <key>ProgramArguments</key>
     <array>
         <string>$(command -v python3)</string>
-        <string>$HOME/ttyd-auth/auth.py</string>
+        <string>$AUTH_DIR/auth.py</string>
     </array>
     <key>EnvironmentVariables</key>
     <dict>
@@ -4125,11 +4151,12 @@ PLISTEOF
 install_auth_systemd() {
   local auth_port="$1"
 
-  say "Installing auth service as systemd user service..."
-  local svc_dir="$HOME/.config/systemd/user"
-  mkdir -p "$svc_dir"
+  if pidof systemd >/dev/null 2>&1; then
+    say "Installing auth service as systemd user service..."
+    local svc_dir="$HOME/.config/systemd/user"
+    mkdir -p "$svc_dir"
 
-  cat > "${svc_dir}/ttyd-auth.service" <<SVCEOF
+    cat > "${svc_dir}/ttyd-auth.service" <<SVCEOF
 [Unit]
 Description=ttyd web terminal auth service
 After=network.target
@@ -4137,7 +4164,7 @@ After=network.target
 [Service]
 Type=simple
 Environment=AUTH_PORT=${auth_port}
-ExecStart=$(command -v python3) $HOME/ttyd-auth/auth.py
+ExecStart=$(command -v python3) $AUTH_DIR/auth.py
 Restart=on-failure
 RestartSec=5
 
@@ -4145,9 +4172,17 @@ RestartSec=5
 WantedBy=default.target
 SVCEOF
 
-  systemctl --user daemon-reload
-  systemctl --user enable --now ttyd-auth.service
-  say "Auth service systemd unit installed: ${svc_dir}/ttyd-auth.service"
+    systemctl --user daemon-reload
+    systemctl --user enable --now ttyd-auth.service
+    say "Auth service systemd unit installed: ${svc_dir}/ttyd-auth.service"
+  else
+    # WSL2 or non-systemd: start auth directly in background
+    say "Starting auth service in background (no systemd)..."
+    local auth_py="$AUTH_DIR/auth.py"
+    local auth_log="$AUTH_DIR/auth.log"
+    AUTH_PORT="$auth_port" nohup python3 "$auth_py" >> "$auth_log" 2>&1 &
+    say "Auth service started (pid: $!), log: $auth_log"
+  fi
 }
 
 # ─── Main ──────────────────────────────────────────────────────────────────────
@@ -4276,8 +4311,14 @@ main() {
         say "Warning: expected plist not found at $plist"
       fi
     else
-      sudo cloudflared service install
-      say "Linux: cloudflared service installed (systemd)."
+      if pidof systemd >/dev/null 2>&1; then
+        sudo cloudflared service install
+        say "Linux: cloudflared service installed (systemd)."
+      else
+        say "No systemd detected (WSL2?). Starting cloudflared in background..."
+        sudo nohup cloudflared tunnel run >> /var/log/cloudflared.log 2>&1 &
+        say "Linux: cloudflared started (pid: $!), log: /var/log/cloudflared.log"
+      fi
     fi
 
     # --- auth service (only with --web-terminal) ---
@@ -4308,7 +4349,7 @@ EOF
     cat <<EOF
 
 Web Terminal Setup
-  Auth service:  http://127.0.0.1:${auth_port} (~/ttyd-auth/auth.py)
+  Auth service:  http://127.0.0.1:${auth_port} (${AUTH_DIR}/auth.py)
   nginx config:  ${conf_dir}/${hostname}.conf
   nginx port:    ${nginx_port}
   ttyd ports:    7700+ (per-user, dynamic)

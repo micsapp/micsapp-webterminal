@@ -176,8 +176,10 @@ reload_nginx() {
   say "Testing nginx config..."
   _priv nginx -t
   say "Reloading nginx..."
-  if is_linux; then
+  if is_linux && pidof systemd >/dev/null 2>&1; then
     sudo systemctl reload nginx
+  elif is_linux && command -v service >/dev/null 2>&1; then
+    sudo service nginx reload
   else
     nginx -s reload
   fi
@@ -190,7 +192,7 @@ stop_auth_service() {
   fi
 
   # Linux systemd user service.
-  if is_linux && command -v systemctl >/dev/null 2>&1; then
+  if is_linux && pidof systemd >/dev/null 2>&1; then
     systemctl --user stop ttyd-auth.service 2>/dev/null || true
   fi
 
@@ -334,7 +336,7 @@ start_auth_service() {
     exit 1
   fi
 
-  if is_linux && command -v systemctl >/dev/null 2>&1; then
+  if is_linux && pidof systemd >/dev/null 2>&1; then
     write_auth_systemd_unit
     systemctl --user daemon-reload
     systemctl --user restart ttyd-auth.service
@@ -380,7 +382,7 @@ status_report() {
     fi
   fi
 
-  if is_linux && command -v systemctl >/dev/null 2>&1; then
+  if is_linux && pidof systemd >/dev/null 2>&1; then
     if systemctl --user is-active --quiet ttyd-auth.service 2>/dev/null; then
       say "systemd auth : OK (ttyd-auth.service active)"
     else
