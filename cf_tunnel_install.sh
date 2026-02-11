@@ -4454,6 +4454,53 @@ EOF
   else
     say "======================================="
   fi
+
+  # ── Ensure tunnel is running ──
+  # If neither --run-foreground nor --install-service was used, the tunnel
+  # won't be running. Start it in a tmux session so the user doesn't hit
+  # error 1033 (tunnel not connected).
+  if [ "$run_fg" = false ] && [ "$install_service" = false ]; then
+    if ! pgrep -x cloudflared >/dev/null 2>&1; then
+      say ""
+      say "Starting tunnel in tmux session 'cloudflared'..."
+      need_cmd tmux
+      local cf_log="${AUTH_DIR}/cloudflared.log"
+      if tmux has-session -t cloudflared 2>/dev/null; then
+        tmux kill-session -t cloudflared 2>/dev/null || true
+        sleep 1
+      fi
+      tmux new-session -d -s cloudflared \
+        "cloudflared tunnel run ${name} 2>&1 | tee -a ${cf_log}"
+
+      # Wait for tunnel to connect (up to 15s).
+      say "Waiting for tunnel to connect..."
+      local _i _connected=false
+      for _i in $(seq 1 30); do
+        if pgrep -x cloudflared >/dev/null 2>&1; then
+          local _conns
+          _conns="$(cloudflared tunnel info "$name" 2>/dev/null | grep -c 'CONNECTIONS\|connector' || true)"
+          if [ "${_conns:-0}" -gt 0 ]; then
+            _connected=true
+            break
+          fi
+        fi
+        sleep 0.5
+      done
+
+      if $_connected; then
+        say "Tunnel '${name}' is connected and serving https://${hostname}"
+      elif pgrep -x cloudflared >/dev/null 2>&1; then
+        say "cloudflared is running (connections still establishing)."
+        say "  Log: ${cf_log}"
+        say "  Attach: tmux attach -t cloudflared"
+      else
+        err "cloudflared failed to start. Check log: ${cf_log}"
+      fi
+    else
+      say ""
+      say "cloudflared is already running."
+    fi
+  fi
 }
 
 main "$@"

@@ -54,16 +54,19 @@ ACCESS_LOG_ENABLED = env_bool("ACCESS_LOG_ENABLED", False)
 COOKIE_NAME = os.environ.get("SESSION_COOKIE_NAME", "__Host-ttyd_session")
 COOKIE_SECURE = env_bool("COOKIE_SECURE", True)
 
+import platform as _platform
+_IS_LINUX = _platform.system() == "Linux"
+
 SSHPASS_BIN = (
     os.environ.get("SSHPASS_BIN")
     or shutil.which("sshpass")
-    or "/usr/local/bin/sshpass"
+    or ("/usr/bin/sshpass" if _IS_LINUX else "/usr/local/bin/sshpass")
 )
 SSH_BIN = os.environ.get("SSH_BIN") or shutil.which("ssh") or "/usr/bin/ssh"
 TTYD_BIN = (
     os.environ.get("TTYD_BIN")
     or shutil.which("ttyd")
-    or "/usr/local/bin/ttyd"
+    or ("/usr/bin/ttyd" if _IS_LINUX else "/usr/local/bin/ttyd")
 )
 
 def _safe_ascii_filename(name):

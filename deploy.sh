@@ -2,9 +2,8 @@
 set -euo pipefail
 
 # Deploy/redeploy this ttyd-auth project on the local machine.
-# - Installs/updates nginx config from ./nginx/ttyd.conf
-# - Reloads nginx
-# - Restarts auth.py on 127.0.0.1:7682
+# Manages all components: sshd, nginx, auth.py, cloudflared tunnel.
+# Health-checks each component and only starts what's actually down.
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 NGINX_SRC_CONF="${PROJECT_DIR}/nginx/ttyd.conf"
@@ -20,16 +19,21 @@ NGINX_PORT="7680"
 AUTH_LAUNCHD_LABEL="com.ttyd-auth"
 AUTH_PLIST="${HOME}/Library/LaunchAgents/${AUTH_LAUNCHD_LABEL}.plist"
 
+CF_CONFIG="${HOME}/.cloudflared/config.yml"
+CF_LOG="${PROJECT_DIR}/cloudflared.log"
+CF_TMUX_SESSION="cloudflared"
+
 say() { printf '%s\n' "$*"; }
 err() { printf 'ERROR: %s\n' "$*" >&2; }
 
 usage() {
   cat <<EOF
 Usage:
-  ./deploy.sh           Deploy/redeploy services
-  ./deploy.sh --status  Show current health/status only
+  ./deploy.sh              Deploy/start services (only starts what's down)
+  ./deploy.sh --restart    Force restart all components
+  ./deploy.sh --status     Show current health/status only
   ./deploy.sh --status --public-url https://example.com
-  ./deploy.sh -h|--help Show this help
+  ./deploy.sh -h|--help    Show this help
 EOF
 }
 
@@ -182,6 +186,17 @@ reload_nginx() {
     sudo service nginx reload
   else
     nginx -s reload
+  fi
+}
+
+start_nginx() {
+  say "Starting nginx..."
+  if is_linux && pidof systemd >/dev/null 2>&1; then
+    sudo systemctl start nginx
+  elif is_linux && command -v service >/dev/null 2>&1; then
+    sudo service nginx start
+  else
+    nginx
   fi
 }
 
@@ -364,16 +379,198 @@ start_auth_service() {
   exit 1
 }
 
+# ─── Cloudflared tunnel helpers ───────────────────────────────────────────────
+
+detect_tunnel_name() {
+  if [ -f "$CF_CONFIG" ]; then
+    grep -E '^tunnel:' "$CF_CONFIG" 2>/dev/null | head -1 | awk '{print $2}' | tr -d '"' || true
+  fi
+}
+
+detect_tunnel_hostname() {
+  if [ -f "$CF_CONFIG" ]; then
+    grep -E '^\s*-\s*hostname:' "$CF_CONFIG" 2>/dev/null | head -1 | awk '{print $NF}' | tr -d '"' || true
+  fi
+}
+
+check_sshd() {
+  pgrep -x sshd >/dev/null 2>&1
+}
+
+start_sshd() {
+  say "Starting sshd..."
+  if is_macos; then
+    if sudo systemsetup -getremotelogin 2>/dev/null | grep -qi "on"; then
+      say "  SSH (Remote Login) already enabled."
+    else
+      sudo systemsetup -setremotelogin on
+    fi
+  elif pidof systemd >/dev/null 2>&1; then
+    local sshd_name="sshd"
+    if ! systemctl list-unit-files "${sshd_name}.service" >/dev/null 2>&1; then
+      sshd_name="ssh"
+    fi
+    sudo systemctl start "$sshd_name"
+  elif command -v service >/dev/null 2>&1; then
+    sudo service ssh start
+  else
+    sudo /usr/sbin/sshd
+  fi
+}
+
+_port_listening() {
+  local port="$1"
+  # Try multiple methods; return 0 on first success.
+  if command -v lsof >/dev/null 2>&1; then
+    _priv lsof -nP -iTCP:"${port}" -sTCP:LISTEN >/dev/null 2>&1 && return 0
+  fi
+  if /usr/sbin/ss -tlnp 2>/dev/null | grep -q ":${port} "; then
+    return 0
+  fi
+  # Last resort: try curl.
+  if command -v curl >/dev/null 2>&1; then
+    curl -s -o /dev/null --max-time 2 "http://127.0.0.1:${port}/" 2>/dev/null && return 0
+  fi
+  return 1
+}
+
+check_nginx() {
+  # Check if nginx master process is running AND listening on our port.
+  if ! pgrep -x nginx >/dev/null 2>&1; then
+    return 1
+  fi
+  _port_listening "${NGINX_PORT}"
+}
+
+check_auth() {
+  if command -v curl >/dev/null 2>&1; then
+    local code
+    code="$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:${AUTH_PORT}/api/auth" 2>/dev/null || true)"
+    [ "$code" = "200" ] || [ "$code" = "401" ]
+  else
+    _port_listening "${AUTH_PORT}"
+  fi
+}
+
+check_cloudflared() {
+  pgrep -x cloudflared >/dev/null 2>&1
+}
+
+stop_cloudflared() {
+  say "Stopping cloudflared..."
+  if tmux has-session -t "$CF_TMUX_SESSION" 2>/dev/null; then
+    tmux kill-session -t "$CF_TMUX_SESSION" 2>/dev/null || true
+  fi
+  # Also kill any stray cloudflared processes (e.g. from nohup or systemd).
+  if is_linux && pidof systemd >/dev/null 2>&1; then
+    sudo systemctl stop cloudflared 2>/dev/null || true
+  fi
+  pkill -x cloudflared 2>/dev/null || true
+  sleep 1
+}
+
+start_cloudflared() {
+  local tunnel_name
+  tunnel_name="$(detect_tunnel_name)"
+  if [ -z "$tunnel_name" ]; then
+    err "Cannot detect tunnel name from ${CF_CONFIG}. Run cf_tunnel_install.sh first."
+    return 1
+  fi
+
+  if ! command -v cloudflared >/dev/null 2>&1; then
+    err "cloudflared not found. Run cf_tunnel_install.sh first."
+    return 1
+  fi
+
+  say "Starting cloudflared tunnel '${tunnel_name}' in tmux session '${CF_TMUX_SESSION}'..."
+
+  # Kill existing tmux session if present (stale).
+  if tmux has-session -t "$CF_TMUX_SESSION" 2>/dev/null; then
+    tmux kill-session -t "$CF_TMUX_SESSION" 2>/dev/null || true
+    sleep 1
+  fi
+
+  tmux new-session -d -s "$CF_TMUX_SESSION" \
+    "cloudflared tunnel run ${tunnel_name} 2>&1 | tee -a ${CF_LOG}"
+
+  # Wait for cloudflared to establish connections (up to 15s).
+  say "Waiting for tunnel to connect..."
+  local i
+  for i in $(seq 1 30); do
+    if pgrep -x cloudflared >/dev/null 2>&1; then
+      # Check if tunnel has active connections.
+      local conns
+      conns="$(cloudflared tunnel info "$tunnel_name" 2>/dev/null | grep -c 'CONNECTIONS\|connector' || true)"
+      if [ "${conns:-0}" -gt 0 ]; then
+        say "  Tunnel '${tunnel_name}' connected."
+        return 0
+      fi
+    fi
+    sleep 0.5
+  done
+
+  # Even if connections aren't confirmed yet, check process is alive.
+  if pgrep -x cloudflared >/dev/null 2>&1; then
+    say "  cloudflared is running (connections may still be establishing)."
+    say "  Log: ${CF_LOG}"
+    say "  Attach: tmux attach -t ${CF_TMUX_SESSION}"
+    return 0
+  fi
+
+  err "cloudflared failed to start. Check log: ${CF_LOG}"
+  return 1
+}
+
+# ─── Smart component management ──────────────────────────────────────────────
+
+# ensure_component NAME CHECK_FN START_FN
+# Returns 0 if component is (now) running, 1 if start failed.
+ensure_component() {
+  local name="$1" check_fn="$2" start_fn="$3"
+
+  if "$check_fn" 2>/dev/null; then
+    say "[OK]  ${name}"
+    return 0
+  fi
+
+  say "[DOWN] ${name} - starting..."
+  if "$start_fn"; then
+    # Verify it came up.
+    sleep 1
+    if "$check_fn" 2>/dev/null; then
+      say "[OK]  ${name} - started"
+      return 0
+    fi
+  fi
+
+  err "${name} - failed to start"
+  return 1
+}
+
+# ─── Status report ────────────────────────────────────────────────────────────
+
 status_report() {
   local public_url="${1:-}"
   local rc=0
   local dest_conf
   local code
 
-  say "Status report (local host health)"
+  say ""
+  say "=== Status Report ==="
   say "project    : ${PROJECT_DIR}"
   say "auth log   : ${AUTH_LOG}"
+  say "tunnel log : ${CF_LOG}"
+  say ""
 
+  # ── sshd ──
+  if check_sshd; then
+    say "sshd         : OK (running)"
+  else
+    say "sshd         : FAIL (not running)"
+    rc=1
+  fi
+
+  # ── nginx ──
   if is_macos && command -v launchctl >/dev/null 2>&1; then
     if launchctl list | grep -q "${AUTH_LAUNCHD_LABEL}"; then
       say "launchd auth : OK (${AUTH_LAUNCHD_LABEL} loaded)"
@@ -391,78 +588,125 @@ status_report() {
   fi
 
   if dest_conf="$(detect_nginx_conf_dest 2>/dev/null)"; then
-    say "nginx conf : ${dest_conf}"
+    local conf_dir
+    conf_dir="$(dirname "$dest_conf")"
     if [ -f "$dest_conf" ]; then
-      say "nginx conf : OK (present)"
+      say "nginx conf   : OK (${dest_conf})"
     else
-      say "nginx conf : FAIL (missing)"
-      rc=1
+      # cf_tunnel_install.sh creates hostname-based configs (e.g. dev-ssh.wetigu.com.conf).
+      local alt_conf
+      alt_conf="$(ls "${conf_dir}"/*.conf 2>/dev/null | head -1 || true)"
+      if [ -n "$alt_conf" ]; then
+        say "nginx conf   : OK (${alt_conf})"
+      else
+        say "nginx conf   : FAIL (no config in ${conf_dir})"
+        rc=1
+      fi
     fi
   else
-    say "nginx conf : FAIL (path not detected)"
+    say "nginx conf   : FAIL (path not detected)"
     rc=1
   fi
 
   if _priv nginx -t >/dev/null 2>&1; then
-    say "nginx test : OK"
+    say "nginx test   : OK"
   else
-    say "nginx test : FAIL"
+    say "nginx test   : FAIL"
     rc=1
   fi
 
-  if command -v lsof >/dev/null 2>&1; then
-    if _priv lsof -nP -iTCP:7680 -sTCP:LISTEN >/dev/null 2>&1; then
-      say "port ${NGINX_PORT} : OK (nginx listening)"
-    else
-      say "port ${NGINX_PORT} : FAIL (not listening)"
-      rc=1
-    fi
+  if check_nginx; then
+    say "nginx :${NGINX_PORT} : OK (listening)"
+  else
+    say "nginx :${NGINX_PORT} : FAIL (not listening)"
+    rc=1
+  fi
 
-    if lsof -nP -iTCP:"${AUTH_PORT}" -sTCP:LISTEN >/dev/null 2>&1; then
-      say "port ${AUTH_PORT} : OK (auth listening)"
+  # ── auth.py ──
+  if check_auth; then
+    say "auth  :${AUTH_PORT} : OK (responding)"
+  else
+    say "auth  :${AUTH_PORT} : FAIL (not responding)"
+    rc=1
+  fi
+
+  # ── cloudflared ──
+  local tunnel_name
+  tunnel_name="$(detect_tunnel_name)"
+  if [ -n "$tunnel_name" ]; then
+    if check_cloudflared; then
+      say "cloudflared  : OK (running, tunnel: ${tunnel_name})"
+      if tmux has-session -t "$CF_TMUX_SESSION" 2>/dev/null; then
+        say "tmux session : OK (${CF_TMUX_SESSION})"
+      else
+        say "tmux session : WARN (not in tmux - may be systemd/nohup)"
+      fi
     else
-      say "port ${AUTH_PORT} : FAIL (not listening)"
+      say "cloudflared  : FAIL (not running, tunnel: ${tunnel_name})"
       rc=1
     fi
   else
-    say "ports      : SKIP (lsof not available)"
+    say "cloudflared  : SKIP (no tunnel configured in ${CF_CONFIG})"
   fi
 
+  # ── HTTP health checks ──
+  say ""
   if command -v curl >/dev/null 2>&1; then
     code="$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:${NGINX_PORT}/login" || true)"
     if [ "$code" = "200" ]; then
-      say "GET :${NGINX_PORT}/login : OK (200)"
+      say "GET :${NGINX_PORT}/login     : OK (200)"
     else
-      say "GET :${NGINX_PORT}/login : FAIL (${code:-no response})"
+      say "GET :${NGINX_PORT}/login     : FAIL (${code:-no response})"
       rc=1
     fi
 
     code="$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:${AUTH_PORT}/api/auth" || true)"
     if [ "$code" = "200" ] || [ "$code" = "401" ]; then
-      say "GET :${AUTH_PORT}/api/auth : OK (${code})"
+      say "GET :${AUTH_PORT}/api/auth   : OK (${code})"
     else
-      say "GET :${AUTH_PORT}/api/auth : FAIL (${code:-no response})"
+      say "GET :${AUTH_PORT}/api/auth   : FAIL (${code:-no response})"
       rc=1
     fi
   else
-    say "http checks: SKIP (curl not available)"
+    say "http checks  : SKIP (curl not available)"
+  fi
+
+  # ── Public URL check ──
+  # Auto-detect from tunnel config if not provided.
+  if [ -z "$public_url" ]; then
+    local hostname
+    hostname="$(detect_tunnel_hostname)"
+    if [ -n "$hostname" ]; then
+      public_url="https://${hostname}"
+    fi
   fi
 
   if [ -n "$public_url" ] && command -v curl >/dev/null 2>&1; then
-    code="$(curl -k -s -o /dev/null -w "%{http_code}" "${public_url%/}/login" || true)"
+    code="$(curl -k -s -o /dev/null -w "%{http_code}" --max-time 10 "${public_url%/}/login" || true)"
     if [ "$code" = "200" ] || [ "$code" = "302" ]; then
-      say "GET public /login : OK (${code})"
+      say "GET ${public_url}/login : OK (${code})"
     else
-      say "GET public /login : WARN (${code:-no response})"
+      say "GET ${public_url}/login : FAIL (${code:-no response})"
+      rc=1
     fi
+  fi
+
+  say ""
+  if [ "$rc" -eq 0 ]; then
+    say "All components healthy."
+  else
+    say "Some components have issues (see above)."
   fi
 
   return "$rc"
 }
 
+# ─── Main ─────────────────────────────────────────────────────────────────────
+
 main() {
   local mode=""
   local public_url=""
+  local force_restart=false
 
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -472,6 +716,10 @@ main() {
         ;;
       --status)
         mode="status"
+        shift
+        ;;
+      --restart)
+        force_restart=true
         shift
         ;;
       --public-url)
@@ -514,16 +762,70 @@ main() {
 
   local dest_conf
   dest_conf="$(detect_nginx_conf_dest)"
-
-  install_nginx_conf "$dest_conf"
-  reload_nginx
-  stop_auth_service
-  start_auth_service
+  local had_failure=false
 
   say ""
-  say "Deploy complete."
-  say "nginx conf : ${dest_conf}"
-  say "auth log   : ${AUTH_LOG}"
+  say "=== Checking components ==="
+  say ""
+
+  # ── 1. sshd ──
+  if $force_restart || ! check_sshd; then
+    start_sshd || had_failure=true
+  else
+    say "[OK]  sshd"
+  fi
+
+  # ── 2. nginx config + process ──
+  install_nginx_conf "$dest_conf"
+  if $force_restart; then
+    reload_nginx || had_failure=true
+  elif ! check_nginx; then
+    say "[DOWN] nginx - starting..."
+    start_nginx || had_failure=true
+    # Also reload to pick up any config changes.
+    reload_nginx 2>/dev/null || true
+  else
+    # nginx is running; reload only if config changed.
+    if [ -f "$dest_conf" ] && ! cmp -s "${NGINX_SRC_CONF}" "$dest_conf" 2>/dev/null; then
+      reload_nginx || had_failure=true
+    else
+      say "[OK]  nginx (:${NGINX_PORT})"
+    fi
+  fi
+
+  # ── 3. auth.py ──
+  if $force_restart; then
+    stop_auth_service
+    start_auth_service || had_failure=true
+  elif ! check_auth; then
+    say "[DOWN] auth service - starting..."
+    stop_auth_service
+    start_auth_service || had_failure=true
+  else
+    say "[OK]  auth (:${AUTH_PORT})"
+  fi
+
+  # ── 4. cloudflared tunnel ──
+  local tunnel_name
+  tunnel_name="$(detect_tunnel_name)"
+  if [ -n "$tunnel_name" ]; then
+    if $force_restart; then
+      stop_cloudflared
+      start_cloudflared || had_failure=true
+    elif ! check_cloudflared; then
+      say "[DOWN] cloudflared - starting..."
+      start_cloudflared || had_failure=true
+    else
+      say "[OK]  cloudflared (tunnel: ${tunnel_name})"
+    fi
+  else
+    say "[SKIP] cloudflared (no tunnel in ${CF_CONFIG})"
+  fi
+
+  # ── Final status ──
+  say ""
+  say "=== Deploy complete ==="
+  status_report "$public_url"
 }
 
 main "$@"
