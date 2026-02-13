@@ -107,26 +107,34 @@ ensure_linux_deps() {
 }
 
 detect_nginx_conf_dest() {
+  local hostname
+  hostname="$(detect_tunnel_hostname)"
+  local conf_dir=""
+
   if [ -d "/usr/local/etc/nginx/servers" ]; then
-    printf '%s\n' "/usr/local/etc/nginx/servers/ttyd.conf"
-    return 0
+    conf_dir="/usr/local/etc/nginx/servers"
+  elif [ -d "/opt/homebrew/etc/nginx/servers" ]; then
+    conf_dir="/opt/homebrew/etc/nginx/servers"
+  elif [ -d "/etc/nginx/sites-available" ]; then
+    conf_dir="/etc/nginx/sites-available"
+  elif [ -d "/etc/nginx/conf.d" ]; then
+    conf_dir="/etc/nginx/conf.d"
+  else
+    err "Cannot find nginx config directory."
+    err "Expected one of: /usr/local/etc/nginx/servers, /opt/homebrew/etc/nginx/servers, /etc/nginx/sites-available, /etc/nginx/conf.d"
+    exit 1
   fi
-  if [ -d "/opt/homebrew/etc/nginx/servers" ]; then
-    printf '%s\n' "/opt/homebrew/etc/nginx/servers/ttyd.conf"
-    return 0
+
+  # Prefer hostname-based config (e.g. dev-ssh.wetigu.com.conf) created by
+  # cf_tunnel_install.sh.  Fall back to ttyd.conf for fresh installs.
+  if [ -n "$hostname" ] && [ -f "${conf_dir}/${hostname}.conf" ]; then
+    printf '%s\n' "${conf_dir}/${hostname}.conf"
+  elif [ -n "$hostname" ]; then
+    # No config exists yet — use hostname-based name for new installs.
+    printf '%s\n' "${conf_dir}/${hostname}.conf"
+  else
+    printf '%s\n' "${conf_dir}/ttyd.conf"
   fi
-  if [ -d "/etc/nginx/sites-available" ]; then
-    printf '%s\n' "/etc/nginx/sites-available/ttyd.conf"
-    return 0
-  fi
-  # RHEL/CentOS/Fedora use conf.d instead of sites-available.
-  if [ -d "/etc/nginx/conf.d" ]; then
-    printf '%s\n' "/etc/nginx/conf.d/ttyd.conf"
-    return 0
-  fi
-  err "Cannot find nginx config directory."
-  err "Expected one of: /usr/local/etc/nginx/servers, /opt/homebrew/etc/nginx/servers, /etc/nginx/sites-available, /etc/nginx/conf.d"
-  exit 1
 }
 
 install_nginx_conf() {
@@ -154,7 +162,24 @@ install_nginx_conf() {
     _priv mv "$legacy" "$hidden" 2>/dev/null || _priv rm -f "$legacy" 2>/dev/null || true
   done
 
-  if [ -f "$dest_conf" ] && cmp -s "${NGINX_SRC_CONF}" "$dest_conf"; then
+  # Build the effective source config: substitute server_name with the tunnel
+  # hostname so the template works regardless of which machine it's deployed on.
+  local hostname
+  hostname="$(detect_tunnel_hostname)"
+  local effective_src="${NGINX_SRC_CONF}"
+  local tmp_conf=""
+  if [ -n "$hostname" ]; then
+    local src_hostname
+    src_hostname="$(grep -oP '^\s*server_name\s+\K\S+(?=;)' "${NGINX_SRC_CONF}" | head -1)"
+    if [ -n "$src_hostname" ] && [ "$src_hostname" != "$hostname" ]; then
+      tmp_conf="$(mktemp)"
+      sed "s/server_name ${src_hostname};/server_name ${hostname};/" "${NGINX_SRC_CONF}" > "$tmp_conf"
+      effective_src="$tmp_conf"
+    fi
+  fi
+
+  local updated=false
+  if [ -f "$dest_conf" ] && cmp -s "$effective_src" "$dest_conf"; then
     say "nginx config unchanged."
   else
     if [ -f "$dest_conf" ]; then
@@ -166,14 +191,23 @@ install_nginx_conf() {
       say "Backing up existing config -> ${backup}"
       _priv cp "$dest_conf" "$backup"
     fi
-    _priv cp "${NGINX_SRC_CONF}" "$dest_conf"
+    _priv cp "$effective_src" "$dest_conf"
     say "nginx config updated."
+    updated=true
   fi
 
+  # Clean up temp file.
+  [ -n "$tmp_conf" ] && rm -f "$tmp_conf"
+
   # Debian/Ubuntu: ensure site is enabled.
-  if [ -d "/etc/nginx/sites-enabled" ] && [ "$dest_conf" = "/etc/nginx/sites-available/ttyd.conf" ]; then
-    _priv ln -sf "$dest_conf" "/etc/nginx/sites-enabled/ttyd.conf"
+  if [ -d "/etc/nginx/sites-enabled" ]; then
+    local conf_name
+    conf_name="$(basename "$dest_conf")"
+    _priv ln -sf "$dest_conf" "/etc/nginx/sites-enabled/${conf_name}"
   fi
+
+  # Return 0 if config was updated (caller uses this to decide whether to reload).
+  $updated
 }
 
 reload_nginx() {
@@ -507,6 +541,26 @@ check_auth() {
 
 check_cloudflared() {
   pgrep -x cloudflared >/dev/null 2>&1
+}
+
+# Return 0 (true) if auth.py on disk is newer than the running process.
+auth_py_changed() {
+  [ -f "${AUTH_PY}" ] || return 1
+  local pid
+  pid="$(pgrep -f "python3 ${AUTH_PY}" | head -1 || true)"
+  [ -n "$pid" ] || return 1
+  # Compare file mtime vs process start time using /proc (Linux) or ps (macOS).
+  if [ -d "/proc/${pid}" ]; then
+    # auth.py is newer than the process's start time?
+    [ "${AUTH_PY}" -nt "/proc/${pid}" ]
+  elif is_macos; then
+    local proc_start file_mod
+    proc_start="$(ps -o lstart= -p "$pid" 2>/dev/null | xargs -I{} date -j -f "%c" "{}" +%s 2>/dev/null || echo 0)"
+    file_mod="$(stat -f %m "${AUTH_PY}" 2>/dev/null || echo 0)"
+    [ "$file_mod" -gt "$proc_start" ]
+  else
+    return 1
+  fi
 }
 
 stop_cloudflared() {
@@ -849,7 +903,8 @@ main() {
   check_sshd_localhost_password_auth || had_failure=true
 
   # ── 2. nginx config + process ──
-  install_nginx_conf "$dest_conf"
+  local nginx_conf_changed=false
+  install_nginx_conf "$dest_conf" && nginx_conf_changed=true
   if $force_restart; then
     reload_nginx || had_failure=true
   elif ! check_nginx; then
@@ -858,8 +913,8 @@ main() {
     # Also reload to pick up any config changes.
     reload_nginx 2>/dev/null || true
   else
-    # nginx is running; reload only if config changed.
-    if [ -f "$dest_conf" ] && ! cmp -s "${NGINX_SRC_CONF}" "$dest_conf" 2>/dev/null; then
+    # nginx is running; reload only if config was updated.
+    if $nginx_conf_changed; then
       reload_nginx || had_failure=true
     else
       say "[OK]  nginx (:${NGINX_PORT})"
@@ -872,6 +927,10 @@ main() {
     start_auth_service || had_failure=true
   elif ! check_auth; then
     say "[DOWN] auth service - starting..."
+    stop_auth_service
+    start_auth_service || had_failure=true
+  elif auth_py_changed; then
+    say "[STALE] auth service - auth.py changed, restarting..."
     stop_auth_service
     start_auth_service || had_failure=true
   else
