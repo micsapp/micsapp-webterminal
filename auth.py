@@ -1036,6 +1036,203 @@ APP_HTML = """<!DOCTYPE html>
   }
   .file-panel.dragover .fp-drop-overlay { display: flex; }
 
+  /* Quick Commands panel */
+  .qc-overlay {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.6);
+    z-index: 200;
+    align-items: center;
+    justify-content: center;
+  }
+  .qc-overlay.open { display: flex; }
+  .qc-modal {
+    background: #16213e;
+    border: 1px solid #0f3460;
+    border-radius: 10px;
+    width: 92%;
+    max-width: 720px;
+    max-height: 85vh;
+    display: flex;
+    flex-direction: column;
+    box-shadow: 0 20px 60px rgba(0,0,0,0.5);
+  }
+  .qc-header {
+    display: flex;
+    align-items: center;
+    padding: 10px 14px;
+    border-bottom: 1px solid #0f3460;
+    gap: 8px;
+    flex-shrink: 0;
+  }
+  .qc-header-title {
+    color: #e2e2e2;
+    font-size: 14px;
+    font-weight: 600;
+    flex: 1;
+  }
+  .qc-toolbar {
+    display: flex;
+    align-items: center;
+    padding: 8px 14px;
+    gap: 6px;
+    border-bottom: 1px solid #0f3460;
+    flex-shrink: 0;
+    flex-wrap: wrap;
+  }
+  .qc-search {
+    flex: 1;
+    min-width: 140px;
+    background: #0f3460;
+    border: 1px solid #1a4a7a;
+    color: #e2e2e2;
+    font-size: 13px;
+    padding: 6px 10px;
+    border-radius: 6px;
+    outline: none;
+  }
+  .qc-search:focus { border-color: #e94560; }
+  .qc-search::placeholder { color: #5a5a7a; }
+  .qc-tags-bar {
+    display: flex;
+    align-items: center;
+    padding: 4px 14px 6px;
+    gap: 4px;
+    flex-wrap: wrap;
+    border-bottom: 1px solid #0f3460;
+    flex-shrink: 0;
+  }
+  .qc-tags-bar:empty { display: none; padding: 0; border: none; }
+  .qc-tag-chip {
+    display: inline-flex;
+    align-items: center;
+    padding: 2px 8px;
+    font-size: 11px;
+    border-radius: 10px;
+    border: 1px solid #1a4a7a;
+    background: #0f3460;
+    color: #9a9abf;
+    cursor: pointer;
+    transition: 0.15s;
+    white-space: nowrap;
+  }
+  .qc-tag-chip:hover, .qc-tag-chip.active {
+    border-color: #e94560;
+    color: #e2e2e2;
+    background: rgba(233,69,96,0.15);
+  }
+  .qc-list {
+    flex: 1;
+    overflow-y: auto;
+    overflow-x: hidden;
+    min-height: 0;
+  }
+  .qc-list::-webkit-scrollbar { width: 6px; }
+  .qc-list::-webkit-scrollbar-thumb { background: #1a4a7a; border-radius: 3px; }
+  .qc-empty {
+    padding: 30px 20px;
+    text-align: center;
+    color: #5a5a7a;
+    font-size: 13px;
+  }
+  .qc-item {
+    display: flex;
+    align-items: flex-start;
+    padding: 8px 14px;
+    gap: 10px;
+    cursor: pointer;
+    transition: background 0.1s;
+    border-bottom: 1px solid rgba(15,52,96,0.5);
+  }
+  .qc-item:hover { background: rgba(255,255,255,0.04); }
+  .qc-item-body { flex: 1; min-width: 0; }
+  .qc-item-name {
+    color: #e2e2e2;
+    font-size: 13px;
+    font-weight: 600;
+    margin-bottom: 2px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .qc-item-cmd {
+    color: #9a9abf;
+    font-size: 12px;
+    font-family: 'Menlo','Monaco','Consolas',monospace;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .qc-item-tags {
+    display: flex;
+    gap: 3px;
+    margin-top: 3px;
+    flex-wrap: wrap;
+  }
+  .qc-item-tag {
+    font-size: 10px;
+    padding: 1px 5px;
+    border-radius: 8px;
+    background: rgba(15,52,96,0.8);
+    color: #7a7a9e;
+    border: 1px solid #1a4a7a;
+  }
+  .qc-item-actions {
+    display: flex;
+    gap: 2px;
+    flex-shrink: 0;
+    align-items: center;
+    padding-top: 2px;
+  }
+  .qc-item-actions .fp-act { font-size: 13px; }
+  .qc-form {
+    padding: 12px 14px;
+    border-bottom: 1px solid #0f3460;
+    flex-shrink: 0;
+  }
+  .qc-form-row {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 8px;
+    align-items: flex-start;
+  }
+  .qc-form-row:last-child { margin-bottom: 0; }
+  .qc-form label {
+    color: #7a7a9e;
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    min-width: 70px;
+    padding-top: 7px;
+    flex-shrink: 0;
+  }
+  .qc-form input[type="text"],
+  .qc-form textarea {
+    flex: 1;
+    background: #0f3460;
+    border: 1px solid #1a4a7a;
+    color: #e2e2e2;
+    font-size: 13px;
+    padding: 6px 10px;
+    border-radius: 6px;
+    outline: none;
+  }
+  .qc-form textarea {
+    font-family: 'Menlo','Monaco','Consolas',monospace;
+    resize: vertical;
+    min-height: 56px;
+    line-height: 1.4;
+  }
+  .qc-form input:focus,
+  .qc-form textarea:focus { border-color: #e94560; }
+  .qc-form-actions {
+    display: flex;
+    gap: 6px;
+    justify-content: flex-end;
+  }
+
   /* Terminal container */
   .term-container {
     flex: 1;
@@ -1097,6 +1294,7 @@ APP_HTML = """<!DOCTYPE html>
   <span class="nav-btn nav-hide-mobile quick-font-readout" id="quickFontSizeDisplay">15px</span>
   <button class="nav-btn" onclick="quickAdjustFontSize(1)" title="Increase Font Size">A+</button>
   <div class="nav-sep nav-hide-mobile"></div>
+  <button class="nav-btn nav-hide-mobile" id="cmdsBtn" onclick="toggleQuickCommands()">&#9889; Commands</button>
   <button class="nav-btn nav-hide-mobile" id="filesBtn" onclick="toggleFilePanel()">&#128193; Files</button>
   <button class="nav-btn nav-hide-mobile" id="settingsBtn" onclick="toggleSettings()">&#9881; Settings</button>
   <button class="nav-btn nav-hide-mobile" id="themeBtn" onclick="toggleThemePanel()">&#9673; Themes</button>
@@ -1104,6 +1302,7 @@ APP_HTML = """<!DOCTYPE html>
   <button class="nav-btn nav-hide-mobile" onclick="reconnect()">&#8635; Reconnect</button>
   <button class="hamburger" onclick="toggleHamburger()" aria-label="Menu">&#9776;</button>
   <div class="nav-dropdown" id="navDropdown">
+    <button class="nav-btn" onclick="toggleQuickCommands();toggleHamburger()">&#9889; Commands</button>
     <button class="nav-btn" onclick="toggleFilePanel();toggleHamburger()">&#128193; Files</button>
     <button class="nav-btn" onclick="toggleSettings();toggleHamburger()">&#9881; Settings</button>
     <button class="nav-btn" onclick="toggleThemePanel();toggleHamburger()">&#9673; Themes</button>
@@ -1266,6 +1465,42 @@ APP_HTML = """<!DOCTYPE html>
     </div>
   </div>
 </div>
+<div class="qc-overlay" id="qcOverlay">
+  <div class="qc-modal">
+    <div class="qc-header">
+      <span class="qc-header-title">&#9889; Quick Commands</span>
+      <button class="fp-btn" id="qcAddBtn" onclick="qcShowForm()">+ Add</button>
+      <button class="fp-btn" id="qcImportBtn" onclick="document.getElementById('qcImportInput').click()">&#8593; Import</button>
+      <button class="fp-btn" id="qcExportBtn" onclick="qcExport()">&#8595; Export</button>
+      <button class="fp-btn" onclick="closeQuickCommands()">&#10005;</button>
+    </div>
+    <div class="qc-form" id="qcForm" style="display:none">
+      <div class="qc-form-row">
+        <label>Name</label>
+        <input type="text" id="qcFormName" placeholder="Command name">
+      </div>
+      <div class="qc-form-row">
+        <label>Command</label>
+        <textarea id="qcFormCmd" placeholder="Command string (e.g. ls -la)" rows="2"></textarea>
+      </div>
+      <div class="qc-form-row">
+        <label>Tags</label>
+        <input type="text" id="qcFormTags" placeholder="Comma-separated tags (e.g. system,network)">
+      </div>
+      <div class="qc-form-actions">
+        <button class="dlg-btn" onclick="qcHideForm()">Cancel</button>
+        <button class="dlg-btn primary" id="qcFormSave" onclick="qcSaveForm()">Save</button>
+      </div>
+    </div>
+    <div class="qc-toolbar">
+      <input type="text" class="qc-search" id="qcSearch" placeholder="Search commands by name, command, or tag..." oninput="qcApplyFilter()">
+    </div>
+    <div class="qc-tags-bar" id="qcTagsBar"></div>
+    <div class="qc-list" id="qcList"></div>
+  </div>
+</div>
+<input type="file" id="qcImportInput" accept=".json,application/json" style="display:none" onchange="qcImport(this.files);this.value='';">
+
 <div id="toast" class="toast"></div>
 
 <div class="copy-modal-overlay" id="copyModal">
@@ -2061,9 +2296,10 @@ document.addEventListener('keydown', (e) => {
     const idx = tabs.findIndex(t => t.id === activeTabId);
     if (idx > 0) switchTab(tabs[idx - 1].id);
   }
-  // Escape = close preview modal
+  // Escape = close modals
   if (e.key === 'Escape') {
     closeFileModal();
+    closeQuickCommands();
   }
 });
 
@@ -2799,6 +3035,409 @@ function formatSize(bytes) {
   return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
 }
 
+// --- Quick Commands ---
+let qcCommands = [];
+let qcFilterTag = '';
+let qcEditId = '';
+
+function toggleQuickCommands() {
+  const overlay = document.getElementById('qcOverlay');
+  const isOpen = overlay.classList.contains('open');
+  if (isOpen) {
+    closeQuickCommands();
+  } else {
+    openQuickCommands();
+  }
+}
+
+function openQuickCommands() {
+  document.getElementById('qcOverlay').classList.add('open');
+  qcEditId = '';
+  qcHideForm();
+  qcLoadCommands();
+}
+
+function closeQuickCommands() {
+  document.getElementById('qcOverlay').classList.remove('open');
+  // Delay focus to ensure the overlay is fully hidden first
+  setTimeout(focusActiveTerminal, 50);
+}
+
+function focusActiveTerminal() {
+  try {
+    var frame = document.getElementById('frame-' + activeTabId);
+    if (!frame) return;
+    frame.focus();
+    // Also try to focus the xterm helper textarea inside the iframe
+    try {
+      var doc = frame.contentDocument;
+      if (doc) {
+        var ta = doc.querySelector('.xterm-helper-textarea');
+        if (ta) { ta.focus(); return; }
+      }
+    } catch(ce) {}
+    // Try via contentWindow
+    try {
+      if (frame.contentWindow) {
+        frame.contentWindow.focus();
+      }
+    } catch(cw) {}
+  } catch(e) {}
+}
+
+async function qcLoadCommands() {
+  const list = document.getElementById('qcList');
+  list.innerHTML = '<div class="qc-empty">Loading...</div>';
+  try {
+    const res = await fetch('/api/quick-commands');
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const data = await res.json();
+    if (data.error) { list.innerHTML = '<div class="qc-empty" style="color:#e94560;">' + escHtml(data.error) + '</div>'; return; }
+    qcCommands = data.commands || [];
+    qcRenderTags();
+    qcApplyFilter();
+  } catch (e) {
+    list.innerHTML = '<div class="qc-empty" style="color:#e94560;">Error: ' + escHtml(e.message) + '</div>';
+  }
+}
+
+function qcGetAllTags() {
+  const tags = new Set();
+  qcCommands.forEach(c => {
+    (c.tags || '').split(',').forEach(t => {
+      t = t.trim();
+      if (t) tags.add(t);
+    });
+  });
+  return Array.from(tags).sort();
+}
+
+function qcRenderTags() {
+  const bar = document.getElementById('qcTagsBar');
+  const allTags = qcGetAllTags();
+  bar.innerHTML = '';
+  if (allTags.length === 0) return;
+  const allChip = document.createElement('span');
+  allChip.className = 'qc-tag-chip' + (qcFilterTag === '' ? ' active' : '');
+  allChip.textContent = 'All';
+  allChip.onclick = () => { qcFilterTag = ''; qcRenderTags(); qcApplyFilter(); };
+  bar.appendChild(allChip);
+  allTags.forEach(tag => {
+    const chip = document.createElement('span');
+    chip.className = 'qc-tag-chip' + (qcFilterTag === tag ? ' active' : '');
+    chip.textContent = tag;
+    chip.onclick = () => { qcFilterTag = (qcFilterTag === tag ? '' : tag); qcRenderTags(); qcApplyFilter(); };
+    bar.appendChild(chip);
+  });
+}
+
+function qcApplyFilter() {
+  const query = (document.getElementById('qcSearch').value || '').toLowerCase().trim();
+  const filtered = qcCommands.filter(c => {
+    if (qcFilterTag) {
+      const tags = (c.tags || '').split(',').map(t => t.trim().toLowerCase());
+      if (!tags.includes(qcFilterTag.toLowerCase())) return false;
+    }
+    if (query) {
+      const name = (c.name || '').toLowerCase();
+      const cmd = (c.command || '').toLowerCase();
+      const tags = (c.tags || '').toLowerCase();
+      if (!name.includes(query) && !cmd.includes(query) && !tags.includes(query)) return false;
+    }
+    return true;
+  });
+  qcRenderList(filtered);
+}
+
+function qcRenderList(commands) {
+  const list = document.getElementById('qcList');
+  list.innerHTML = '';
+  if (commands.length === 0) {
+    list.innerHTML = '<div class="qc-empty">No commands found. Click "+ Add" to create one.</div>';
+    return;
+  }
+  commands.forEach(c => {
+    const item = document.createElement('div');
+    item.className = 'qc-item';
+    item.onclick = () => qcSendCommand(c.command);
+
+    const body = document.createElement('div');
+    body.className = 'qc-item-body';
+
+    const name = document.createElement('div');
+    name.className = 'qc-item-name';
+    name.textContent = c.name;
+    body.appendChild(name);
+
+    const cmd = document.createElement('div');
+    cmd.className = 'qc-item-cmd';
+    cmd.textContent = c.command;
+    body.appendChild(cmd);
+
+    if (c.tags) {
+      const tagsDiv = document.createElement('div');
+      tagsDiv.className = 'qc-item-tags';
+      c.tags.split(',').forEach(t => {
+        t = t.trim();
+        if (!t) return;
+        const tag = document.createElement('span');
+        tag.className = 'qc-item-tag';
+        tag.textContent = t;
+        tagsDiv.appendChild(tag);
+      });
+      body.appendChild(tagsDiv);
+    }
+    item.appendChild(body);
+
+    const actions = document.createElement('div');
+    actions.className = 'qc-item-actions';
+
+    const editBtn = document.createElement('button');
+    editBtn.className = 'fp-act';
+    editBtn.innerHTML = '&#9998;';
+    editBtn.title = 'Edit';
+    editBtn.onclick = (ev) => { ev.stopPropagation(); qcEditCommand(c); };
+    actions.appendChild(editBtn);
+
+    const delBtn = document.createElement('button');
+    delBtn.className = 'fp-act';
+    delBtn.innerHTML = '&#128465;';
+    delBtn.title = 'Delete';
+    delBtn.style.color = '#e94560';
+    delBtn.onclick = (ev) => { ev.stopPropagation(); qcDeleteCommand(c.id, c.name); };
+    actions.appendChild(delBtn);
+
+    item.appendChild(actions);
+    list.appendChild(item);
+  });
+}
+
+function qcSendCommand(cmd) {
+  if (!cmd) return;
+  const frame = getActiveFrame();
+  if (!frame || !frame.contentWindow) {
+    showToast('No active terminal', true);
+    return;
+  }
+  try {
+    const w = frame.contentWindow;
+    const text = cmd + '\\r';
+
+    // 1) Try term-hook exposed objects directly (works regardless of xterm version)
+    const termObj = w.term || w.terminal || w.xterm;
+    if (termObj) {
+      // xterm.js v4: paste()
+      if (typeof termObj.paste === 'function') {
+        termObj.paste(text);
+        closeQuickCommands();
+        showToast('Command sent', false);
+        return;
+      }
+      // xterm.js v5+: input() triggers onData which sends via WebSocket
+      if (typeof termObj.input === 'function') {
+        termObj.input(text);
+        closeQuickCommands();
+        showToast('Command sent', false);
+        return;
+      }
+      // Try internal core data event (xterm.js v5 internals)
+      try {
+        var core = termObj._core || (termObj._addonManager && termObj._addonManager._terminal && termObj._addonManager._terminal._core);
+        if (core && core.coreService && typeof core.coreService.triggerDataEvent === 'function') {
+          core.coreService.triggerDataEvent(text);
+          closeQuickCommands();
+          showToast('Command sent', false);
+          return;
+        }
+      } catch(ei) {}
+    }
+
+    // 2) Broader search: findTerminalObject (strict check)
+    const term2 = findTerminalObject(w);
+    if (term2 && typeof term2.paste === 'function') {
+      term2.paste(text);
+      closeQuickCommands();
+      showToast('Command sent', false);
+      return;
+    }
+
+    // 3) Try writing to WebSocket directly (ttyd protocol: type 0 = input)
+    var ws = null;
+    try {
+      // Common ttyd WebSocket locations
+      var candidates = [w.ws, w.socket, w.webSocket];
+      // Also check nested objects
+      var keys = Object.getOwnPropertyNames(w);
+      for (var ki = 0; ki < keys.length && !ws; ki++) {
+        try {
+          var v = w[keys[ki]];
+          if (v instanceof WebSocket && v.readyState === 1) { ws = v; break; }
+          if (v && typeof v === 'object') {
+            if (v.ws instanceof WebSocket && v.ws.readyState === 1) { ws = v.ws; break; }
+            if (v.socket instanceof WebSocket && v.socket.readyState === 1) { ws = v.socket; break; }
+          }
+        } catch(ek) {}
+      }
+      for (var ci = 0; ci < candidates.length && !ws; ci++) {
+        if (candidates[ci] instanceof WebSocket && candidates[ci].readyState === 1) { ws = candidates[ci]; break; }
+      }
+    } catch(ew) {}
+    if (ws) {
+      var enc = new TextEncoder();
+      var d = enc.encode(text);
+      var msg = new Uint8Array(d.length + 1);
+      msg[0] = 0;
+      msg.set(d, 1);
+      ws.send(msg);
+      closeQuickCommands();
+      showToast('Command sent', false);
+      return;
+    }
+
+    // 4) Last resort: type into the xterm helper textarea character by character
+    try {
+      var doc = frame.contentDocument;
+      var ta = doc && doc.querySelector('.xterm-helper-textarea');
+      if (ta) {
+        ta.focus();
+        for (var i = 0; i < text.length; i++) {
+          var ch = text[i];
+          var kc = ch.charCodeAt(0);
+          var key = ch === '\\r' ? 'Enter' : ch;
+          var code = ch === '\\r' ? 13 : kc;
+          ta.dispatchEvent(new KeyboardEvent('keydown', { key: key, keyCode: code, which: code, bubbles: true, cancelable: true }));
+          if (ch !== '\\r') {
+            ta.dispatchEvent(new InputEvent('input', { data: ch, inputType: 'insertText', bubbles: true }));
+          }
+          ta.dispatchEvent(new KeyboardEvent('keyup', { key: key, keyCode: code, which: code, bubbles: true }));
+        }
+        closeQuickCommands();
+        showToast('Command sent', false);
+        return;
+      }
+    } catch(et) {}
+
+    showToast('Terminal not accessible - try clicking the terminal first', true);
+  } catch(e) {
+    showToast('Failed to send: ' + e.message, true);
+  }
+}
+
+function qcShowForm(editCmd) {
+  const form = document.getElementById('qcForm');
+  form.style.display = 'block';
+  document.getElementById('qcFormName').value = editCmd ? editCmd.name : '';
+  document.getElementById('qcFormCmd').value = editCmd ? editCmd.command : '';
+  document.getElementById('qcFormTags').value = editCmd ? editCmd.tags : '';
+  qcEditId = editCmd ? editCmd.id : '';
+  document.getElementById('qcFormSave').textContent = editCmd ? 'Update' : 'Save';
+  document.getElementById('qcAddBtn').style.display = 'none';
+  setTimeout(() => document.getElementById('qcFormName').focus(), 0);
+}
+
+function qcHideForm() {
+  document.getElementById('qcForm').style.display = 'none';
+  document.getElementById('qcAddBtn').style.display = '';
+  qcEditId = '';
+}
+
+async function qcSaveForm() {
+  const name = document.getElementById('qcFormName').value.trim();
+  const command = document.getElementById('qcFormCmd').value.trim();
+  const tags = document.getElementById('qcFormTags').value.trim();
+  if (!name || !command) {
+    showToast('Name and command are required', true);
+    return;
+  }
+  try {
+    const body = qcEditId
+      ? { action: 'update', id: qcEditId, name, command, tags }
+      : { action: 'add', name, command, tags };
+    const jsonBody = JSON.stringify(body);
+    const res = await fetch('/api/quick-commands', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: jsonBody,
+    });
+    const text = await res.text();
+    let data;
+    try { data = JSON.parse(text); } catch(pe) {
+      showToast('Server error (status ' + res.status + '): ' + text.slice(0, 120), true);
+      return;
+    }
+    if (data.error) { showToast(data.error, true); return; }
+    const wasEdit = !!qcEditId;
+    qcHideForm();
+    await qcLoadCommands();
+    showToast(wasEdit ? 'Command updated' : 'Command added', false);
+  } catch (e) {
+    showToast('Error: ' + e.message, true);
+  }
+}
+
+function qcEditCommand(cmd) {
+  qcShowForm(cmd);
+}
+
+async function qcDeleteCommand(id, name) {
+  const ok = await modalConfirm('Delete command "' + name + '"?', 'Delete Command', true);
+  if (!ok) return;
+  try {
+    const res = await fetch('/api/quick-commands', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'delete', id: id }),
+    });
+    const data = await res.json();
+    if (data.error) { showToast(data.error, true); return; }
+    await qcLoadCommands();
+    showToast('Command deleted', false);
+  } catch (e) {
+    showToast('Error: ' + e.message, true);
+  }
+}
+
+function qcExport() {
+  const a = document.createElement('a');
+  a.href = '/api/quick-commands/export';
+  a.download = 'ttyd_quick_command.json';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  showToast('Exporting commands...', false);
+}
+
+async function qcImport(files) {
+  if (!files || !files.length) return;
+  const file = files[0];
+  try {
+    const text = await file.text();
+    const parsed = JSON.parse(text);
+    if (!Array.isArray(parsed)) {
+      showToast('Invalid file: expected a JSON array', true);
+      return;
+    }
+    const res = await fetch('/api/quick-commands/import', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: text,
+    });
+    const data = await res.json();
+    if (data.error) { showToast(data.error, true); return; }
+    await qcLoadCommands();
+    showToast('Imported ' + (data.added || 0) + ' commands', false);
+  } catch (e) {
+    showToast('Import error: ' + e.message, true);
+  }
+}
+
+// Close quick commands on overlay click
+document.getElementById('qcOverlay').addEventListener('click', function(e) {
+  if (e.target === this) closeQuickCommands();
+});
+
+// Close quick commands on Escape (handled in existing keydown listener)
+
 // Drag and drop for file panel
 (function() {
   const panel = document.getElementById('filePanel');
@@ -3494,6 +4133,266 @@ except Exception as ex:
         else:
             self._send_json(200, data)
 
+    # --- Quick Commands API handlers ---
+
+    def _handle_quick_commands_list(self):
+        username = self._get_authenticated_user()
+        if not username:
+            self._send_error(401, "not authenticated")
+            return
+        script = '''
+import os, json
+p = os.path.expanduser("~/ttyd_quick_command.json")
+try:
+    if os.path.exists(p):
+        with open(p, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, list):
+            data = []
+    else:
+        data = []
+    print(json.dumps({"ok": True, "commands": data}))
+except Exception as ex:
+    print(json.dumps({"error": str(ex)}))
+'''
+        rc, out, err = run_as_user(username, script)
+        if rc != 0:
+            self._send_error(500, err.decode(errors="replace"))
+            return
+        try:
+            data = json.loads(out)
+        except Exception:
+            self._send_error(500, out.decode(errors="replace"))
+            return
+        if "error" in data:
+            self._send_error(400, data["error"])
+        else:
+            self._send_json(200, data)
+
+    def _handle_quick_commands_action(self):
+        username = self._get_authenticated_user()
+        if not username:
+            self._send_error(401, "not authenticated")
+            return
+        length = int(self.headers.get("Content-Length", 0))
+        if length > 512 * 1024:
+            self._send_error(413, "payload too large")
+            return
+        body = self.rfile.read(length) if length > 0 else b""
+        try:
+            req = json.loads(body)
+        except Exception as e:
+            print(f"quick-commands: invalid json body ({length} bytes): {body[:200]!r}", flush=True)
+            self._send_error(400, f"invalid json (received {length} bytes): {str(e)}")
+            return
+        action = req.get("action", "")
+        if action not in ("add", "update", "delete"):
+            self._send_error(400, "invalid action (must be add, update, or delete)")
+            return
+        # Pass request data as base64-encoded JSON to avoid quoting issues
+        req_b64 = base64.b64encode(json.dumps(req).encode()).decode()
+        script = f'''
+import os, json, time, hashlib, base64
+p = os.path.expanduser("~/ttyd_quick_command.json")
+req = json.loads(base64.b64decode({req_b64!r}).decode())
+action = req.get("action", "")
+try:
+    cmds = []
+    if os.path.exists(p):
+        with open(p, "r", encoding="utf-8") as f:
+            cmds = json.load(f)
+        if not isinstance(cmds, list):
+            cmds = []
+
+    if action == "add":
+        name = req.get("name", "").strip()
+        command = req.get("command", "").strip()
+        tags = req.get("tags", "").strip()
+        if not name or not command:
+            raise Exception("name and command are required")
+        new_id = hashlib.sha256((name + command + str(time.time())).encode()).hexdigest()[:12]
+        cmds.append({{
+            "id": new_id,
+            "name": name,
+            "command": command,
+            "tags": tags,
+            "created": int(time.time()),
+            "updated": int(time.time()),
+        }})
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(cmds, f, indent=2)
+        print(json.dumps({{"ok": True, "id": new_id}}))
+
+    elif action == "update":
+        cmd_id = req.get("id", "")
+        if not cmd_id:
+            raise Exception("id is required")
+        found = False
+        for c in cmds:
+            if c.get("id") == cmd_id:
+                if "name" in req:
+                    c["name"] = req["name"].strip()
+                if "command" in req:
+                    c["command"] = req["command"].strip()
+                if "tags" in req:
+                    c["tags"] = req["tags"].strip()
+                c["updated"] = int(time.time())
+                found = True
+                break
+        if not found:
+            raise Exception("command not found")
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(cmds, f, indent=2)
+        print(json.dumps({{"ok": True}}))
+
+    elif action == "delete":
+        cmd_id = req.get("id", "")
+        if not cmd_id:
+            raise Exception("id is required")
+        new_cmds = [c for c in cmds if c.get("id") != cmd_id]
+        if len(new_cmds) == len(cmds):
+            raise Exception("command not found")
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(new_cmds, f, indent=2)
+        print(json.dumps({{"ok": True}}))
+
+except Exception as ex:
+    print(json.dumps({{"error": str(ex)}}))
+'''
+        rc, out, err = run_as_user(username, script)
+        if rc != 0:
+            errmsg = err.decode(errors="replace").strip()
+            print(f"quick-commands action: script failed rc={rc} err={errmsg[:300]}", flush=True)
+            self._send_error(500, f"script error: {errmsg[:200]}")
+            return
+        try:
+            data = json.loads(out)
+        except Exception:
+            raw = out.decode(errors="replace").strip()
+            print(f"quick-commands action: bad output: {raw[:300]}", flush=True)
+            self._send_error(500, f"script output not json: {raw[:200]}")
+            return
+        if "error" in data:
+            self._send_error(400, data["error"])
+        else:
+            self._send_json(200, data)
+
+    def _handle_quick_commands_export(self):
+        username = self._get_authenticated_user()
+        if not username:
+            self._send_error(401, "not authenticated")
+            return
+        script = '''
+import os, json, sys
+p = os.path.expanduser("~/ttyd_quick_command.json")
+try:
+    if os.path.exists(p):
+        with open(p, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, list):
+            data = []
+    else:
+        data = []
+    print(json.dumps(data))
+except Exception as ex:
+    print(json.dumps({"error": str(ex)}))
+'''
+        rc, out, err = run_as_user(username, script)
+        if rc != 0:
+            self._send_error(500, err.decode(errors="replace"))
+            return
+        try:
+            data = json.loads(out)
+        except Exception:
+            self._send_error(500, out.decode(errors="replace"))
+            return
+        if isinstance(data, dict) and "error" in data:
+            self._send_error(400, data["error"])
+            return
+        body = json.dumps(data, indent=2).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Disposition",
+                         content_disposition("attachment", "ttyd_quick_command.json"))
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _handle_quick_commands_import(self):
+        username = self._get_authenticated_user()
+        if not username:
+            self._send_error(401, "not authenticated")
+            return
+        length = int(self.headers.get("Content-Length", 0))
+        if length > 2 * 1024 * 1024:
+            self._send_error(413, "file too large (>2MB)")
+            return
+        body = self.rfile.read(length)
+        try:
+            imported = json.loads(body)
+        except Exception:
+            self._send_error(400, "invalid json")
+            return
+        if not isinstance(imported, list):
+            self._send_error(400, "expected a JSON array of commands")
+            return
+        # Validate structure
+        for item in imported:
+            if not isinstance(item, dict):
+                self._send_error(400, "each command must be a JSON object")
+                return
+            if not item.get("name") or not item.get("command"):
+                self._send_error(400, "each command must have name and command fields")
+                return
+        # Pass imported data as base64-encoded JSON to avoid quoting issues
+        imported_b64 = base64.b64encode(json.dumps(imported).encode()).decode()
+        script = f'''
+import os, json, time, hashlib, base64
+p = os.path.expanduser("~/ttyd_quick_command.json")
+imported = json.loads(base64.b64decode({imported_b64!r}).decode())
+try:
+    cmds = []
+    if os.path.exists(p):
+        with open(p, "r", encoding="utf-8") as f:
+            cmds = json.load(f)
+        if not isinstance(cmds, list):
+            cmds = []
+    existing_ids = set(c.get("id", "") for c in cmds)
+    added = 0
+    for item in imported:
+        cmd_id = item.get("id", "")
+        if not cmd_id or cmd_id in existing_ids:
+            cmd_id = hashlib.sha256((item.get("name","") + item.get("command","") + str(time.time()) + str(added)).encode()).hexdigest()[:12]
+        existing_ids.add(cmd_id)
+        cmds.append({{
+            "id": cmd_id,
+            "name": str(item.get("name", "")),
+            "command": str(item.get("command", "")),
+            "tags": str(item.get("tags", "")),
+            "created": item.get("created", int(time.time())),
+            "updated": int(time.time()),
+        }})
+        added += 1
+    with open(p, "w", encoding="utf-8") as f:
+        json.dump(cmds, f, indent=2)
+    print(json.dumps({{"ok": True, "added": added, "total": len(cmds)}}))
+except Exception as ex:
+    print(json.dumps({{"error": str(ex)}}))
+'''
+        rc, out, err = run_as_user(username, script)
+        if rc != 0:
+            self._send_error(500, err.decode(errors="replace"))
+            return
+        try:
+            data = json.loads(out)
+        except Exception:
+            self._send_error(500, out.decode(errors="replace"))
+            return
+        if "error" in data:
+            self._send_error(400, data["error"])
+        else:
+            self._send_json(200, data)
+
     def _handle_files_rename(self):
         username = self._get_authenticated_user()
         if not username:
@@ -3616,6 +4515,10 @@ except Exception as ex:
             self._handle_files_read(params)
         elif path == "/api/files/download":
             self._handle_files_download(params)
+        elif path == "/api/quick-commands":
+            self._handle_quick_commands_list()
+        elif path == "/api/quick-commands/export":
+            self._handle_quick_commands_export()
         else:
             self.send_response(404)
             self.end_headers()
@@ -3675,6 +4578,10 @@ except Exception as ex:
             self._handle_files_delete()
         elif path == "/api/files/rename":
             self._handle_files_rename()
+        elif path == "/api/quick-commands":
+            self._handle_quick_commands_action()
+        elif path == "/api/quick-commands/import":
+            self._handle_quick_commands_import()
         else:
             self.send_response(404)
             self.end_headers()
