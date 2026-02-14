@@ -1250,6 +1250,72 @@ APP_HTML = """<!DOCTYPE html>
   }
   .term-container iframe.active { display: block; }
 
+  /* Split pane layout */
+  .split-container {
+    display: flex;
+    width: 100%;
+    height: 100%;
+    min-height: 0;
+    min-width: 0;
+  }
+  .split-container.split-h { flex-direction: row; }
+  .split-container.split-v { flex-direction: column; }
+  .split-pane {
+    position: relative;
+    min-height: 0;
+    min-width: 0;
+    overflow: hidden;
+  }
+  .split-pane > iframe {
+    position: absolute;
+    top: 0; left: 0;
+    width: 100%;
+    height: 100%;
+    border: none;
+  }
+  .split-pane.split-focused { outline: 2px solid #e94560; outline-offset: -2px; z-index: 1; }
+  .split-divider {
+    flex-shrink: 0;
+    background: #0f3460;
+    position: relative;
+    z-index: 5;
+    transition: background 0.15s;
+  }
+  .split-divider:hover, .split-divider.dragging { background: #e94560; }
+  .split-container.split-h > .split-divider {
+    width: 4px;
+    cursor: col-resize;
+  }
+  .split-container.split-v > .split-divider {
+    height: 4px;
+    cursor: row-resize;
+  }
+  .split-divider::after {
+    content: '';
+    position: absolute;
+    top: 50%; left: 50%;
+    transform: translate(-50%, -50%);
+    border-radius: 2px;
+    background: #7a7a9e;
+  }
+  .split-container.split-h > .split-divider::after { width: 2px; height: 32px; }
+  .split-container.split-v > .split-divider::after { width: 32px; height: 2px; }
+  /* Pane label (top-left, shows tab name) */
+  .split-pane-label {
+    position: absolute;
+    top: 4px; left: 8px;
+    font-size: 10px;
+    color: #7a7a9e;
+    background: rgba(22, 33, 62, 0.8);
+    padding: 1px 6px;
+    border-radius: 3px;
+    z-index: 2;
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity 0.2s;
+  }
+  .split-pane:hover > .split-pane-label { opacity: 1; }
+
   /* Mobile responsive */
   @media (max-width: 600px) {
     .hamburger { display: block; }
@@ -1290,6 +1356,9 @@ APP_HTML = """<!DOCTYPE html>
   <div class="title"><span>&#9611;</span> __USERNAME__</div>
   <div class="nav-sep"></div>
   <button class="nav-btn" onclick="addTab()">&#43; New Tab</button>
+  <button class="nav-btn nav-hide-mobile" id="splitRightBtn" onclick="splitRight()" title="Split Right (Ctrl+Shift+\\)">&#9707; Split Right</button>
+  <button class="nav-btn nav-hide-mobile" id="splitDownBtn" onclick="splitDown()" title="Split Down (Ctrl+Shift+-)">&#9707; Split Down</button>
+  <button class="nav-btn nav-hide-mobile" id="unsplitBtn" onclick="unsplit()" title="Close Split Pane" style="display:none">&#9746; Unsplit</button>
   <button class="nav-btn" onclick="quickAdjustFontSize(-1)" title="Decrease Font Size">A-</button>
   <span class="nav-btn nav-hide-mobile quick-font-readout" id="quickFontSizeDisplay">15px</span>
   <button class="nav-btn" onclick="quickAdjustFontSize(1)" title="Increase Font Size">A+</button>
@@ -1302,6 +1371,9 @@ APP_HTML = """<!DOCTYPE html>
   <button class="nav-btn nav-hide-mobile" onclick="reconnect()">&#8635; Reconnect</button>
   <button class="hamburger" onclick="toggleHamburger()" aria-label="Menu">&#9776;</button>
   <div class="nav-dropdown" id="navDropdown">
+    <button class="nav-btn nav-split-mobile" onclick="splitRight();toggleHamburger()" style="display:none">&#9707; Split Right</button>
+    <button class="nav-btn nav-split-mobile" onclick="splitDown();toggleHamburger()" style="display:none">&#9707; Split Down</button>
+    <button class="nav-btn nav-unsplit-mobile" onclick="unsplit();toggleHamburger()" style="display:none">&#9746; Unsplit</button>
     <button class="nav-btn" onclick="toggleQuickCommands();toggleHamburger()">&#9889; Commands</button>
     <button class="nav-btn" onclick="toggleFilePanel();toggleHamburger()">&#128193; Files</button>
     <button class="nav-btn" onclick="toggleSettings();toggleHamburger()">&#9881; Settings</button>
@@ -1549,6 +1621,437 @@ let tabs = [];
 let activeTabId = null;
 let tabCounter = 0;
 
+// --- Split Screen System ---
+// splitRoot: null (no split, single pane) or a tree node:
+//   { type:'pane', tabId:'tab-1' }
+//   { type:'split', direction:'h'|'v', ratio:0.5, children:[node, node] }
+let splitRoot = null;
+let focusedPaneTabId = null; // which pane has focus in split mode
+
+const SPLIT_MIN_WIDTH = 768;   // tablet+ only
+const SPLIT_NEST_MIN = 1024;   // nesting allowed on desktop only
+
+function isSplitActive() { return splitRoot !== null && splitRoot.type === 'split'; }
+
+function canSplit() { return window.innerWidth >= SPLIT_MIN_WIDTH; }
+function canNest() { return window.innerWidth >= SPLIT_NEST_MIN; }
+
+function getSplitPaneCount(node) {
+  if (!node) return 0;
+  if (node.type === 'pane') return 1;
+  return getSplitPaneCount(node.children[0]) + getSplitPaneCount(node.children[1]);
+}
+
+function findPaneNode(node, tabId) {
+  if (!node) return null;
+  if (node.type === 'pane') return node.tabId === tabId ? node : null;
+  return findPaneNode(node.children[0], tabId) || findPaneNode(node.children[1], tabId);
+}
+
+function findParent(node, target, parent) {
+  if (!node) return null;
+  if (node === target) return parent;
+  if (node.type === 'split') {
+    return findParent(node.children[0], target, node) || findParent(node.children[1], target, node);
+  }
+  return null;
+}
+
+function splitDirection(dir) {
+  if (!canSplit()) return;
+  if (!activeTabId || tabs.length < 2) { addTab(); if (tabs.length < 2) return; }
+
+  // If not in split mode, enter split with active tab + next adjacent tab
+  if (!isSplitActive()) {
+    const activeIdx = tabs.findIndex(t => t.id === activeTabId);
+    let secondId = null;
+    // Pick next tab, or previous if active is last
+    if (activeIdx < tabs.length - 1) secondId = tabs[activeIdx + 1].id;
+    else if (activeIdx > 0) secondId = tabs[activeIdx - 1].id;
+    if (!secondId) { addTab(); secondId = tabs[tabs.length - 1].id; }
+    if (!secondId) return;
+    splitRoot = {
+      type: 'split', direction: dir, ratio: 0.5,
+      children: [
+        { type: 'pane', tabId: activeTabId },
+        { type: 'pane', tabId: secondId },
+      ]
+    };
+    focusedPaneTabId = activeTabId;
+    renderSplitLayout();
+    updateSplitButtons();
+    saveSplitState();
+    return;
+  }
+
+  // Already split: split the focused pane further
+  const focusId = focusedPaneTabId || activeTabId;
+  const paneCount = getSplitPaneCount(splitRoot);
+  if (!canNest() && paneCount >= 2) return; // tablet: max 2 panes
+
+  // Need a tab not already in a pane
+  const panesInUse = new Set();
+  (function collectPanes(n) {
+    if (!n) return;
+    if (n.type === 'pane') { panesInUse.add(n.tabId); return; }
+    collectPanes(n.children[0]); collectPanes(n.children[1]);
+  })(splitRoot);
+  let freeTab = tabs.find(t => !panesInUse.has(t.id));
+  if (!freeTab) { addTab(); freeTab = tabs[tabs.length - 1]; }
+
+  // Find the pane node and replace it with a split
+  (function replacePaneWithSplit(node, parent) {
+    if (node.type === 'pane' && node.tabId === focusId) {
+      const newSplit = {
+        type: 'split', direction: dir, ratio: 0.5,
+        children: [
+          { type: 'pane', tabId: focusId },
+          { type: 'pane', tabId: freeTab.id },
+        ]
+      };
+      if (!parent) { splitRoot = newSplit; }
+      else {
+        const idx = parent.children.indexOf(node);
+        parent.children[idx] = newSplit;
+      }
+      return true;
+    }
+    if (node.type === 'split') {
+      return replacePaneWithSplit(node.children[0], node) || replacePaneWithSplit(node.children[1], node);
+    }
+    return false;
+  })(splitRoot, null);
+
+  focusedPaneTabId = focusId;
+  renderSplitLayout();
+  updateSplitButtons();
+  saveSplitState();
+}
+
+function splitRight() { splitDirection('h'); }
+function splitDown() { splitDirection('v'); }
+
+function unsplit() {
+  if (!isSplitActive()) return;
+  // Collapse to single pane mode with focused/active tab
+  splitRoot = null;
+  focusedPaneTabId = null;
+  renderSingleLayout();
+  updateSplitButtons();
+  saveSplitState();
+}
+
+function closeSplitPane(tabId) {
+  if (!isSplitActive()) return;
+  // Remove the pane with tabId, promote its sibling
+  (function removePane(node, parent) {
+    if (node.type !== 'split') return false;
+    for (let i = 0; i < 2; i++) {
+      const child = node.children[i];
+      if (child.type === 'pane' && child.tabId === tabId) {
+        const sibling = node.children[1 - i];
+        if (!parent) { splitRoot = sibling; }
+        else {
+          const idx = parent.children.indexOf(node);
+          parent.children[idx] = sibling;
+        }
+        return true;
+      }
+    }
+    return removePane(node.children[0], node) || removePane(node.children[1], node);
+  })(splitRoot, null);
+
+  // If collapsed to single pane
+  if (splitRoot && splitRoot.type === 'pane') {
+    focusedPaneTabId = null;
+    activeTabId = splitRoot.tabId;
+    splitRoot = null;
+    renderSingleLayout();
+  } else {
+    // Focus first available pane
+    (function firstPane(n) {
+      if (!n) return;
+      if (n.type === 'pane') { focusedPaneTabId = n.tabId; activeTabId = n.tabId; return; }
+      firstPane(n.children[0]);
+    })(splitRoot);
+    renderSplitLayout();
+  }
+  updateSplitButtons();
+  saveSplitState();
+}
+
+function renderSingleLayout() {
+  const container = document.getElementById('termContainer');
+  // Remove overlay elements (dividers, labels)
+  container.querySelectorAll('.split-divider-overlay, .split-pane-label').forEach(el => el.remove());
+  // Clear ALL split-related inline styles and let CSS classes handle visibility
+  // CSS: .term-container iframe { display:none } / iframe.active { display:block }
+  tabs.forEach(t => {
+    let f = document.getElementById('frame-' + t.id);
+    if (!f) return;
+    f.style.cssText = 'position:absolute;top:0;left:0;width:100%;height:100%;border:none;';
+    f.classList.toggle('active', t.id === activeTabId);
+  });
+}
+
+// Compute pane rectangles from split tree (all values in % of container)
+function computeSplitRects(node, rect) {
+  if (!node) return { panes: [], dividers: [] };
+  if (node.type === 'pane') {
+    return { panes: [{ tabId: node.tabId, rect: rect }], dividers: [] };
+  }
+  const isH = node.direction === 'h';
+  const dividerPx = 4; // matches CSS
+  // Split into two sub-rects
+  const r1 = { ...rect }, r2 = { ...rect };
+  if (isH) {
+    r1.width = rect.width * node.ratio;
+    r2.left = rect.left + r1.width;
+    r2.width = rect.width - r1.width;
+  } else {
+    r1.height = rect.height * node.ratio;
+    r2.top = rect.top + r1.height;
+    r2.height = rect.height - r1.height;
+  }
+  const left = computeSplitRects(node.children[0], r1);
+  const right = computeSplitRects(node.children[1], r2);
+  const divider = {
+    rect: isH
+      ? { left: r2.left, top: rect.top, width: 0, height: rect.height }
+      : { left: rect.left, top: r2.top, width: rect.width, height: 0 },
+    direction: node.direction,
+    splitNode: node
+  };
+  return {
+    panes: left.panes.concat(right.panes),
+    dividers: [divider].concat(left.dividers).concat(right.dividers)
+  };
+}
+
+function renderSplitLayout() {
+  const container = document.getElementById('termContainer');
+  // Remove old overlay dividers and labels
+  container.querySelectorAll('.split-divider-overlay, .split-pane-label').forEach(el => el.remove());
+  // Compute layout as percentages
+  const layout = computeSplitRects(splitRoot, { top: 0, left: 0, width: 100, height: 100 });
+  const panesInUse = new Set(layout.panes.map(p => p.tabId));
+  // Position iframes — never move them in DOM, just set position/size
+  tabs.forEach(t => {
+    const f = document.getElementById('frame-' + t.id);
+    if (!f) return;
+    const pane = layout.panes.find(p => p.tabId === t.id);
+    if (pane) {
+      f.style.position = 'absolute';
+      f.style.display = 'block';
+      f.style.left = pane.rect.left + '%';
+      f.style.top = pane.rect.top + '%';
+      f.style.width = pane.rect.width + '%';
+      f.style.height = pane.rect.height + '%';
+      f.style.outline = t.id === focusedPaneTabId ? '2px solid #e94560' : '1px solid #0f3460';
+      f.style.outlineOffset = t.id === focusedPaneTabId ? '-2px' : '-1px';
+      f.style.zIndex = t.id === focusedPaneTabId ? '1' : '0';
+      f.classList.remove('active');
+    } else {
+      f.style.display = 'none';
+      f.style.outline = '';
+    }
+  });
+  // Create divider overlays (absolute positioned, on top of iframes)
+  layout.dividers.forEach(d => {
+    const div = document.createElement('div');
+    div.className = 'split-divider-overlay';
+    const isH = d.direction === 'h';
+    div.style.position = 'absolute';
+    div.style.zIndex = '5';
+    if (isH) {
+      div.style.left = 'calc(' + d.rect.left + '% - 2px)';
+      div.style.top = d.rect.top + '%';
+      div.style.width = '4px';
+      div.style.height = d.rect.height + '%';
+      div.style.cursor = 'col-resize';
+    } else {
+      div.style.left = d.rect.left + '%';
+      div.style.top = 'calc(' + d.rect.top + '% - 2px)';
+      div.style.width = d.rect.width + '%';
+      div.style.height = '4px';
+      div.style.cursor = 'row-resize';
+    }
+    div.style.background = '#0f3460';
+    div.style.transition = 'background 0.15s';
+    div.addEventListener('mouseenter', () => { div.style.background = '#e94560'; });
+    div.addEventListener('mouseleave', () => { if (!div._dragging) div.style.background = '#0f3460'; });
+    div.addEventListener('mousedown', (e) => startDividerDrag(e, d.splitNode, div, container));
+    div.addEventListener('touchstart', (e) => {
+      e.preventDefault();
+      startDividerDragTouch(e, d.splitNode, div, container);
+    }, { passive: false });
+    container.appendChild(div);
+  });
+  // Add pane labels
+  layout.panes.forEach(p => {
+    const t = tabs.find(t => t.id === p.tabId);
+    const label = document.createElement('div');
+    label.className = 'split-pane-label';
+    label.textContent = t ? t.name : p.tabId;
+    label.style.position = 'absolute';
+    label.style.left = 'calc(' + p.rect.left + '% + 8px)';
+    label.style.top = 'calc(' + p.rect.top + '% + 4px)';
+    label.style.zIndex = '3';
+    container.appendChild(label);
+  });
+}
+
+function focusSplitPane(tabId) {
+  focusedPaneTabId = tabId;
+  activeTabId = tabId;
+  // Update iframe outlines
+  tabs.forEach(t => {
+    const f = document.getElementById('frame-' + t.id);
+    if (!f || f.style.display === 'none') return;
+    f.style.outline = t.id === tabId ? '2px solid #e94560' : '1px solid #0f3460';
+    f.style.outlineOffset = t.id === tabId ? '-2px' : '-1px';
+    f.style.zIndex = t.id === tabId ? '1' : '0';
+  });
+  // Update tab bar highlight
+  document.querySelectorAll('#tabBar .tab').forEach(el => {
+    el.classList.toggle('active', el.dataset.tabId === tabId);
+  });
+}
+
+function startDividerDrag(e, splitNode, dividerEl, container) {
+  e.preventDefault();
+  const isH = splitNode.direction === 'h';
+  const startPos = isH ? e.clientX : e.clientY;
+  const containerRect = container.getBoundingClientRect();
+  const totalSize = isH ? containerRect.width : containerRect.height;
+  const startRatio = splitNode.ratio;
+  dividerEl._dragging = true;
+  dividerEl.style.background = '#e94560';
+  // Overlay to capture mouse over iframes
+  const overlay = document.createElement('div');
+  overlay.style.cssText = 'position:fixed;inset:0;z-index:9999;cursor:' + (isH ? 'col-resize' : 'row-resize') + ';';
+  document.body.appendChild(overlay);
+  function onMove(ev) {
+    const pos = isH ? ev.clientX : ev.clientY;
+    const delta = (pos - startPos) / totalSize;
+    splitNode.ratio = Math.max(0.15, Math.min(0.85, startRatio + delta));
+    renderSplitLayout();
+  }
+  function onUp() {
+    dividerEl._dragging = false;
+    overlay.remove();
+    document.removeEventListener('mousemove', onMove);
+    document.removeEventListener('mouseup', onUp);
+    saveSplitState();
+  }
+  document.addEventListener('mousemove', onMove);
+  document.addEventListener('mouseup', onUp);
+}
+
+function startDividerDragTouch(e, splitNode, dividerEl, container) {
+  const isH = splitNode.direction === 'h';
+  const touch = e.touches[0];
+  const startPos = isH ? touch.clientX : touch.clientY;
+  const containerRect = container.getBoundingClientRect();
+  const totalSize = isH ? containerRect.width : containerRect.height;
+  const startRatio = splitNode.ratio;
+  dividerEl._dragging = true;
+  dividerEl.style.background = '#e94560';
+  function onMove(ev) {
+    ev.preventDefault();
+    const t = ev.touches[0];
+    const pos = isH ? t.clientX : t.clientY;
+    const delta = (pos - startPos) / totalSize;
+    splitNode.ratio = Math.max(0.15, Math.min(0.85, startRatio + delta));
+    renderSplitLayout();
+  }
+  function onEnd() {
+    dividerEl._dragging = false;
+    document.removeEventListener('touchmove', onMove);
+    document.removeEventListener('touchend', onEnd);
+    saveSplitState();
+  }
+  document.addEventListener('touchmove', onMove, { passive: false });
+  document.addEventListener('touchend', onEnd);
+}
+
+function updateSplitButtons() {
+  const active = isSplitActive();
+  const btn = document.getElementById('unsplitBtn');
+  if (btn) btn.style.display = active ? '' : 'none';
+  // Mobile hamburger split items
+  document.querySelectorAll('.nav-split-mobile').forEach(el => {
+    el.style.display = canSplit() ? '' : 'none';
+  });
+  document.querySelectorAll('.nav-unsplit-mobile').forEach(el => {
+    el.style.display = active ? '' : 'none';
+  });
+}
+
+function saveSplitState() {
+  try {
+    if (splitRoot) {
+      localStorage.setItem('ttyd_split', JSON.stringify(splitRoot));
+    } else {
+      localStorage.removeItem('ttyd_split');
+    }
+  } catch(e) {}
+}
+
+function restoreSplitState() {
+  try {
+    const saved = localStorage.getItem('ttyd_split');
+    if (!saved || !canSplit()) return false;
+    const tree = JSON.parse(saved);
+    // Validate all panes reference existing tabs
+    const valid = (function validateTree(n) {
+      if (!n) return false;
+      if (n.type === 'pane') return tabs.some(t => t.id === n.tabId);
+      if (n.type === 'split') return validateTree(n.children[0]) && validateTree(n.children[1]);
+      return false;
+    })(tree);
+    if (!valid) { localStorage.removeItem('ttyd_split'); return false; }
+    splitRoot = tree;
+    // Set focus to first pane
+    (function firstPane(n) {
+      if (!n) return;
+      if (n.type === 'pane') { focusedPaneTabId = n.tabId; activeTabId = n.tabId; return; }
+      firstPane(n.children[0]);
+    })(splitRoot);
+    return true;
+  } catch(e) { return false; }
+}
+
+// Collapse splits on window resize below threshold
+window.addEventListener('resize', () => {
+  if (isSplitActive() && !canSplit()) {
+    unsplit();
+  }
+  updateSplitButtons();
+});
+
+// Detect clicks on iframes to focus the correct pane
+// When an iframe gets focus, window blur fires; we check which iframe has focus
+window.addEventListener('blur', () => {
+  if (!isSplitActive()) return;
+  setTimeout(() => {
+    const active = document.activeElement;
+    if (active && active.tagName === 'IFRAME' && active.id.startsWith('frame-')) {
+      const tabId = active.id.replace('frame-', '');
+      if (tabId !== focusedPaneTabId && findPaneNode(splitRoot, tabId)) {
+        focusSplitPane(tabId);
+      }
+    }
+  }, 0);
+});
+
+// Helper: get all iframes including those in split panes
+function getAllIframes() {
+  return document.querySelectorAll('#termContainer iframe');
+}
+
+// --- End Split Screen System ---
+
 function buildTermUrl(overrides) {
   const s = getSettings();
   if (overrides && typeof overrides === 'object') {
@@ -1585,7 +2088,9 @@ function addTab() {
   iframe.src = buildTermUrl();
   document.getElementById('termContainer').appendChild(iframe);
   tabs.push({ id, name: 'Shell ' + tabCounter });
-  switchTab(id);
+  if (!isSplitActive()) {
+    switchTab(id);
+  }
   renderTabs();
   saveTabs();
 }
@@ -1593,6 +2098,10 @@ function addTab() {
 function closeTab(id, e) {
   if (e) e.stopPropagation();
   if (tabs.length <= 1) return;
+  // If this tab is in a split pane, remove that pane first
+  if (isSplitActive() && findPaneNode(splitRoot, id)) {
+    closeSplitPane(id);
+  }
   const idx = tabs.findIndex(t => t.id === id);
   const iframe = document.getElementById('frame-' + id);
   if (iframe) iframe.remove();
@@ -1607,7 +2116,36 @@ function closeTab(id, e) {
 
 function switchTab(id) {
   activeTabId = id;
-  document.querySelectorAll('#termContainer iframe').forEach(f => f.classList.remove('active'));
+  if (isSplitActive()) {
+    const focusId = focusedPaneTabId;
+    const focusedPane = focusId ? findPaneNode(splitRoot, focusId) : null;
+    if (focusedPane && focusedPane.tabId === id) {
+      // Already showing in focused pane — no-op
+    } else {
+      const targetPane = findPaneNode(splitRoot, id);
+      if (targetPane && focusedPane) {
+        // Tab is in another pane — swap the two panes' content
+        const oldTabId = focusedPane.tabId;
+        focusedPane.tabId = id;
+        targetPane.tabId = oldTabId;
+        renderSplitLayout();
+        focusSplitPane(id);
+        saveSplitState();
+      } else if (focusedPane) {
+        // Tab not in any pane — put it in the focused pane
+        focusedPane.tabId = id;
+        renderSplitLayout();
+        focusSplitPane(id);
+        saveSplitState();
+      }
+    }
+    // Update tab bar highlight
+    document.querySelectorAll('#tabBar .tab').forEach(el => {
+      el.classList.toggle('active', el.dataset.tabId === id);
+    });
+    return;
+  }
+  getAllIframes().forEach(f => f.classList.remove('active'));
   const frame = document.getElementById('frame-' + id);
   if (frame) frame.classList.add('active');
   // Update tab classes without rebuilding DOM
@@ -1931,7 +2469,7 @@ function applyFontSizeToFrame(frame, size) {
 }
 
 function applyFontSizeToAllLiveSessions(size) {
-  const frames = document.querySelectorAll('#termContainer iframe');
+  const frames = getAllIframes();
   let applied = 0;
   frames.forEach((f) => {
     if (applyFontSizeToFrame(f, size)) applied++;
@@ -2186,7 +2724,7 @@ function suppressLeaveAlertInFrame(frame) {
 function reconnectAllTabsNoLeaveAlert() {
   // Fallback path: apply without browser "leave alert".
   const url = buildTermUrl({ disableLeaveAlert: true });
-  document.querySelectorAll('#termContainer iframe').forEach((f) => {
+  getAllIframes().forEach((f) => {
     suppressLeaveAlertInFrame(f);
     f.src = url;
   });
@@ -2207,7 +2745,7 @@ function applySettings(initial) {
   const s = getSettings();
   localStorage.setItem('ttyd_settings', JSON.stringify(s));
   const url = buildTermUrl();
-  document.querySelectorAll('#termContainer iframe').forEach(f => { f.src = url; });
+  getAllIframes().forEach(f => { f.src = url; });
   updateQuickFontDisplay(parseInt(s.fontSize, 10) || 15);
   if (!initial) {
     document.getElementById('settingsPanel').classList.remove('open');
@@ -2284,6 +2822,12 @@ document.addEventListener('keydown', (e) => {
   if (e.ctrlKey && e.shiftKey && e.key === 'W') { e.preventDefault(); closeTab(activeTabId); }
   // Ctrl+Shift+E = toggle file panel
   if (e.ctrlKey && e.shiftKey && e.key === 'E') { e.preventDefault(); toggleFilePanel(); }
+  // Ctrl+Shift+\\ = split right
+  if (e.ctrlKey && e.shiftKey && e.code === 'Backslash') { e.preventDefault(); splitRight(); }
+  // Ctrl+Shift+- = split down
+  if (e.ctrlKey && e.shiftKey && e.code === 'Minus') { e.preventDefault(); splitDown(); }
+  // Ctrl+Shift+U = unsplit
+  if (e.ctrlKey && e.shiftKey && e.key === 'U') { e.preventDefault(); unsplit(); }
   // Ctrl+Shift+] = next tab
   if (e.ctrlKey && e.shiftKey && e.key === ']') {
     e.preventDefault();
@@ -2446,17 +2990,24 @@ function init() {
     switchTab(tabs[0].id);
     // Create iframes with staggered delays so each tmux grouped session
     // can register before the next one counts existing sessions
+    const hasSplit = restoreSplitState();
     tabs.forEach((t, i) => {
       setTimeout(() => {
         const iframe = document.createElement('iframe');
         iframe.id = 'frame-' + t.id;
         iframe.src = buildTermUrl();
         document.getElementById('termContainer').appendChild(iframe);
-        if (t.id === activeTabId) iframe.classList.add('active');
+        if (!hasSplit && t.id === activeTabId) iframe.classList.add('active');
+        // After all iframes created, render split layout if restored
+        if (hasSplit && i === tabs.length - 1) {
+          setTimeout(() => { renderSplitLayout(); updateSplitButtons(); }, 100);
+        }
       }, i * 300);
     });
+    if (!hasSplit) updateSplitButtons();
   } else {
     addTab();
+    updateSplitButtons();
   }
 
   // Copy modal wiring
