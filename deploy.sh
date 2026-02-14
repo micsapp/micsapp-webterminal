@@ -262,7 +262,7 @@ stop_auth_service() {
   if command -v lsof >/dev/null 2>&1; then
     lsof -ti:"${AUTH_PORT}" 2>/dev/null | xargs kill 2>/dev/null || true
   fi
-  pkill -f "python3 ${AUTH_PY}" 2>/dev/null || true
+  pkill -f "python3[^ ]* ${AUTH_PY}" 2>/dev/null || true
 }
 
 wait_for_auth_ready() {
@@ -547,7 +547,7 @@ check_cloudflared() {
 auth_py_changed() {
   [ -f "${AUTH_PY}" ] || return 1
   local pid
-  pid="$(pgrep -f "python3 ${AUTH_PY}" | head -1 || true)"
+  pid="$(pgrep -f "python3[^ ]* ${AUTH_PY}" | head -1 || true)"
   [ -n "$pid" ] || return 1
   # Compare file mtime vs process start time using /proc (Linux) or ps (macOS).
   if [ -d "/proc/${pid}" ]; then
