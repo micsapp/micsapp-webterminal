@@ -816,6 +816,19 @@ TERM_HOOK_JS = r"""// ttyd term hook (injected by nginx into /ut/... HTML)
       if (expose() || n > 60) clearInterval(iv);
     }, 200);
   }
+
+  // Force xterm.js to bypass mouse reporting for click/drag events so that
+  // native text selection works, while leaving wheel events untouched so
+  // tmux mouse scroll keeps working.  xterm.js skips mouse reporting when
+  // it sees shiftKey === true on the event, which is the standard Shift+click
+  // bypass behaviour.
+  ['mousedown', 'mousemove', 'mouseup', 'click', 'dblclick'].forEach(function (t) {
+    document.addEventListener(t, function (e) {
+      if (!e.shiftKey) {
+        Object.defineProperty(e, 'shiftKey', { get: function () { return true; } });
+      }
+    }, true);
+  });
 })();
 """
 
@@ -2591,6 +2604,7 @@ function addTab() {
   const id = 'tab-' + tabCounter;
   const iframe = document.createElement('iframe');
   iframe.id = 'frame-' + id;
+  iframe.allow = 'clipboard-read; clipboard-write';
   iframe.src = buildTermUrl();
   document.getElementById('termContainer').appendChild(iframe);
   tabs.push({ id, name: 'Shell ' + tabCounter });
@@ -3501,6 +3515,7 @@ function init() {
       setTimeout(() => {
         const iframe = document.createElement('iframe');
         iframe.id = 'frame-' + t.id;
+        iframe.allow = 'clipboard-read; clipboard-write';
         iframe.src = buildTermUrl();
         document.getElementById('termContainer').appendChild(iframe);
         if (!hasSplit && t.id === activeTabId) iframe.classList.add('active');
@@ -4591,7 +4606,8 @@ def spawn_user_ttyd(username, password):
     # while the base "main" session (and its windows) persist to keep processes alive.
     # On reconnect, tabs reattach to existing windows instead of creating new ones.
     tmux_cmd = (
-        r'tmux has-session -t main 2>/dev/null || exec tmux new-session -s main;'
+        r'tmux has-session -t main 2>/dev/null || exec tmux new-session -s main \; set -g mouse on \; set -g history-limit 10000 \; set -s set-clipboard on;'
+        r' tmux set -g mouse on 2>/dev/null; tmux set -g history-limit 10000 2>/dev/null; tmux set -s set-clipboard on 2>/dev/null; tmux set -g set-clipboard on 2>/dev/null;'
         r' IDX=$(tmux list-sessions -F "#{session_name}" | grep -cv "^main$" || true);'
         r' NWIN=$(tmux list-windows -t main -F x | wc -l | tr -d " ");'
         r' while [ $NWIN -le $IDX ]; do tmux new-window -t main; NWIN=$((NWIN + 1)); done;'
