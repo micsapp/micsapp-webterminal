@@ -4497,7 +4497,10 @@ async function qcImport(files) {
     const data = await res.json();
     if (data.error) { showToast(data.error, true); return; }
     await qcLoadCommands();
-    showToast('Imported ' + (data.added || 0) + ' commands', false);
+    var parts = [];
+    if (data.added) parts.push(data.added + ' added');
+    if (data.updated) parts.push(data.updated + ' updated');
+    showToast(parts.length ? 'Commands: ' + parts.join(', ') : 'No new commands to import', false);
   } catch (e) {
     showToast('Import error: ' + e.message, true);
   }
@@ -5430,25 +5433,39 @@ try:
             cmds = json.load(f)
         if not isinstance(cmds, list):
             cmds = []
+    existing_by_name = {{}}
+    for i, c in enumerate(cmds):
+        existing_by_name[c.get("name", "").strip().lower()] = i
     existing_ids = set(c.get("id", "") for c in cmds)
     added = 0
+    updated = 0
     for item in imported:
-        cmd_id = item.get("id", "")
-        if not cmd_id or cmd_id in existing_ids:
-            cmd_id = hashlib.sha256((item.get("name","") + item.get("command","") + str(time.time()) + str(added)).encode()).hexdigest()[:12]
-        existing_ids.add(cmd_id)
-        cmds.append({{
-            "id": cmd_id,
-            "name": str(item.get("name", "")),
-            "command": str(item.get("command", "")),
-            "tags": str(item.get("tags", "")),
-            "created": item.get("created", int(time.time())),
-            "updated": int(time.time()),
-        }})
-        added += 1
+        iname = str(item.get("name", "")).strip()
+        key = iname.lower()
+        if key in existing_by_name:
+            idx = existing_by_name[key]
+            cmds[idx]["command"] = str(item.get("command", ""))
+            cmds[idx]["tags"] = str(item.get("tags", ""))
+            cmds[idx]["updated"] = int(time.time())
+            updated += 1
+        else:
+            cmd_id = item.get("id", "")
+            if not cmd_id or cmd_id in existing_ids:
+                cmd_id = hashlib.sha256((iname + str(item.get("command","")) + str(time.time()) + str(added)).encode()).hexdigest()[:12]
+            existing_ids.add(cmd_id)
+            cmds.append({{
+                "id": cmd_id,
+                "name": iname,
+                "command": str(item.get("command", "")),
+                "tags": str(item.get("tags", "")),
+                "created": item.get("created", int(time.time())),
+                "updated": int(time.time()),
+            }})
+            existing_by_name[key] = len(cmds) - 1
+            added += 1
     with open(p, "w", encoding="utf-8") as f:
         json.dump(cmds, f, indent=2)
-    print(json.dumps({{"ok": True, "added": added, "total": len(cmds)}}))
+    print(json.dumps({{"ok": True, "added": added, "updated": updated, "total": len(cmds)}}))
 except Exception as ex:
     print(json.dumps({{"error": str(ex)}}))
 '''
