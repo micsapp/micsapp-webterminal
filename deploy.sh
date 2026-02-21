@@ -67,24 +67,29 @@ ensure_linux_deps() {
 
   local need_apt=false
 
-  if ! command -v nginx >/dev/null 2>&1; then
-    say "nginx not found, will install..."
-    need_apt=true
-  fi
-  if ! command -v sshpass >/dev/null 2>&1; then
-    say "sshpass not found, will install..."
-    need_apt=true
-  fi
-  if ! command -v tmux >/dev/null 2>&1; then
-    say "tmux not found, will install..."
-    need_apt=true
-  fi
+  # Map of command -> apt package name
+  local -A cmd_pkg=(
+    [nginx]=nginx
+    [sshpass]=sshpass
+    [tmux]=tmux
+    [python3]=python3
+    [curl]=curl
+    [lsof]=lsof
+    [sshd]=openssh-server
+  )
+
+  for cmd in "${!cmd_pkg[@]}"; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+      say "${cmd} not found, will install ${cmd_pkg[$cmd]}..."
+      need_apt=true
+    fi
+  done
 
   if $need_apt && command -v apt-get >/dev/null 2>&1; then
     local pkgs=()
-    command -v nginx   >/dev/null 2>&1 || pkgs+=(nginx)
-    command -v sshpass >/dev/null 2>&1 || pkgs+=(sshpass)
-    command -v tmux    >/dev/null 2>&1 || pkgs+=(tmux)
+    for cmd in "${!cmd_pkg[@]}"; do
+      command -v "$cmd" >/dev/null 2>&1 || pkgs+=("${cmd_pkg[$cmd]}")
+    done
     sudo apt-get update -qq
     sudo apt-get install -y "${pkgs[@]}"
   fi
@@ -486,6 +491,14 @@ restart_sshd() {
 
 start_sshd() {
   say "Starting sshd..."
+  # Install openssh-server if sshd is missing (Linux only)
+  if is_linux && ! command -v sshd >/dev/null 2>&1; then
+    say "  sshd not found, installing openssh-server..."
+    if command -v apt-get >/dev/null 2>&1; then
+      sudo apt-get update -qq
+      sudo apt-get install -y openssh-server
+    fi
+  fi
   if is_macos; then
     if sudo systemsetup -getremotelogin 2>/dev/null | grep -qi "on"; then
       say "  SSH (Remote Login) already enabled."

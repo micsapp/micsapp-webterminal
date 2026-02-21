@@ -251,22 +251,50 @@ install_web_terminal_deps() {
     fi
   fi
 
-  # --- python3 ---
-  if command -v python3 >/dev/null 2>&1; then
+  # --- apt-based packages: python3, nginx, tmux, openssh-server, curl, lsof ---
+  if ! is_macos; then
+    local need_apt=false
+    local -A cmd_pkg=(
+      [python3]=python3
+      [nginx]=nginx
+      [tmux]=tmux
+      [sshd]=openssh-server
+      [curl]=curl
+      [lsof]=lsof
+    )
+    for cmd in "${!cmd_pkg[@]}"; do
+      if ! command -v "$cmd" >/dev/null 2>&1; then
+        say "${cmd} not found, will install ${cmd_pkg[$cmd]}..."
+        need_apt=true
+      fi
+    done
+    if $need_apt && command -v apt-get >/dev/null 2>&1; then
+      local pkgs=()
+      for cmd in "${!cmd_pkg[@]}"; do
+        command -v "$cmd" >/dev/null 2>&1 || pkgs+=("${cmd_pkg[$cmd]}")
+      done
+      sudo apt-get update -qq
+      sudo apt-get install -y "${pkgs[@]}"
+    fi
+    # Verify critical commands after install attempt
+    for cmd in python3 nginx; do
+      if ! command -v "$cmd" >/dev/null 2>&1; then
+        err "${cmd} is required but could not be installed."
+        return 1
+      fi
+    done
+  else
+    # macOS: check and suggest brew
+    if ! command -v python3 >/dev/null 2>&1; then
+      err "python3 is required but not found. Install: brew install python3"
+      return 1
+    fi
     say "python3 already installed: $(python3 --version 2>&1)"
-  else
-    err "python3 is required but not found. Please install Python 3."
-    return 1
-  fi
-
-  # --- nginx ---
-  if command -v nginx >/dev/null 2>&1; then
+    if ! command -v nginx >/dev/null 2>&1; then
+      err "nginx is required but not found. Install: brew install nginx"
+      return 1
+    fi
     say "nginx already installed: $(nginx -v 2>&1)"
-  else
-    err "nginx is required but not found. Please install nginx first."
-    err "  macOS: brew install nginx"
-    err "  Linux: sudo apt-get install nginx"
-    return 1
   fi
 }
 
@@ -282,6 +310,22 @@ enable_ssh_server() {
       sudo systemsetup -setremotelogin on
     fi
   else
+    # Install openssh-server if sshd is missing
+    if ! command -v sshd >/dev/null 2>&1; then
+      say "sshd not found, installing openssh-server..."
+      if command -v apt-get >/dev/null 2>&1; then
+        sudo apt-get update -qq
+        sudo apt-get install -y openssh-server
+      elif command -v yum >/dev/null 2>&1; then
+        sudo yum install -y openssh-server
+      elif command -v dnf >/dev/null 2>&1; then
+        sudo dnf install -y openssh-server
+      else
+        err "Cannot auto-install openssh-server. Install manually."
+        return 1
+      fi
+    fi
+
     # Linux: start sshd via systemd or fallback to service/sshd binary
     local sshd_name="sshd"
     if ! systemctl list-unit-files "${sshd_name}.service" >/dev/null 2>&1; then
