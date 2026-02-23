@@ -316,9 +316,77 @@ TERM_HOOK_JS = r"""// ttyd term hook (injected by nginx into /ut/... HTML)
   // tmux mouse scroll keeps working.  xterm.js skips mouse reporting when
   // it sees shiftKey === true on the event, which is the standard Shift+click
   // bypass behaviour.
+  //
+  // IMPORTANT: When a TUI app (e.g. Textual, htop) activates mouse tracking
+  // mode (DECSET 1000/1002/1003), we must NOT fake shiftKey so that
+  // click/touch events reach the app.  We detect this by intercepting the
+  // DECSET/DECRST escape sequences written to the terminal.
+  var _mouseTrackingActive = false;
+
+  // Mouse tracking DECSET codes: 9, 1000, 1002, 1003
+  var _mouseDecsetRe = /\x1b\[\?(?:9|1000|1002|1003|1004|1006|1015)([hl])/g;
+
+  function hookTerminalWrite(t) {
+    if (!t || !t._core || t._mouseHooked) return false;
+    var core = t._core;
+    // Hook into writeSync or the input handler's parse
+    var origWrite = core.write && core.write.bind(core);
+    var origWriteSync = core.writeSync && core.writeSync.bind(core);
+
+    function scanForMouse(data) {
+      if (typeof data !== 'string') {
+        // Convert Uint8Array to string for scanning
+        try { data = new TextDecoder().decode(data); } catch (e) { return; }
+      }
+      var m;
+      _mouseDecsetRe.lastIndex = 0;
+      while ((m = _mouseDecsetRe.exec(data)) !== null) {
+        if (m[1] === 'h') _mouseTrackingActive = true;
+        else if (m[1] === 'l') _mouseTrackingActive = false;
+      }
+    }
+
+    if (origWriteSync) {
+      core.writeSync = function (data, maxMs) {
+        scanForMouse(data);
+        return origWriteSync(data, maxMs);
+      };
+    }
+    if (origWrite) {
+      core.write = function (data, cb) {
+        scanForMouse(data);
+        return origWrite(data, cb);
+      };
+    }
+    t._mouseHooked = true;
+    return true;
+  }
+
+  // Also poll xterm.js internals as a fallback
+  function checkMouseTracking() {
+    try {
+      var t = window.term || window.terminal || window.xterm;
+      if (!t) return;
+      hookTerminalWrite(t);
+      if (t._core) {
+        var ms = t._core._coreMouseService;
+        if (ms && typeof ms.activeProtocol === 'string') {
+          _mouseTrackingActive = ms.activeProtocol !== 'NONE';
+          return;
+        }
+        var dp = (t._core._coreService && t._core._coreService.decPrivateModes) || t._core._decPrivateModes;
+        if (dp && dp.mouseTrackingMode !== undefined) {
+          _mouseTrackingActive = dp.mouseTrackingMode > 0;
+        }
+      }
+    } catch (ex) {}
+  }
+
+  setInterval(checkMouseTracking, 500);
+
   ['mousedown', 'mousemove', 'mouseup', 'click', 'dblclick'].forEach(function (t) {
     document.addEventListener(t, function (e) {
-      if (!e.shiftKey) {
+      if (!e.shiftKey && !_mouseTrackingActive) {
         Object.defineProperty(e, 'shiftKey', { get: function () { return true; } });
       }
     }, true);
