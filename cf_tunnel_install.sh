@@ -864,11 +864,18 @@ TERM_HOOK_JS = r"""// ttyd term hook (injected by nginx into /ut/... HTML)
   // Force xterm.js to bypass mouse reporting for click/drag events so that
   // native text selection works, while leaving wheel events untouched so
   // tmux mouse scroll keeps working.  xterm.js skips mouse reporting when
-  // it sees shiftKey === true on the event, which is the standard Shift+click
-  // bypass behaviour.
+  // it sees shiftKey === true on the event.
+  //
+  // Since tmux "mouse on" activates DECSET mouse tracking, we always fake
+  // shiftKey for click/drag events to ensure text selection works in tmux.
+  // Hold Alt (Option on Mac) to temporarily bypass and send mouse events
+  // to TUI apps (htop, vim, etc.) that need mouse interaction.
+
   ['mousedown', 'mousemove', 'mouseup', 'click', 'dblclick'].forEach(function (t) {
     document.addEventListener(t, function (e) {
-      if (!e.shiftKey) {
+      // Alt+click: let mouse through to terminal app (for TUI interaction)
+      // Otherwise: fake shiftKey so xterm.js does native text selection
+      if (!e.shiftKey && !e.altKey) {
         Object.defineProperty(e, 'shiftKey', { get: function () { return true; } });
       }
     }, true);
