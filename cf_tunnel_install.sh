@@ -2183,6 +2183,7 @@ let currentTheme = 'default';
 let tabs = [];
 let activeTabId = null;
 let tabCounter = 0;
+let nextWindowSlot = 0;
 
 // --- Split Screen System ---
 // splitRoot: null (no split, single pane) or a tree node:
@@ -2615,12 +2616,17 @@ function getAllIframes() {
 
 // --- End Split Screen System ---
 
-function buildTermUrl(overrides) {
+function buildTermUrl(tab, overrides) {
   const s = getSettings();
   if (overrides && typeof overrides === 'object') {
     Object.assign(s, overrides);
   }
   const params = new URLSearchParams();
+  const slot = tab && Number.isInteger(tab.windowSlot) ? tab.windowSlot : 0;
+  // Include active slots list only when explicitly provided (page restore / reconnect).
+  // Single-tab additions skip cleanup to avoid races.
+  const arg = s._activeSlots ? slot + ':' + s._activeSlots : String(slot);
+  params.append('arg', arg);
   if (s.fontSize && s.fontSize !== '15') params.set('fontSize', s.fontSize);
   if (s.fontFamily) params.set('fontFamily', s.fontFamily);
   if (s.cursorStyle && s.cursorStyle !== 'block') params.set('cursorStyle', s.cursorStyle);
@@ -2640,18 +2646,25 @@ function buildTermUrl(overrides) {
 }
 
 function saveTabs() {
-  try { localStorage.setItem('ttyd_tabs', JSON.stringify(tabs.map(t => ({ name: t.name })))); } catch(e) {}
+  try { localStorage.setItem('ttyd_tabs', JSON.stringify(tabs.map(t => ({ name: t.name, windowSlot: t.windowSlot })))); } catch(e) {}
+}
+
+function nextTabWindowSlot() {
+  const slot = nextWindowSlot;
+  nextWindowSlot += 1;
+  return slot;
 }
 
 function addTab() {
   tabCounter++;
   const id = 'tab-' + tabCounter;
+  const tab = { id, name: 'Shell ' + tabCounter, windowSlot: nextTabWindowSlot() };
+  tabs.push(tab);
   const iframe = document.createElement('iframe');
   iframe.id = 'frame-' + id;
   iframe.allow = 'clipboard-read; clipboard-write';
-  iframe.src = buildTermUrl();
+  iframe.src = buildTermUrl(tab);
   document.getElementById('termContainer').appendChild(iframe);
-  tabs.push({ id, name: 'Shell ' + tabCounter });
   if (!isSplitActive()) {
     switchTab(id);
   }
@@ -3287,10 +3300,12 @@ function suppressLeaveAlertInFrame(frame) {
 
 function reconnectAllTabsNoLeaveAlert() {
   // Fallback path: apply without browser "leave alert".
-  const url = buildTermUrl({ disableLeaveAlert: true });
+  const activeSlots = tabs.map(t => t.windowSlot).join(',');
   getAllIframes().forEach((f) => {
+    const tabId = f.id.replace('frame-', '');
+    const tab = tabs.find(t => t.id === tabId);
     suppressLeaveAlertInFrame(f);
-    f.src = url;
+    f.src = buildTermUrl(tab, { disableLeaveAlert: true, _activeSlots: activeSlots });
   });
 }
 
@@ -3308,8 +3323,11 @@ function quickAdjustFontSize(delta) {
 function applySettings(initial) {
   const s = getSettings();
   localStorage.setItem('ttyd_settings', JSON.stringify(s));
-  const url = buildTermUrl();
-  getAllIframes().forEach(f => { f.src = url; });
+  getAllIframes().forEach(f => {
+    const tabId = f.id.replace('frame-', '');
+    const tab = tabs.find(t => t.id === tabId);
+    f.src = buildTermUrl(tab);
+  });
   updateQuickFontDisplay(parseInt(s.fontSize, 10) || 15);
   if (!initial) {
     document.getElementById('settingsPanel').classList.remove('open');
@@ -3369,7 +3387,10 @@ function fullscreen() {
 
 function reconnect() {
   const f = document.getElementById('frame-' + activeTabId);
-  if (f) f.src = buildTermUrl();
+  if (f) {
+    const tab = tabs.find(t => t.id === activeTabId);
+    f.src = buildTermUrl(tab);
+  }
 }
 
 function logout() {
@@ -3546,21 +3567,24 @@ function init() {
   let saved = [];
   try { saved = JSON.parse(localStorage.getItem('ttyd_tabs') || '[]'); } catch(e) {}
   if (saved.length > 0) {
-    saved.forEach(t => {
+    saved.forEach((t, idx) => {
       tabCounter++;
-      tabs.push({ id: 'tab-' + tabCounter, name: t.name || ('Shell ' + tabCounter) });
+      const slot = Number.isInteger(t.windowSlot) && t.windowSlot >= 0 ? t.windowSlot : idx;
+      nextWindowSlot = Math.max(nextWindowSlot, slot + 1);
+      tabs.push({ id: 'tab-' + tabCounter, name: t.name || ('Shell ' + tabCounter), windowSlot: slot });
     });
     renderTabs();
     switchTab(tabs[0].id);
     // Create iframes with staggered delays so each tmux grouped session
     // can register before the next one counts existing sessions
     const hasSplit = restoreSplitState();
+    const activeSlots = tabs.map(t => t.windowSlot).join(',');
     tabs.forEach((t, i) => {
       setTimeout(() => {
         const iframe = document.createElement('iframe');
         iframe.id = 'frame-' + t.id;
         iframe.allow = 'clipboard-read; clipboard-write';
-        iframe.src = buildTermUrl();
+        iframe.src = buildTermUrl(t, { _activeSlots: activeSlots });
         document.getElementById('termContainer').appendChild(iframe);
         if (!hasSplit && t.id === activeTabId) iframe.classList.add('active');
         // After all iframes created, render split layout if restored
@@ -4648,20 +4672,25 @@ def spawn_user_ttyd(username, password):
 
     # Bind ttyd to localhost only, so the per-user port isn't reachable directly from the LAN/Internet.
     # Use tmux so terminal sessions persist across page refreshes and re-logins.
-    # Each tab gets a grouped session pointing at a distinct tmux window.
+    # Each tab gets a grouped session pointing at a deterministic tmux window slot.
     # Grouped sessions have destroy-unattached so they auto-clean on disconnect,
     # while the base "main" session (and its windows) persist to keep processes alive.
     # On reconnect, tabs reattach to existing windows instead of creating new ones.
     tmux_cmd = (
         r'tmux has-session -t main 2>/dev/null || exec tmux new-session -s main \; set -g mouse on \; set -g history-limit 10000 \; set -s set-clipboard on;'
         r' tmux set -g mouse on 2>/dev/null; tmux set -g history-limit 10000 2>/dev/null; tmux set -s set-clipboard on 2>/dev/null; tmux set -g set-clipboard on 2>/dev/null;'
-        r' IDX=$(tmux list-sessions -F "#{session_name}" | grep -cv "^main$" || true);'
-        r' NWIN=$(tmux list-windows -t main -F x | wc -l | tr -d " ");'
-        r' while [ $NWIN -le $IDX ]; do tmux new-window -t main; NWIN=$((NWIN + 1)); done;'
-        r' TARGET=$(tmux list-windows -t main -F "#{window_index}" | sort -n | head -n $((IDX+1)) | tail -n 1);'
-        r' exec tmux new-session -t main \; set-option destroy-unattached on \; select-window -t :${TARGET:-0}'
+        # Parse arg format "SLOT:ACTIVE_SLOTS" (e.g. "0:0,2,3") or plain "SLOT"
+        r' RAW="$1"; case "$RAW" in *:*) SLOT="${RAW%%:*}"; ACTIVE="${RAW#*:}" ;; *) SLOT="$RAW"; ACTIVE="" ;; esac;'
+        r' case "$SLOT" in (""|*[!0-9]*) SLOT=0 ;; esac;'
+        # Create window at exact SLOT index (no gap-filling)
+        r' tmux list-windows -t main -F "#{window_index}" | grep -q "^${SLOT}$" || tmux new-window -t main:${SLOT};'
+        # Clean up orphaned windows not in the active slots list
+        r' if [ -n "$ACTIVE" ]; then for _w in $(tmux list-windows -t main -F "#{window_index}"); do'
+        r' _k=0; _I="$IFS"; IFS=","; for _a in $ACTIVE; do [ "$_w" = "$_a" ] && _k=1; done; IFS="$_I";'
+        r' [ "$_k" = "0" ] && tmux kill-window -t "main:${_w}" 2>/dev/null; done; true; fi;'
+        r' exec tmux new-session -t main \; set-option destroy-unattached on \; select-window -t :${SLOT}'
     )
-    ttyd_cmd = f"{shlex.quote(TTYD_BIN)} -W -i 127.0.0.1 -p {port} bash -lc {shlex.quote(tmux_cmd)}"
+    ttyd_cmd = f"{shlex.quote(TTYD_BIN)} -W -a -i 127.0.0.1 -p {port} bash -lc {shlex.quote(tmux_cmd)} ttyd-tab"
     proc = subprocess.Popen(
         [SSHPASS_BIN, "-p", password, SSH_BIN,
          "-o", "StrictHostKeyChecking=no",
