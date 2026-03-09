@@ -1388,6 +1388,44 @@ APP_HTML = """<!DOCTYPE html>
     resize: vertical;
   }
   .fp-modal-body textarea:focus { border-color: #e94560; }
+  .fp-modal-md-render {
+    display: none;
+    color: #e2e2e2;
+    font-size: 14px;
+    line-height: 1.6;
+    word-wrap: break-word;
+  }
+  .fp-modal-md-render h1, .fp-modal-md-render h2, .fp-modal-md-render h3,
+  .fp-modal-md-render h4, .fp-modal-md-render h5, .fp-modal-md-render h6 {
+    color: #ffffff; margin: 16px 0 8px 0; font-weight: 600;
+  }
+  .fp-modal-md-render h1 { font-size: 1.8em; border-bottom: 1px solid #333; padding-bottom: 6px; }
+  .fp-modal-md-render h2 { font-size: 1.4em; border-bottom: 1px solid #333; padding-bottom: 4px; }
+  .fp-modal-md-render h3 { font-size: 1.2em; }
+  .fp-modal-md-render p { margin: 8px 0; }
+  .fp-modal-md-render ul, .fp-modal-md-render ol { padding-left: 24px; margin: 8px 0; }
+  .fp-modal-md-render li { margin: 4px 0; }
+  .fp-modal-md-render code {
+    background: #1a1a3e; padding: 2px 6px; border-radius: 4px;
+    font-family: 'Menlo','Monaco','Consolas',monospace; font-size: 0.9em;
+  }
+  .fp-modal-md-render pre {
+    background: #0f3460; border: 1px solid #1a4a7a; border-radius: 8px;
+    padding: 12px; overflow-x: auto; margin: 10px 0;
+  }
+  .fp-modal-md-render pre code { background: none; padding: 0; }
+  .fp-modal-md-render blockquote {
+    border-left: 3px solid #e94560; padding: 4px 12px; margin: 8px 0;
+    color: #9a9abf; background: #16213e;
+  }
+  .fp-modal-md-render a { color: #4fc3f7; text-decoration: underline; }
+  .fp-modal-md-render table { border-collapse: collapse; margin: 10px 0; width: 100%; }
+  .fp-modal-md-render th, .fp-modal-md-render td {
+    border: 1px solid #333; padding: 6px 10px; text-align: left;
+  }
+  .fp-modal-md-render th { background: #1a1a3e; font-weight: 600; }
+  .fp-modal-md-render hr { border: none; border-top: 1px solid #333; margin: 16px 0; }
+  .fp-modal-md-render img { max-width: 100%; border-radius: 6px; }
   .fp-modal-body .fp-modal-image,
   .fp-modal-body .fp-modal-video,
   .fp-modal-body .fp-modal-audio,
@@ -2091,6 +2129,7 @@ APP_HTML = """<!DOCTYPE html>
   <div class="fp-modal">
     <div class="fp-modal-header">
       <span class="fp-modal-title" id="fpModalTitle"></span>
+      <button class="fp-btn" id="fpModalMdToggle" style="display:none" onclick="toggleMdView()">&#60;/&#62; Source</button>
       <button class="fp-btn" id="fpModalEdit" style="display:none">&#9998; Edit</button>
       <button class="fp-btn" id="fpModalSave" style="display:none">&#10003; Save</button>
       <button class="fp-btn" id="fpModalDownload">&#8595; Download</button>
@@ -2099,6 +2138,7 @@ APP_HTML = """<!DOCTYPE html>
     <div class="fp-modal-body">
       <div class="fp-modal-note" id="fpModalNote"></div>
       <pre id="fpModalContent"></pre>
+      <div id="fpModalMdRender" class="fp-modal-md-render"></div>
       <textarea id="fpModalEditor" spellcheck="false"></textarea>
       <img id="fpModalImage" class="fp-modal-image" alt="Image preview">
       <video id="fpModalVideo" class="fp-modal-video" controls preload="metadata"></video>
@@ -3656,6 +3696,89 @@ function isPdfFile(name) {
   return /\\.(pdf)$/i.test(name || '');
 }
 
+function isMdFile(name) {
+  return /\\.(md|markdown|mkd|mdx)$/i.test(name || '');
+}
+
+let fpModalMdRendered = false;
+
+function renderMarkdown(src) {
+  let h = src
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  // fenced code blocks
+  h = h.replace(/```(\\w*)\\n([\\s\\S]*?)```/g, function(m, lang, code) {
+    return '<pre><code>' + code + '</code></pre>';
+  });
+  // tables
+  h = h.replace(/^(\\|.+\\|)\\n(\\|[\\s:|-]+\\|)\\n((\\|.+\\|\\n?)*)/gm, function(m, hdr, sep, body) {
+    var cols = hdr.split('|').filter(function(c){return c.trim();});
+    var t = '<table><thead><tr>' + cols.map(function(c){return '<th>'+c.trim()+'</th>';}).join('') + '</tr></thead><tbody>';
+    body.trim().split('\\n').forEach(function(row) {
+      var cells = row.split('|').filter(function(c){return c.trim();});
+      t += '<tr>' + cells.map(function(c){return '<td>'+c.trim()+'</td>';}).join('') + '</tr>';
+    });
+    return t + '</tbody></table>';
+  });
+  // blockquotes
+  h = h.replace(/^&gt; (.+)$/gm, '<blockquote>$1</blockquote>');
+  // headings
+  h = h.replace(/^###### (.+)$/gm, '<h6>$1</h6>');
+  h = h.replace(/^##### (.+)$/gm, '<h5>$1</h5>');
+  h = h.replace(/^#### (.+)$/gm, '<h4>$1</h4>');
+  h = h.replace(/^### (.+)$/gm, '<h3>$1</h3>');
+  h = h.replace(/^## (.+)$/gm, '<h2>$1</h2>');
+  h = h.replace(/^# (.+)$/gm, '<h1>$1</h1>');
+  // hr
+  h = h.replace(/^[-*_]{3,}$/gm, '<hr>');
+  // images
+  h = h.replace(/!\\[([^\\]]*)\\]\\(([^)]+)\\)/g, '<img src="$2" alt="$1">');
+  // links
+  h = h.replace(/\\[([^\\]]+)\\]\\(([^)]+)\\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+  // bold + italic
+  h = h.replace(/\\*\\*\\*(.+?)\\*\\*\\*/g, '<strong><em>$1</em></strong>');
+  h = h.replace(/\\*\\*(.+?)\\*\\*/g, '<strong>$1</strong>');
+  h = h.replace(/\\*(.+?)\\*/g, '<em>$1</em>');
+  // inline code (but not inside <pre>)
+  h = h.replace(/`([^`]+)`/g, '<code>$1</code>');
+  // unordered lists
+  h = h.replace(/(^[\\t ]*[-*+] .+$\\n?)+/gm, function(block) {
+    var items = block.trim().split('\\n').map(function(l) {
+      return '<li>' + l.replace(/^[\\t ]*[-*+] /, '') + '</li>';
+    }).join('');
+    return '<ul>' + items + '</ul>';
+  });
+  // ordered lists
+  h = h.replace(/(^[\\t ]*\\d+\\. .+$\\n?)+/gm, function(block) {
+    var items = block.trim().split('\\n').map(function(l) {
+      return '<li>' + l.replace(/^[\\t ]*\\d+\\. /, '') + '</li>';
+    }).join('');
+    return '<ol>' + items + '</ol>';
+  });
+  // checkboxes
+  h = h.replace(/\\[x\\]/gi, '&#9745;').replace(/\\[ \\]/g, '&#9744;');
+  // paragraphs: wrap remaining loose lines
+  h = h.replace(/^(?!<[a-z/])((?!\\s*$).+)$/gm, '<p>$1</p>');
+  // collapse adjacent blockquotes
+  h = h.replace(/<\\/blockquote>\\s*<blockquote>/g, '<br>');
+  return h;
+}
+
+function toggleMdView() {
+  fpModalMdRendered = !fpModalMdRendered;
+  var btn = document.getElementById('fpModalMdToggle');
+  btn.innerHTML = fpModalMdRendered ? '&#60;/&#62; Source' : '&#128196; Rendered';
+  var pre = document.getElementById('fpModalContent');
+  var md = document.getElementById('fpModalMdRender');
+  if (fpModalMdRendered) {
+    md.innerHTML = renderMarkdown(fpModalText);
+    md.style.display = 'block';
+    pre.style.display = 'none';
+  } else {
+    md.style.display = 'none';
+    pre.style.display = 'block';
+  }
+}
+
 function getInlinePreviewUrl(pathToken) {
   return '/api/files/download?inline=1&path_token=' + encodeURIComponent(pathToken);
 }
@@ -3667,10 +3790,12 @@ function closeFileModal() {
   fpModalEditing = false;
   fpModalKind = 'binary';
   fpModalEncoding = 'utf-8';
+  fpModalMdRendered = false;
   const img = document.getElementById('fpModalImage');
   const vid = document.getElementById('fpModalVideo');
   const aud = document.getElementById('fpModalAudio');
   const pdf = document.getElementById('fpModalPdf');
+  const mdRender = document.getElementById('fpModalMdRender');
   img.style.display = 'none';
   img.src = '';
   vid.pause();
@@ -3683,12 +3808,15 @@ function closeFileModal() {
   aud.load();
   pdf.style.display = 'none';
   pdf.removeAttribute('src');
+  mdRender.style.display = 'none';
+  mdRender.innerHTML = '';
   document.getElementById('fpModal').classList.remove('open');
   document.getElementById('fpModalContent').style.display = 'block';
   document.getElementById('fpModalEditor').style.display = 'none';
   document.getElementById('fpModalNote').style.display = 'none';
   document.getElementById('fpModalEdit').style.display = 'none';
   document.getElementById('fpModalSave').style.display = 'none';
+  document.getElementById('fpModalMdToggle').style.display = 'none';
 }
 
 function setModalEditing(editing) {
@@ -3703,22 +3831,45 @@ function setModalEditing(editing) {
   const aud = document.getElementById('fpModalAudio');
   const pdf = document.getElementById('fpModalPdf');
 
+  const mdRender = document.getElementById('fpModalMdRender');
+  const mdToggle = document.getElementById('fpModalMdToggle');
+
   pre.style.display = 'none';
   editor.style.display = 'none';
   img.style.display = 'none';
   vid.style.display = 'none';
   aud.style.display = 'none';
   pdf.style.display = 'none';
+  mdRender.style.display = 'none';
   editBtn.style.display = 'none';
   saveBtn.style.display = 'none';
   note.style.display = 'none';
+  mdToggle.style.display = 'none';
 
   if (fpModalKind === 'text') {
+    const isMd = isMdFile(document.getElementById('fpModalTitle').textContent);
     editBtn.style.display = 'inline-block';
     editBtn.innerHTML = fpModalEditing ? '&#10005; Cancel' : '&#9998; Edit';
     saveBtn.style.display = fpModalEditing ? 'inline-block' : 'none';
-    pre.style.display = fpModalEditing ? 'none' : 'block';
-    editor.style.display = fpModalEditing ? 'block' : 'none';
+    if (fpModalEditing) {
+      pre.style.display = 'none';
+      mdRender.style.display = 'none';
+      editor.style.display = 'block';
+      mdToggle.style.display = 'none';
+    } else if (isMd) {
+      mdToggle.style.display = 'inline-block';
+      mdToggle.innerHTML = fpModalMdRendered ? '&#60;/&#62; Source' : '&#128196; Rendered';
+      if (fpModalMdRendered) {
+        mdRender.innerHTML = renderMarkdown(fpModalText);
+        mdRender.style.display = 'block';
+        pre.style.display = 'none';
+      } else {
+        pre.style.display = 'block';
+        mdRender.style.display = 'none';
+      }
+    } else {
+      pre.style.display = 'block';
+    }
     if (fpModalEncoding !== 'utf-8') note.style.display = 'block';
     return;
   }
@@ -4018,6 +4169,7 @@ async function previewFile(pathToken, name) {
     fpModalKind = fpModalIsText ? 'text' : 'binary';
     fpModalText = data.content || '';
     fpModalEncoding = data.encoding || 'utf-8';
+    fpModalMdRendered = fpModalIsText && isMdFile(name);
     document.getElementById('fpModalContent').textContent = fpModalText;
     document.getElementById('fpModalEditor').value = fpModalText;
     document.getElementById('fpModalNote').textContent = fpModalIsText
