@@ -1241,6 +1241,22 @@ APP_HTML = """<!DOCTYPE html>
     white-space: nowrap;
   }
   .fp-breadcrumbs::-webkit-scrollbar { height: 0; }
+  .fp-breadcrumbs { cursor: text; }
+  .fp-path-input {
+    display: none;
+    width: 100%;
+    box-sizing: border-box;
+    padding: 5px 10px;
+    font-size: 12px;
+    font-family: inherit;
+    color: #e2e2e2;
+    background: #0a1929;
+    border: none;
+    border-bottom: 1px solid #1a6aff;
+    outline: none;
+    flex-shrink: 0;
+  }
+  .fp-path-input::placeholder { color: #3a3a5a; }
   .fp-crumb {
     color: #9a9abf;
     cursor: pointer;
@@ -2125,10 +2141,15 @@ APP_HTML = """<!DOCTYPE html>
     <div class="fp-header">
       <span class="fp-title">Files</span>
       <button class="fp-btn" onclick="document.getElementById('fpUploadInput').click()">&#8593; Upload</button>
+      <button class="fp-btn" onclick="pasteImageFromClipboard()">&#128203; Paste Img</button>
       <button class="fp-btn" onclick="createFolder()">+ Folder</button>
       <button class="fp-btn" onclick="toggleFilePanel()">&#10005;</button>
     </div>
-    <div class="fp-breadcrumbs" id="fpBreadcrumbs"></div>
+    <div class="fp-breadcrumbs" id="fpBreadcrumbs" ondblclick="startPathEdit()"></div>
+    <input type="text" class="fp-path-input" id="fpPathInput" style="display:none"
+      onkeydown="if(event.key==='Enter'){commitPathEdit();}else if(event.key==='Escape'){cancelPathEdit();}"
+      onblur="cancelPathEdit()"
+      spellcheck="false" autocomplete="off" placeholder="Type path and press Enter">
     <div class="fp-sort-bar" id="fpSortBar"></div>
     <div class="fp-list" id="fpList"></div>
     <input type="file" id="fpUploadInput" multiple style="display:none" onchange="handleUpload(this.files);this.value='';">
@@ -3503,6 +3524,23 @@ document.addEventListener('click', (e) => {
   }
 });
 
+// Clipboard image paste handler
+document.addEventListener('paste', async (e) => {
+  if (!e.clipboardData || !e.clipboardData.items) return;
+  const active = document.activeElement;
+  if (active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA' || active.isContentEditable)) return;
+  const imageBlobs = [];
+  for (const item of e.clipboardData.items) {
+    if (item.kind === 'file' && item.type.startsWith('image/')) {
+      const blob = item.getAsFile();
+      if (blob) imageBlobs.push({ blob, type: item.type });
+    }
+  }
+  if (!imageBlobs.length) return;
+  e.preventDefault();
+  await _promptAndUploadClipboardImages(imageBlobs);
+});
+
 // Special keys toolbar
 let modCtrl = false, modAlt = false;
 
@@ -4013,7 +4051,10 @@ function toggleFilePanel() {
   document.getElementById('settingsBtn').classList.remove('active');
   document.getElementById('themePanel').classList.remove('open');
   document.getElementById('themeBtn').classList.remove('active');
-  if (open) fetchFiles(fpCurrentPathToken);
+  if (open) {
+    const savedToken = localStorage.getItem('ttyd_fp_last_token') || '';
+    fetchFiles(fpCurrentPathToken || savedToken);
+  }
 }
 
 async function fetchFiles(pathToken) {
@@ -4031,6 +4072,8 @@ async function fetchFiles(pathToken) {
     fpCurrentPath = data.path;
     fpCurrentPathToken = data.path_token || '';
     fpParentToken = data.parent_token || '';
+    localStorage.setItem('ttyd_fp_last_token', fpCurrentPathToken);
+    localStorage.setItem('ttyd_fp_last_path', fpCurrentPath);
     renderBreadcrumbs(data.breadcrumbs || []);
     fpCurrentEntries = data.entries || [];
     renderSortBar();
@@ -4064,6 +4107,47 @@ function renderBreadcrumbs(breadcrumbs) {
   });
   // Scroll to end
   bc.scrollLeft = bc.scrollWidth;
+}
+
+function startPathEdit() {
+  const bc = document.getElementById('fpBreadcrumbs');
+  const inp = document.getElementById('fpPathInput');
+  bc.style.display = 'none';
+  inp.style.display = 'block';
+  inp.value = fpCurrentPath || '~';
+  inp.focus();
+  inp.select();
+}
+
+function cancelPathEdit() {
+  const bc = document.getElementById('fpBreadcrumbs');
+  const inp = document.getElementById('fpPathInput');
+  inp.style.display = 'none';
+  bc.style.display = 'flex';
+}
+
+async function commitPathEdit() {
+  const inp = document.getElementById('fpPathInput');
+  const raw = (inp.value || '').trim();
+  cancelPathEdit();
+  if (!raw || raw === fpCurrentPath) return;
+  try {
+    const res = await fetch('/api/files/list?path=' + encodeURIComponent(raw));
+    if (!res.ok) { showToast('Path not found: ' + raw, true); return; }
+    const data = await res.json();
+    if (data.error) { showToast(data.error, true); return; }
+    fpCurrentPath = data.path;
+    fpCurrentPathToken = data.path_token || '';
+    fpParentToken = data.parent_token || '';
+    localStorage.setItem('ttyd_fp_last_token', fpCurrentPathToken);
+    localStorage.setItem('ttyd_fp_last_path', fpCurrentPath);
+    renderBreadcrumbs(data.breadcrumbs || []);
+    fpCurrentEntries = data.entries || [];
+    renderSortBar();
+    renderFileList(fpCurrentEntries);
+  } catch (e) {
+    showToast('Error: ' + e.message, true);
+  }
 }
 
 function renderFileList(entries) {
@@ -4270,6 +4354,117 @@ function downloadFile(pathToken, name) {
   document.body.appendChild(a);
   a.click();
   a.remove();
+}
+
+function _clipboardDefaultName(mimeType) {
+  const now = new Date();
+  const ts = now.getFullYear().toString() +
+    String(now.getMonth() + 1).padStart(2, '0') +
+    String(now.getDate()).padStart(2, '0') + '_' +
+    String(now.getHours()).padStart(2, '0') +
+    String(now.getMinutes()).padStart(2, '0') +
+    String(now.getSeconds()).padStart(2, '0');
+  const ext = mimeType === 'image/png' ? '.png' :
+              mimeType === 'image/jpeg' ? '.jpg' :
+              mimeType === 'image/gif' ? '.gif' :
+              mimeType === 'image/webp' ? '.webp' : '.png';
+  return 'clipboard_' + ts + ext;
+}
+
+async function _promptAndUploadClipboardImages(blobs) {
+  // blobs: array of { blob: Blob, type: string }
+  if (!blobs.length) return;
+
+  // Ensure file panel is open so user sees the current folder
+  const panel = document.getElementById('filePanel');
+  if (!panel.classList.contains('open')) {
+    panel.classList.add('open');
+    document.getElementById('filesBtn').classList.add('active');
+  }
+  if (!fpCurrentPathToken) await fetchFiles('');
+  if (!fpCurrentPathToken) { showToast('Cannot determine upload path', true); return; }
+
+  // Prompt for folder — default to current file-panel path
+  const folder = await modalPrompt(
+    'Save to folder (relative to home, or absolute):',
+    'Paste Image — Choose Folder',
+    fpCurrentPath || '~'
+  );
+  if (folder === null || folder === undefined) return; // cancelled
+
+  // Resolve folder to a path token via the API
+  let targetToken = fpCurrentPathToken;
+  const trimmed = folder.trim();
+  if (trimmed && trimmed !== fpCurrentPath) {
+    try {
+      const res = await fetch('/api/files/list?path=' + encodeURIComponent(trimmed));
+      if (!res.ok) { showToast('Folder not found: ' + trimmed, true); return; }
+      const data = await res.json();
+      if (data.error) { showToast(data.error, true); return; }
+      targetToken = data.path_token || '';
+    } catch (e) {
+      showToast('Error resolving folder: ' + e.message, true);
+      return;
+    }
+  }
+  if (!targetToken) { showToast('Cannot determine upload path', true); return; }
+
+  for (let i = 0; i < blobs.length; i++) {
+    const item = blobs[i];
+    const defaultName = _clipboardDefaultName(item.type);
+    const chosenName = await modalPrompt(
+      'File name' + (blobs.length > 1 ? ' (' + (i + 1) + '/' + blobs.length + ')' : '') + ':',
+      'Paste Image — File Name',
+      defaultName
+    );
+    if (chosenName === null || chosenName === undefined) return; // cancelled
+    const finalName = chosenName.trim() || defaultName;
+    const file = new File([item.blob], finalName, { type: item.type });
+
+    try {
+      const body = await file.arrayBuffer();
+      const nameB64 = btoa(unescape(encodeURIComponent(file.name))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+      const res = await fetch('/api/files/upload?path_token=' + encodeURIComponent(targetToken), {
+        method: 'POST',
+        headers: { 'X-Path-Token': targetToken, 'X-File-Name-B64': nameB64 },
+        body: body,
+      });
+      if (!res.ok) {
+        const d = await res.json().catch(() => ({}));
+        await modalAlert('Upload failed: ' + (d.error || res.status), 'Upload Failed');
+      } else {
+        showToast('Saved ' + finalName);
+      }
+    } catch (e) {
+      await modalAlert('Upload error: ' + e.message, 'Upload Failed');
+    }
+  }
+  fetchFiles(fpCurrentPathToken);
+}
+
+async function pasteImageFromClipboard() {
+  try {
+    const items = await navigator.clipboard.read();
+    const imageBlobs = [];
+    for (const item of items) {
+      const imageType = item.types.find(t => t.startsWith('image/'));
+      if (imageType) {
+        const blob = await item.getType(imageType);
+        imageBlobs.push({ blob, type: imageType });
+      }
+    }
+    if (!imageBlobs.length) {
+      showToast('No image in clipboard', true);
+      return;
+    }
+    await _promptAndUploadClipboardImages(imageBlobs);
+  } catch (e) {
+    if (e.name === 'NotAllowedError') {
+      showToast('Clipboard access denied', true);
+    } else {
+      showToast('Paste failed: ' + e.message, true);
+    }
+  }
 }
 
 async function handleUpload(files) {
