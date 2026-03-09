@@ -2278,7 +2278,14 @@ function switchTab(id) {
   }
   getAllIframes().forEach(f => f.classList.remove('active'));
   const frame = document.getElementById('frame-' + id);
-  if (frame) frame.classList.add('active');
+  if (frame) {
+    // Lazy-load: if iframe hasn't loaded its real URL yet, load it now
+    if (frame.dataset.lazySrc && (!frame.src || frame.src === 'about:blank' || frame.src.endsWith('/blank'))) {
+      frame.src = frame.dataset.lazySrc;
+      delete frame.dataset.lazySrc;
+    }
+    frame.classList.add('active');
+  }
   // Update tab classes without rebuilding DOM
   document.querySelectorAll('#tabBar .tab').forEach(el => {
     el.classList.toggle('active', el.dataset.tabId === id);
@@ -3148,29 +3155,35 @@ function init() {
     });
     renderTabs();
     switchTab(tabs[0].id);
-    // Create iframes with staggered delays so each tmux grouped session
-    // can register before the next one counts existing sessions
-    const hasSplit = restoreSplitState();
+    // Clear stale split state — tab IDs are regenerated on reload so
+    // the saved split tree references are no longer reliable.
+    localStorage.removeItem('ttyd_split');
+    // Create iframes — only load the active tab immediately;
+    // defer hidden tabs to avoid tmux sizing the window to the
+    // smallest (hidden/zero-size) client.
     const activeSlots = tabs.filter(t => t.type !== 'desktop').map(t => t.windowSlot).join(',');
     tabs.forEach((t, i) => {
+      const isActive = (t.id === activeTabId);
       setTimeout(() => {
         const iframe = document.createElement('iframe');
         iframe.id = 'frame-' + t.id;
         iframe.allow = 'clipboard-read; clipboard-write';
+        let url;
         if (t.type === 'desktop') {
-          iframe.src = '/noVNC/vnc.html?autoconnect=true&resize=scale&reconnect=true&reconnect_delay=1000&path=noVNC/websockify';
+          url = '/noVNC/vnc.html?autoconnect=true&resize=scale&reconnect=true&reconnect_delay=1000&path=noVNC/websockify';
         } else {
-          iframe.src = buildTermUrl(t, { _activeSlots: activeSlots });
+          url = buildTermUrl(t, { _activeSlots: activeSlots });
+        }
+        if (isActive) {
+          iframe.src = url;
+          iframe.classList.add('active');
+        } else {
+          iframe.dataset.lazySrc = url;
         }
         document.getElementById('termContainer').appendChild(iframe);
-        if (!hasSplit && t.id === activeTabId) iframe.classList.add('active');
-        // After all iframes created, render split layout if restored
-        if (hasSplit && i === tabs.length - 1) {
-          setTimeout(() => { renderSplitLayout(); updateSplitButtons(); }, 100);
-        }
-      }, i * 300);
+      }, isActive ? 0 : i * 300);
     });
-    if (!hasSplit) updateSplitButtons();
+    updateSplitButtons();
   } else {
     addTab();
     updateSplitButtons();
@@ -4598,8 +4611,8 @@ def spawn_user_ttyd(username, password):
     # while the base "main" session (and its windows) persist to keep processes alive.
     # On reconnect, tabs reattach to existing windows instead of creating new ones.
     tmux_cmd = (
-        r'tmux has-session -t main 2>/dev/null || exec tmux new-session -s main \; set -g mouse on \; set -g history-limit 10000 \; set -s set-clipboard on;'
-        r' tmux set -g mouse on 2>/dev/null; tmux set -g history-limit 10000 2>/dev/null; tmux set -s set-clipboard on 2>/dev/null; tmux set -g set-clipboard on 2>/dev/null;'
+        r'tmux has-session -t main 2>/dev/null || exec tmux new-session -s main \; set -g mouse on \; set -g history-limit 10000 \; set -s set-clipboard on \; setw -g aggressive-resize on;'
+        r' tmux set -g mouse on 2>/dev/null; tmux set -g history-limit 10000 2>/dev/null; tmux set -s set-clipboard on 2>/dev/null; tmux set -g set-clipboard on 2>/dev/null; tmux setw -g aggressive-resize on 2>/dev/null;'
         # Parse arg format "SLOT:ACTIVE_SLOTS" (e.g. "0:0,2,3") or plain "SLOT"
         r' RAW="$1"; case "$RAW" in *:*) SLOT="${RAW%%:*}"; ACTIVE="${RAW#*:}" ;; *) SLOT="$RAW"; ACTIVE="" ;; esac;'
         r' case "$SLOT" in (""|*[!0-9]*) SLOT=0 ;; esac;'
