@@ -4731,8 +4731,7 @@ def spawn_user_vnc(username, password):
         "display": display_num,
         "password": password,
     }
-    logging.info("VNC desktop started for %s: display=:%d vnc_port=%d ws_port=%d",
-                 username, display_num, vnc_port, ws_port)
+    print(f"[VNC] desktop started for {username}: display=:{display_num} vnc_port={vnc_port} ws_port={ws_port}")
     return ws_port
 
 
@@ -4944,7 +4943,7 @@ class AuthHandler(http.server.BaseHTTPRequestHandler):
             ws_port = spawn_user_vnc(username, info["password"])
             self._send_json(200, {"ok": True, "ws_port": ws_port})
         except Exception as e:
-            logging.exception("Failed to spawn VNC for %s", username)
+            import traceback; traceback.print_exc()
             self._send_error(500, f"failed to start desktop: {e}")
 
 # --- File API handlers ---
