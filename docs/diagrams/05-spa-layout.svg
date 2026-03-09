@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg viewBox="0 0 800 500" xmlns="http://www.w3.org/2000/svg" font-family="Segoe UI, Arial, sans-serif">
+  <rect width="800" height="500" rx="12" fill="#0f172a"/>
+
+  <!-- Browser window chrome -->
+  <rect x="40" y="20" width="720" height="460" rx="10" fill="#16213e" stroke="#334155" stroke-width="2"/>
+
+  <!-- Navbar -->
+  <rect x="42" y="22" width="716" height="42" rx="8" fill="#1a1a2e"/>
+  <circle cx="60" cy="43" r="6" fill="#e94560"/>
+  <circle cx="78" cy="43" r="6" fill="#f59e0b"/>
+  <circle cx="96" cy="43" r="6" fill="#22c55e"/>
+  <text x="120" y="47" fill="#e2e8f0" font-size="13" font-weight="600">Terminal</text>
+  <rect x="620" y="32" width="50" height="22" rx="4" fill="#334155"/>
+  <text x="645" y="47" text-anchor="middle" fill="#94a3b8" font-size="10">Files</text>
+  <rect x="680" y="32" width="60" height="22" rx="4" fill="#334155"/>
+  <text x="710" y="47" text-anchor="middle" fill="#94a3b8" font-size="10">Logout</text>
+
+  <!-- Tab bar -->
+  <rect x="42" y="64" width="716" height="32" rx="0" fill="#0d1b2a"/>
+  <rect x="50" y="68" width="90" height="24" rx="4" fill="#16213e" stroke="#e94560" stroke-width="0 0 2 0"/>
+  <text x="95" y="84" text-anchor="middle" fill="#e94560" font-size="11" font-weight="600">Tab 1</text>
+  <rect x="148" y="68" width="90" height="24" rx="4" fill="#0f172a"/>
+  <text x="193" y="84" text-anchor="middle" fill="#64748b" font-size="11">Tab 2</text>
+  <rect x="246" y="68" width="90" height="24" rx="4" fill="#0f172a"/>
+  <text x="291" y="84" text-anchor="middle" fill="#64748b" font-size="11">Tab 3</text>
+  <rect x="700" y="68" width="24" height="24" rx="4" fill="#0f172a"/>
+  <text x="712" y="85" text-anchor="middle" fill="#64748b" font-size="14">+</text>
+
+  <!-- Split: File panel + Terminal -->
+  <!-- File panel -->
+  <rect x="42" y="96" width="220" height="382" fill="#0d1b2a" stroke="#1e3a5f" stroke-width="1"/>
+
+  <!-- Breadcrumbs -->
+  <rect x="50" y="102" width="204" height="24" rx="3" fill="#16213e"/>
+  <text x="60" y="118" fill="#3b82f6" font-size="10">~ / projects / myapp</text>
+
+  <!-- File entries -->
+  <rect x="50" y="132" width="204" height="24" rx="3" fill="transparent"/>
+  <text x="72" y="148" fill="#f59e0b" font-size="11">src/</text>
+  <rect x="50" y="158" width="204" height="24" rx="3" fill="transparent"/>
+  <text x="72" y="174" fill="#f59e0b" font-size="11">docs/</text>
+  <rect x="50" y="184" width="204" height="24" rx="3" fill="transparent"/>
+  <text x="72" y="200" fill="#e2e8f0" font-size="11">README.md</text>
+  <text x="200" y="200" text-anchor="end" fill="#64748b" font-size="9">2.3 KB</text>
+  <rect x="50" y="210" width="204" height="24" rx="3" fill="transparent"/>
+  <text x="72" y="226" fill="#e2e8f0" font-size="11">package.json</text>
+  <text x="200" y="226" text-anchor="end" fill="#64748b" font-size="9">1.1 KB</text>
+  <rect x="50" y="236" width="204" height="24" rx="3" fill="transparent"/>
+  <text x="72" y="252" fill="#e2e8f0" font-size="11">.env</text>
+  <text x="200" y="252" text-anchor="end" fill="#64748b" font-size="9">256 B</text>
+
+  <!-- Upload zone -->
+  <rect x="50" y="430" width="204" height="40" rx="6" fill="#16213e" stroke="#334155" stroke-dasharray="4,3"/>
+  <text x="152" y="454" text-anchor="middle" fill="#64748b" font-size="10">Drop files to upload</text>
+
+  <!-- Terminal area -->
+  <rect x="262" y="96" width="496" height="382" fill="#0a0a1a"/>
+  <text x="280" y="120" fill="#22c55e" font-size="12" font-family="monospace">alice@server:~$ </text>
+  <text x="416" y="120" fill="#e2e8f0" font-size="12" font-family="monospace">ls -la</text>
+  <text x="280" y="140" fill="#94a3b8" font-size="12" font-family="monospace">total 24</text>
+  <text x="280" y="156" fill="#94a3b8" font-size="12" font-family="monospace">drwxr-xr-x  5 alice alice 4096 Mar  8</text>
+  <text x="280" y="172" fill="#3b82f6" font-size="12" font-family="monospace">drwxr-xr-x  3 alice alice 4096 Mar  7</text>
+  <text x="280" y="188" fill="#94a3b8" font-size="12" font-family="monospace">-rw-r--r--  1 alice alice 2341 Mar  8</text>
+  <text x="280" y="220" fill="#22c55e" font-size="12" font-family="monospace">alice@server:~$ </text>
+  <rect x="416" y="210" width="8" height="15" fill="#e94560" opacity="0.8"/>
+
+  <!-- Label: iframe -->
+  <text x="510" y="465" text-anchor="middle" fill="#334155" font-size="10">iframe &rarr; /ut/7701/ &rarr; ttyd &rarr; xterm.js &rarr; tmux</text>
+</svg>

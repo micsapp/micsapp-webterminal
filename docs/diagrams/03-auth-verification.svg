@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg viewBox="0 0 740 340" xmlns="http://www.w3.org/2000/svg" font-family="Segoe UI, Arial, sans-serif">
+  <defs>
+    <marker id="a2" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#64748b"/></marker>
+    <marker id="a2g" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#22c55e"/></marker>
+    <marker id="a2r" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#e94560"/></marker>
+  </defs>
+  <rect width="740" height="340" rx="12" fill="#0f172a"/>
+
+  <!-- Start -->
+  <ellipse cx="70" cy="50" rx="50" ry="22" fill="#3b82f6" opacity="0.8"/>
+  <text x="70" y="55" text-anchor="middle" fill="#fff" font-size="12">Request</text>
+
+  <!-- Extract cookie -->
+  <rect x="160" y="30" width="140" height="40" rx="6" fill="#1e293b" stroke="#334155"/>
+  <text x="230" y="55" text-anchor="middle" fill="#e2e8f0" font-size="11">Extract cookie</text>
+
+  <!-- Parse token -->
+  <rect x="340" y="30" width="140" height="40" rx="6" fill="#1e293b" stroke="#334155"/>
+  <text x="410" y="48" text-anchor="middle" fill="#e2e8f0" font-size="11">Parse token</text>
+  <text x="410" y="62" text-anchor="middle" fill="#94a3b8" font-size="10">user:port:ts:sig</text>
+
+  <!-- Verify HMAC -->
+  <path d="M520 50 L570 50" stroke="#64748b" stroke-width="1.5" marker-end="url(#a2)"/>
+  <rect x="570" y="22" width="140" height="55" rx="6" fill="#e94560" opacity="0.3" stroke="#e94560" stroke-width="1"/>
+  <text x="640" y="44" text-anchor="middle" fill="#fecdd3" font-size="11">Verify HMAC</text>
+  <text x="640" y="58" text-anchor="middle" fill="#94a3b8" font-size="10">SHA256(key,</text>
+  <text x="640" y="70" text-anchor="middle" fill="#94a3b8" font-size="10">user:port:ts)</text>
+
+  <!-- Check expiry -->
+  <rect x="570" y="110" width="140" height="40" rx="6" fill="#1e293b" stroke="#334155"/>
+  <text x="640" y="128" text-anchor="middle" fill="#e2e8f0" font-size="11">Check expiry</text>
+  <text x="640" y="142" text-anchor="middle" fill="#94a3b8" font-size="10">now - ts &lt; MAX_AGE</text>
+
+  <!-- Check port binding -->
+  <rect x="570" y="180" width="140" height="40" rx="6" fill="#1e293b" stroke="#334155"/>
+  <text x="640" y="198" text-anchor="middle" fill="#e2e8f0" font-size="11">Verify port binding</text>
+  <text x="640" y="212" text-anchor="middle" fill="#94a3b8" font-size="10">X-TTYD-Port == port</text>
+
+  <!-- 200 OK -->
+  <ellipse cx="640" cy="265" rx="50" ry="22" fill="#22c55e" opacity="0.8"/>
+  <text x="640" y="270" text-anchor="middle" fill="#fff" font-size="12">200 OK</text>
+
+  <!-- 401 -->
+  <ellipse cx="380" cy="265" rx="50" ry="22" fill="#ef4444" opacity="0.8"/>
+  <text x="380" y="270" text-anchor="middle" fill="#fff" font-size="12">401</text>
+
+  <!-- Arrows -->
+  <line x1="120" y1="50" x2="158" y2="50" stroke="#64748b" stroke-width="1.5" marker-end="url(#a2)"/>
+  <line x1="300" y1="50" x2="338" y2="50" stroke="#64748b" stroke-width="1.5" marker-end="url(#a2)"/>
+  <line x1="640" y1="77" x2="640" y2="108" stroke="#22c55e" stroke-width="1.5" marker-end="url(#a2g)"/>
+  <text x="655" y="96" fill="#86efac" font-size="10">valid</text>
+  <line x1="640" y1="150" x2="640" y2="178" stroke="#22c55e" stroke-width="1.5" marker-end="url(#a2g)"/>
+  <text x="655" y="168" fill="#86efac" font-size="10">fresh</text>
+  <line x1="640" y1="220" x2="640" y2="243" stroke="#22c55e" stroke-width="1.5" marker-end="url(#a2g)"/>
+  <text x="655" y="236" fill="#86efac" font-size="10">match</text>
+
+  <!-- Fail paths -->
+  <path d="M570 50 L380 50 L380 243" stroke="#ef4444" stroke-width="1.2" stroke-dasharray="4,3" marker-end="url(#a2r)" fill="none"/>
+  <text x="470" y="42" fill="#f87171" font-size="10">invalid sig</text>
+  <path d="M570 130 L480 130 L480 180 L380 180 L380 243" stroke="#ef4444" stroke-width="1.2" stroke-dasharray="4,3" fill="none"/>
+  <text x="510" y="122" fill="#f87171" font-size="10">expired</text>
+  <path d="M570 200 L480 200 L480 220 L380 220 L380 243" stroke="#ef4444" stroke-width="1.2" stroke-dasharray="4,3" fill="none"/>
+  <text x="510" y="192" fill="#f87171" font-size="10">wrong port</text>
+</svg>

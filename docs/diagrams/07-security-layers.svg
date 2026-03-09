@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg viewBox="0 0 800 350" xmlns="http://www.w3.org/2000/svg" font-family="Segoe UI, Arial, sans-serif">
+  <rect width="800" height="350" rx="12" fill="#0f172a"/>
+  <text x="400" y="30" text-anchor="middle" fill="#e2e8f0" font-size="14" font-weight="600">Security Layers</text>
+
+  <!-- Layer 1: Network -->
+  <rect x="40" y="50" width="720" height="50" rx="8" fill="#3b82f6" opacity="0.15" stroke="#3b82f6" stroke-width="1"/>
+  <text x="60" y="72" fill="#3b82f6" font-size="12" font-weight="600">Network</text>
+  <text x="60" y="88" fill="#93c5fd" font-size="10">Cloudflare tunnel (HTTPS) &bull; ttyd binds 127.0.0.1 only &bull; SSH localhost only</text>
+
+  <!-- Layer 2: Auth -->
+  <rect x="60" y="110" width="680" height="50" rx="8" fill="#e94560" opacity="0.15" stroke="#e94560" stroke-width="1"/>
+  <text x="80" y="132" fill="#e94560" font-size="12" font-weight="600">Authentication</text>
+  <text x="80" y="148" fill="#fecdd3" font-size="10">HMAC-SHA256 tokens &bull; __Host- cookie prefix &bull; HttpOnly + Secure + SameSite=Strict &bull; 24h expiry</text>
+
+  <!-- Layer 3: Authorization -->
+  <rect x="80" y="170" width="640" height="50" rx="8" fill="#f59e0b" opacity="0.15" stroke="#f59e0b" stroke-width="1"/>
+  <text x="100" y="192" fill="#f59e0b" font-size="12" font-weight="600">Authorization</text>
+  <text x="100" y="208" fill="#fde68a" font-size="10">Port binding in token &bull; nginx auth subrequest &bull; HMAC-signed path tokens (file ops)</text>
+
+  <!-- Layer 4: Isolation -->
+  <rect x="100" y="230" width="600" height="50" rx="8" fill="#22c55e" opacity="0.15" stroke="#22c55e" stroke-width="1"/>
+  <text x="120" y="252" fill="#22c55e" font-size="12" font-weight="600">Process Isolation</text>
+  <text x="120" y="268" fill="#86efac" font-size="10">Per-user UID &bull; OS file permissions &bull; Separate ttyd process per user &bull; Isolated tmux sessions</text>
+
+  <!-- Layer 5: Headers -->
+  <rect x="120" y="290" width="560" height="50" rx="8" fill="#8b5cf6" opacity="0.15" stroke="#8b5cf6" stroke-width="1"/>
+  <text x="140" y="312" fill="#8b5cf6" font-size="12" font-weight="600">HTTP Hardening</text>
+  <text x="140" y="328" fill="#c4b5fd" font-size="10">CSP &bull; X-Frame-Options: SAMEORIGIN &bull; no-referrer &bull; nosniff &bull; Permissions-Policy</text>
+</svg>

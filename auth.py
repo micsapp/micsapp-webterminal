@@ -840,42 +840,54 @@ APP_HTML = """<!DOCTYPE html>
   .fp-modal-body textarea:focus { border-color: #e94560; }
   .fp-modal-md-render {
     display: none;
-    color: #e2e2e2;
+    color: #c9d1d9;
     font-size: 14px;
-    line-height: 1.6;
+    line-height: 1.7;
     word-wrap: break-word;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
   }
   .fp-modal-md-render h1, .fp-modal-md-render h2, .fp-modal-md-render h3,
   .fp-modal-md-render h4, .fp-modal-md-render h5, .fp-modal-md-render h6 {
-    color: #ffffff; margin: 16px 0 8px 0; font-weight: 600;
+    color: #e6edf3; margin: 24px 0 16px 0; font-weight: 600; line-height: 1.25;
   }
-  .fp-modal-md-render h1 { font-size: 1.8em; border-bottom: 1px solid #333; padding-bottom: 6px; }
-  .fp-modal-md-render h2 { font-size: 1.4em; border-bottom: 1px solid #333; padding-bottom: 4px; }
-  .fp-modal-md-render h3 { font-size: 1.2em; }
-  .fp-modal-md-render p { margin: 8px 0; }
-  .fp-modal-md-render ul, .fp-modal-md-render ol { padding-left: 24px; margin: 8px 0; }
+  .fp-modal-md-render h1 { font-size: 2em; border-bottom: 1px solid #30363d; padding-bottom: 0.3em; }
+  .fp-modal-md-render h2 { font-size: 1.5em; border-bottom: 1px solid #30363d; padding-bottom: 0.3em; }
+  .fp-modal-md-render h3 { font-size: 1.25em; }
+  .fp-modal-md-render h4 { font-size: 1em; }
+  .fp-modal-md-render p { margin: 0 0 16px 0; }
+  .fp-modal-md-render ul, .fp-modal-md-render ol { padding-left: 2em; margin: 0 0 16px 0; }
   .fp-modal-md-render li { margin: 4px 0; }
+  .fp-modal-md-render li > p { margin: 0; }
   .fp-modal-md-render code {
-    background: #1a1a3e; padding: 2px 6px; border-radius: 4px;
-    font-family: 'Menlo','Monaco','Consolas',monospace; font-size: 0.9em;
+    background: rgba(110,118,129,0.4); padding: 0.2em 0.4em; border-radius: 6px;
+    font-family: 'SFMono-Regular','Menlo','Monaco','Consolas','Liberation Mono',monospace;
+    font-size: 85%;
   }
   .fp-modal-md-render pre {
-    background: #0f3460; border: 1px solid #1a4a7a; border-radius: 8px;
-    padding: 12px; overflow-x: auto; margin: 10px 0;
+    background: #161b22; border: 1px solid #30363d; border-radius: 6px;
+    padding: 16px; overflow-x: auto; margin: 0 0 16px 0; line-height: 1.45;
   }
-  .fp-modal-md-render pre code { background: none; padding: 0; }
+  .fp-modal-md-render pre code {
+    background: none; padding: 0; font-size: 85%; border-radius: 0;
+  }
   .fp-modal-md-render blockquote {
-    border-left: 3px solid #e94560; padding: 4px 12px; margin: 8px 0;
-    color: #9a9abf; background: #16213e;
+    border-left: 4px solid #3b82f6; padding: 0 16px; margin: 0 0 16px 0;
+    color: #8b949e;
   }
-  .fp-modal-md-render a { color: #4fc3f7; text-decoration: underline; }
-  .fp-modal-md-render table { border-collapse: collapse; margin: 10px 0; width: 100%; }
+  .fp-modal-md-render blockquote p { margin: 0; }
+  .fp-modal-md-render a { color: #58a6ff; text-decoration: none; }
+  .fp-modal-md-render a:hover { text-decoration: underline; }
+  .fp-modal-md-render table { border-collapse: collapse; margin: 0 0 16px 0; width: auto; display: block; overflow-x: auto; }
   .fp-modal-md-render th, .fp-modal-md-render td {
-    border: 1px solid #333; padding: 6px 10px; text-align: left;
+    border: 1px solid #30363d; padding: 6px 13px;
   }
-  .fp-modal-md-render th { background: #1a1a3e; font-weight: 600; }
-  .fp-modal-md-render hr { border: none; border-top: 1px solid #333; margin: 16px 0; }
+  .fp-modal-md-render th { background: #161b22; font-weight: 600; }
+  .fp-modal-md-render tr:nth-child(even) td { background: rgba(110,118,129,0.1); }
+  .fp-modal-md-render hr { border: none; border-top: 2px solid #30363d; margin: 24px 0; }
   .fp-modal-md-render img { max-width: 100%; border-radius: 6px; }
+  .fp-modal-md-render svg { max-width: 100%; height: auto; margin: 8px 0; display: block; }
+  .fp-modal-md-render strong { color: #e6edf3; font-weight: 600; }
+  .fp-modal-md-render em { font-style: italic; }
   .fp-modal-body .fp-modal-image,
   .fp-modal-body .fp-modal-video,
   .fp-modal-body .fp-modal-audio,
@@ -3153,63 +3165,132 @@ function isMdFile(name) {
 let fpModalMdRendered = false;
 
 function renderMarkdown(src) {
-  let h = src
-    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-  // fenced code blocks
-  h = h.replace(/```(\\w*)\\n([\\s\\S]*?)```/g, function(m, lang, code) {
-    return '<pre><code>' + code + '</code></pre>';
+  var placeholders = [];
+  function ph(content) {
+    placeholders.push(content);
+    return '\\x00PH' + (placeholders.length - 1) + '\\x00';
+  }
+  var h = src;
+  // 1. Extract raw HTML/SVG blocks (opening tag at line start, closing tag at line start)
+  h = h.replace(/^(<(?:svg|div|details|figure|picture|section)(?:\\s[^>]*)?>(?:[\\s\\S]*?)\\n<\\/(?:svg|div|details|figure|picture|section)>)/gm, function(m) {
+    return ph(m);
   });
-  // tables
-  h = h.replace(/^(\\|.+\\|)\\n(\\|[\\s:|-]+\\|)\\n((\\|.+\\|\\n?)*)/gm, function(m, hdr, sep, body) {
-    var cols = hdr.split('|').filter(function(c){return c.trim();});
-    var t = '<table><thead><tr>' + cols.map(function(c){return '<th>'+c.trim()+'</th>';}).join('') + '</tr></thead><tbody>';
-    body.trim().split('\\n').forEach(function(row) {
-      var cells = row.split('|').filter(function(c){return c.trim();});
-      t += '<tr>' + cells.map(function(c){return '<td>'+c.trim()+'</td>';}).join('') + '</tr>';
+  // 2. Fenced code blocks (before escaping)
+  h = h.replace(/```(\\w*)\\n([\\s\\S]*?)\\n```/g, function(m, lang, code) {
+    var escaped = code.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    return ph('<pre><code class="language-' + (lang||'') + '">' + escaped + '</code></pre>');
+  });
+  // 3. Inline code (before escaping so backtick content is protected)
+  h = h.replace(/`([^`\\n]+)`/g, function(m, code) {
+    var escaped = code.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    return ph('<code>' + escaped + '</code>');
+  });
+  // 4. Escape remaining HTML
+  h = h.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  // 5. Tables (must be before lists/hr to avoid conflicts with | and ---)
+  h = h.replace(/^(\\|.+\\|)\\n(\\|[\\s:|-]+\\|)\\n((\\|.+\\|(?:\\n|$))*)/gm, function(m, hdr, sep, body) {
+    var cols = hdr.split('|').slice(1, -1);
+    var aligns = sep.split('|').slice(1, -1).map(function(c) {
+      c = c.trim();
+      if (c.startsWith(':') && c.endsWith(':')) return 'center';
+      if (c.endsWith(':')) return 'right';
+      return 'left';
     });
-    return t + '</tbody></table>';
+    var t = '<table><thead><tr>';
+    cols.forEach(function(c, i) {
+      t += '<th align="' + (aligns[i]||'left') + '">' + c.trim() + '</th>';
+    });
+    t += '</tr></thead><tbody>';
+    var rows = body.trim().split('\\n');
+    rows.forEach(function(row) {
+      if (!row.trim()) return;
+      var cells = row.split('|').slice(1, -1);
+      t += '<tr>';
+      cells.forEach(function(c, i) {
+        t += '<td align="' + (aligns[i]||'left') + '">' + c.trim() + '</td>';
+      });
+      t += '</tr>';
+    });
+    t += '</tbody></table>';
+    return ph(t);
   });
-  // blockquotes
-  h = h.replace(/^&gt; (.+)$/gm, '<blockquote>$1</blockquote>');
-  // headings
-  h = h.replace(/^###### (.+)$/gm, '<h6>$1</h6>');
-  h = h.replace(/^##### (.+)$/gm, '<h5>$1</h5>');
-  h = h.replace(/^#### (.+)$/gm, '<h4>$1</h4>');
-  h = h.replace(/^### (.+)$/gm, '<h3>$1</h3>');
-  h = h.replace(/^## (.+)$/gm, '<h2>$1</h2>');
-  h = h.replace(/^# (.+)$/gm, '<h1>$1</h1>');
-  // hr
-  h = h.replace(/^[-*_]{3,}$/gm, '<hr>');
-  // images
+  // 6. Blockquotes (consecutive lines)
+  h = h.replace(/(^&gt; .+$\\n?)+/gm, function(block) {
+    var lines = block.replace(/^&gt; /gm, '').trim();
+    return ph('<blockquote><p>' + lines.replace(/\\n/g, '<br>') + '</p></blockquote>');
+  });
+  // 7. Headings
+  h = h.replace(/^###### (.+)$/gm, function(m,t){ return ph('<h6>'+t+'</h6>'); });
+  h = h.replace(/^##### (.+)$/gm, function(m,t){ return ph('<h5>'+t+'</h5>'); });
+  h = h.replace(/^#### (.+)$/gm, function(m,t){ return ph('<h4>'+t+'</h4>'); });
+  h = h.replace(/^### (.+)$/gm, function(m,t){ return ph('<h3>'+t+'</h3>'); });
+  h = h.replace(/^## (.+)$/gm, function(m,t){ return ph('<h2>'+t+'</h2>'); });
+  h = h.replace(/^# (.+)$/gm, function(m,t){ return ph('<h1>'+t+'</h1>'); });
+  // 8. Horizontal rules (only standalone lines of 3+ dashes/stars/underscores)
+  h = h.replace(/^[ \\t]*[-]{3,}[ \\t]*$/gm, function(m){ return ph('<hr>'); });
+  h = h.replace(/^[ \\t]*[*]{3,}[ \\t]*$/gm, function(m){ return ph('<hr>'); });
+  h = h.replace(/^[ \\t]*[_]{3,}[ \\t]*$/gm, function(m){ return ph('<hr>'); });
+  // 9. Images
   h = h.replace(/!\\[([^\\]]*)\\]\\(([^)]+)\\)/g, '<img src="$2" alt="$1">');
-  // links
+  // 10. Links
   h = h.replace(/\\[([^\\]]+)\\]\\(([^)]+)\\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
-  // bold + italic
+  // 11. Bold + italic (order matters)
   h = h.replace(/\\*\\*\\*(.+?)\\*\\*\\*/g, '<strong><em>$1</em></strong>');
   h = h.replace(/\\*\\*(.+?)\\*\\*/g, '<strong>$1</strong>');
-  h = h.replace(/\\*(.+?)\\*/g, '<em>$1</em>');
-  // inline code (but not inside <pre>)
-  h = h.replace(/`([^`]+)`/g, '<code>$1</code>');
-  // unordered lists
-  h = h.replace(/(^[\\t ]*[-*+] .+$\\n?)+/gm, function(block) {
-    var items = block.trim().split('\\n').map(function(l) {
-      return '<li>' + l.replace(/^[\\t ]*[-*+] /, '') + '</li>';
-    }).join('');
-    return '<ul>' + items + '</ul>';
-  });
-  // ordered lists
-  h = h.replace(/(^[\\t ]*\\d+\\. .+$\\n?)+/gm, function(block) {
-    var items = block.trim().split('\\n').map(function(l) {
-      return '<li>' + l.replace(/^[\\t ]*\\d+\\. /, '') + '</li>';
-    }).join('');
-    return '<ol>' + items + '</ol>';
-  });
-  // checkboxes
+  h = h.replace(/(?<![\\w*])\\*([^*\\n]+)\\*(?![\\w*])/g, '<em>$1</em>');
+  h = h.replace(/&amp;mdash;/g, '\\u2014');
+  h = h.replace(/&amp;rarr;/g, '\\u2192');
+  h = h.replace(/&amp;bull;/g, '\\u2022');
+  // 12. Checkboxes
   h = h.replace(/\\[x\\]/gi, '&#9745;').replace(/\\[ \\]/g, '&#9744;');
-  // paragraphs: wrap remaining loose lines
-  h = h.replace(/^(?!<[a-z/])((?!\\s*$).+)$/gm, '<p>$1</p>');
-  // collapse adjacent blockquotes
-  h = h.replace(/<\\/blockquote>\\s*<blockquote>/g, '<br>');
+  // 13. Unordered lists (consecutive lines starting with - or * or +, not HR)
+  h = h.replace(/(^[ \\t]*[-*+] .+(?:\\n|$))+/gm, function(block) {
+    var items = block.trim().split('\\n').map(function(l) {
+      return '<li>' + l.replace(/^[ \\t]*[-*+] /, '') + '</li>';
+    }).join('\\n');
+    return ph('<ul>' + items + '</ul>');
+  });
+  // 14. Ordered lists
+  h = h.replace(/(^[ \\t]*\\d+\\. .+(?:\\n|$))+/gm, function(block) {
+    var items = block.trim().split('\\n').map(function(l) {
+      return '<li>' + l.replace(/^[ \\t]*\\d+\\. /, '') + '</li>';
+    }).join('\\n');
+    return ph('<ol>' + items + '</ol>');
+  });
+  // 15. Paragraphs: group consecutive non-empty, non-block lines
+  var lines = h.split('\\n');
+  var out = [], para = [];
+  function flushPara() {
+    if (para.length) {
+      out.push('<p>' + para.join('<br>') + '</p>');
+      para = [];
+    }
+  }
+  for (var i = 0; i < lines.length; i++) {
+    var ln = lines[i];
+    if (ln.indexOf('\\x00PH') !== -1 || ln.match(/^\\s*$/)) {
+      flushPara();
+      out.push(ln);
+    } else {
+      para.push(ln);
+    }
+  }
+  flushPara();
+  h = out.join('\\n');
+  // 16. Restore all placeholders (repeat to handle nested placeholders)
+  for (var pass = 0; pass < 3; pass++) {
+    var changed = false;
+    for (var j = 0; j < placeholders.length; j++) {
+      var marker = '\\x00PH' + j + '\\x00';
+      if (h.indexOf(marker) !== -1) {
+        h = h.split(marker).join(placeholders[j]);
+        changed = true;
+      }
+    }
+    if (!changed) break;
+  }
+  // Clean up empty paragraphs
+  h = h.replace(/<p>\\s*<\\/p>/g, '');
   return h;
 }
 
