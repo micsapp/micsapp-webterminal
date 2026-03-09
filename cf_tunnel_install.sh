@@ -3635,6 +3635,7 @@ let fpModalText = '';
 let fpModalIsText = false;
 let fpModalEditing = false;
 let fpModalKind = 'binary';
+let fpModalEncoding = 'utf-8';
 let fpSortBy = 'name';
 let fpSortAsc = true;
 let fpCurrentEntries = [];
@@ -3665,6 +3666,7 @@ function closeFileModal() {
   fpModalIsText = false;
   fpModalEditing = false;
   fpModalKind = 'binary';
+  fpModalEncoding = 'utf-8';
   const img = document.getElementById('fpModalImage');
   const vid = document.getElementById('fpModalVideo');
   const aud = document.getElementById('fpModalAudio');
@@ -3717,6 +3719,7 @@ function setModalEditing(editing) {
     saveBtn.style.display = fpModalEditing ? 'inline-block' : 'none';
     pre.style.display = fpModalEditing ? 'none' : 'block';
     editor.style.display = fpModalEditing ? 'block' : 'none';
+    if (fpModalEncoding !== 'utf-8') note.style.display = 'block';
     return;
   }
 
@@ -3757,7 +3760,7 @@ async function saveEditedFile() {
     const res = await fetch('/api/files/write', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ path_token: fpModalPath, content: newContent }),
+      body: JSON.stringify({ path_token: fpModalPath, content: newContent, encoding: fpModalEncoding }),
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok || data.error) throw new Error(data.error || ('HTTP ' + res.status));
@@ -4014,10 +4017,11 @@ async function previewFile(pathToken, name) {
     fpModalIsText = !!data.is_text;
     fpModalKind = fpModalIsText ? 'text' : 'binary';
     fpModalText = data.content || '';
+    fpModalEncoding = data.encoding || 'utf-8';
     document.getElementById('fpModalContent').textContent = fpModalText;
     document.getElementById('fpModalEditor').value = fpModalText;
     document.getElementById('fpModalNote').textContent = fpModalIsText
-      ? ''
+      ? (fpModalEncoding !== 'utf-8' ? 'Encoding: ' + fpModalEncoding : '')
       : 'Binary file preview is disabled. Use Download.';
     setModalEditing(false);
     document.getElementById('fpModal').classList.add('open');
@@ -4967,24 +4971,30 @@ import os, json
 p = os.path.expanduser({path!r})
 try:
     size = os.path.getsize(p)
-    if size > 102400:
-        print(json.dumps({{"error": "file too large (>100KB)"}}))
+    if size > 2097152:
+        print(json.dumps({{"error": "file too large (>2MB)"}}))
     else:
         with open(p, "rb") as f:
             data = f.read()
         is_text = True
         content = ""
+        encoding = "utf-8"
         if b"\\x00" in data:
             is_text = False
         else:
             try:
                 content = data.decode("utf-8")
             except UnicodeDecodeError:
-                is_text = False
+                try:
+                    content = data.decode("latin-1")
+                    encoding = "latin-1"
+                except Exception:
+                    is_text = False
         print(json.dumps({{
             "is_text": is_text,
             "content": content if is_text else "",
-            "size": size
+            "size": size,
+            "encoding": encoding if is_text else ""
         }}))
 except Exception as ex:
     print(json.dumps({{"error": str(ex)}}))
@@ -5010,7 +5020,7 @@ except Exception as ex:
             return
 
         length = int(self.headers.get("Content-Length", 0))
-        if length > 512 * 1024:
+        if length > 4 * 1024 * 1024:
             self._send_error(413, "payload too large")
             return
         body = self.rfile.read(length)
@@ -5022,19 +5032,23 @@ except Exception as ex:
 
         path = self._path_from_body(username, req)
         content = req.get("content")
+        encoding = req.get("encoding", "utf-8")
+        if encoding not in ("utf-8", "latin-1"):
+            encoding = "utf-8"
         if not path or not isinstance(content, str):
             self._send_error(400, "missing path or content")
             return
 
-        content_size = len(content.encode("utf-8"))
-        if content_size > 102400:
-            self._send_error(400, "file too large (>100KB)")
+        content_size = len(content.encode(encoding, errors="replace"))
+        if content_size > 2097152:
+            self._send_error(400, "file too large (>2MB)")
             return
 
         script = f'''
 import os, json
 p = os.path.expanduser({path!r})
 content = {content!r}
+encoding = {encoding!r}
 try:
     if os.path.isdir(p):
         raise Exception("path is a directory")
@@ -5043,14 +5057,10 @@ try:
             sample = f.read(8192)
         if b"\\x00" in sample:
             raise Exception("binary file cannot be edited here")
-        try:
-            sample.decode("utf-8")
-        except UnicodeDecodeError:
-            raise Exception("non-UTF-8 file cannot be edited here")
 
-    with open(p, "w", encoding="utf-8", newline="") as f:
+    with open(p, "w", encoding=encoding, newline="") as f:
         f.write(content)
-    print(json.dumps({{"ok": True, "size": len(content.encode("utf-8"))}}))
+    print(json.dumps({{"ok": True, "size": os.path.getsize(p)}}))
 except Exception as ex:
     print(json.dumps({{"error": str(ex)}}))
 '''
