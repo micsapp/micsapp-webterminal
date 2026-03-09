@@ -2204,42 +2204,26 @@ function addTab() {
   saveTabs();
 }
 
-async function addDesktopTab() {
+function addDesktopTab() {
   // If a desktop tab already exists, just switch to it
   const existing = tabs.find(t => t.type === 'desktop');
   if (existing) {
     switchTab(existing.id);
     return;
   }
-  showToast('Starting desktop...');
-  try {
-    const res = await fetch('/api/desktop');
-    if (!res.ok) {
-      const d = await res.json().catch(() => ({}));
-      showToast(d.error || 'Failed to start desktop', true);
-      return;
-    }
-    const data = await res.json();
-    if (!data.ok || !data.ws_port) {
-      showToast(data.error || 'Desktop unavailable', true);
-      return;
-    }
-    tabCounter++;
-    const id = 'tab-' + tabCounter;
-    const tab = { id, name: 'Desktop', type: 'desktop', wsPort: data.ws_port };
-    tabs.push(tab);
-    const iframe = document.createElement('iframe');
-    iframe.id = 'frame-' + id;
-    iframe.allow = 'clipboard-read; clipboard-write';
-    iframe.src = '/noVNC/vnc.html?autoconnect=true&resize=scale&reconnect=true&reconnect_delay=1000&path=vnc/' + data.ws_port + '/websockify';
-    document.getElementById('termContainer').appendChild(iframe);
-    switchTab(id);
-    renderTabs();
-    saveTabs();
-    showToast('Desktop ready');
-  } catch (e) {
-    showToast('Desktop error: ' + e.message, true);
-  }
+  tabCounter++;
+  const id = 'tab-' + tabCounter;
+  const tab = { id, name: 'Desktop', type: 'desktop' };
+  tabs.push(tab);
+  const iframe = document.createElement('iframe');
+  iframe.id = 'frame-' + id;
+  iframe.allow = 'clipboard-read; clipboard-write';
+  iframe.src = '/noVNC/vnc.html?autoconnect=true&resize=scale&reconnect=true&reconnect_delay=1000&path=noVNC/websockify';
+  document.getElementById('termContainer').appendChild(iframe);
+  switchTab(id);
+  renderTabs();
+  saveTabs();
+  showToast('Desktop ready');
 }
 
 function closeTab(id, e) {
@@ -3159,7 +3143,7 @@ function init() {
       const slot = Number.isInteger(t.windowSlot) && t.windowSlot >= 0 ? t.windowSlot : idx;
       nextWindowSlot = Math.max(nextWindowSlot, slot + 1);
       const tabObj = { id: 'tab-' + tabCounter, name: t.name || ('Shell ' + tabCounter), windowSlot: slot };
-      if (t.type === 'desktop') { tabObj.type = 'desktop'; tabObj.wsPort = t.wsPort; }
+      if (t.type === 'desktop') { tabObj.type = 'desktop'; }
       tabs.push(tabObj);
     });
     renderTabs();
@@ -3173,8 +3157,8 @@ function init() {
         const iframe = document.createElement('iframe');
         iframe.id = 'frame-' + t.id;
         iframe.allow = 'clipboard-read; clipboard-write';
-        if (t.type === 'desktop' && t.wsPort) {
-          iframe.src = '/noVNC/vnc.html?autoconnect=true&resize=scale&reconnect=true&reconnect_delay=1000&path=vnc/' + t.wsPort + '/websockify';
+        if (t.type === 'desktop') {
+          iframe.src = '/noVNC/vnc.html?autoconnect=true&resize=scale&reconnect=true&reconnect_delay=1000&path=noVNC/websockify';
         } else {
           iframe.src = buildTermUrl(t, { _activeSlots: activeSlots });
         }
@@ -4682,26 +4666,41 @@ def spawn_user_vnc(username, password):
         display_num = vnc_port % 1000 + 100
 
     # Spawn Xtigervnc + xfce4-session via SSH as the user
+    # Kill any stale Xtigervnc on this display before starting
     vnc_cmd = (
-        f"Xtigervnc :{display_num} -rfbport {vnc_port} -localhost=1"
+        f"rm -f /tmp/.X{display_num}-lock /tmp/.X11-unix/X{display_num} 2>/dev/null;"
+        f" unset DISPLAY;"
+        f" Xtigervnc :{display_num} -rfbport {vnc_port} -localhost=1"
         f" -SecurityTypes None -geometry 1920x1080 -depth 24 &"
         f" sleep 1; DISPLAY=:{display_num} xfce4-session"
     )
+    # Clear DISPLAY from env to prevent SSH X11 forwarding interference
+    clean_env = {k: v for k, v in os.environ.items() if k != "DISPLAY"}
     vnc_proc = subprocess.Popen(
         [SSHPASS_BIN, "-p", password, SSH_BIN,
          "-o", "StrictHostKeyChecking=no",
          "-o", "ConnectTimeout=5",
+         "-o", "ForwardX11=no",
          "-o", "PreferredAuthentications=password",
          "-o", "PubkeyAuthentication=no",
          "-o", "PasswordAuthentication=yes",
          "-o", "ServerAliveInterval=30",
          f"{username}@127.0.0.1",
          "bash", "-lc", vnc_cmd],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        env=clean_env,
     )
 
     # Wait for VNC server to be ready
     if not wait_for_ttyd_ready(vnc_port, timeout=6.0):
+        # Capture output for debugging
+        try:
+            out, err = vnc_proc.communicate(timeout=2)
+        except Exception:
+            out, err = b"", b""
+        print(f"[VNC] FAILED for {username} display=:{display_num} port={vnc_port}")
+        print(f"[VNC] stdout: {out[:500]}")
+        print(f"[VNC] stderr: {err[:500]}")
         try:
             vnc_proc.terminate()
         except Exception:
