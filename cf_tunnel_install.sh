@@ -2006,6 +2006,7 @@ APP_HTML = """<!DOCTYPE html>
   <button class="nav-btn nav-hide-mobile" onclick="fullscreen()">&#9974; Fullscreen</button>
   <button class="nav-btn nav-hide-mobile" onclick="addDesktopTab()">&#128421; Desktop</button>
   <button class="nav-btn nav-hide-mobile" onclick="reconnect()">&#8635; Reconnect</button>
+  <button class="nav-btn nav-hide-mobile" onclick="showHelp()">&#10068; Help</button>
   <button class="hamburger" onclick="toggleHamburger()" aria-label="Menu">&#9776;</button>
   <div class="nav-dropdown" id="navDropdown">
     <button class="nav-btn nav-split-mobile" onclick="splitRight();toggleHamburger()" style="display:none">&#9707; Split Right</button>
@@ -2018,6 +2019,7 @@ APP_HTML = """<!DOCTYPE html>
     <button class="nav-btn" onclick="fullscreen();toggleHamburger()">&#9974; Fullscreen</button>
     <button class="nav-btn" onclick="addDesktopTab();toggleHamburger()">&#128421; Desktop</button>
     <button class="nav-btn" onclick="reconnect();toggleHamburger()">&#8635; Reconnect</button>
+    <button class="nav-btn" onclick="showHelp();toggleHamburger()">&#10068; Help</button>
     <button class="nav-btn" onclick="logout()" style="color:#e94560;">&#9211; Logout</button>
   </div>
   <div class="nav-right">
@@ -2217,6 +2219,18 @@ APP_HTML = """<!DOCTYPE html>
   </div>
 </div>
 <input type="file" id="qcImportInput" accept=".json,application/json" style="display:none" onchange="qcImport(this.files);this.value='';">
+
+<div class="fp-modal-overlay" id="helpModal">
+  <div class="fp-modal" style="max-width:860px;height:90vh;max-height:90vh">
+    <div class="fp-modal-header">
+      <span class="fp-modal-title">&#10068; Help &mdash; User Manual</span>
+      <button class="fp-btn" onclick="closeHelp()">&#10005;</button>
+    </div>
+    <div class="fp-modal-body" style="overflow-y:auto">
+      <div id="helpContent" class="fp-modal-md-render" style="display:block"></div>
+    </div>
+  </div>
+</div>
 
 <div id="toast" class="toast"></div>
 
@@ -2754,42 +2768,26 @@ function addTab() {
   saveTabs();
 }
 
-async function addDesktopTab() {
+function addDesktopTab() {
   // If a desktop tab already exists, just switch to it
   const existing = tabs.find(t => t.type === 'desktop');
   if (existing) {
     switchTab(existing.id);
     return;
   }
-  showToast('Starting desktop...');
-  try {
-    const res = await fetch('/api/desktop');
-    if (!res.ok) {
-      const d = await res.json().catch(() => ({}));
-      showToast(d.error || 'Failed to start desktop', true);
-      return;
-    }
-    const data = await res.json();
-    if (!data.ok || !data.ws_port) {
-      showToast(data.error || 'Desktop unavailable', true);
-      return;
-    }
-    tabCounter++;
-    const id = 'tab-' + tabCounter;
-    const tab = { id, name: 'Desktop', type: 'desktop', wsPort: data.ws_port };
-    tabs.push(tab);
-    const iframe = document.createElement('iframe');
-    iframe.id = 'frame-' + id;
-    iframe.allow = 'clipboard-read; clipboard-write';
-    iframe.src = '/noVNC/vnc.html?autoconnect=true&resize=scale&reconnect=true&reconnect_delay=1000&path=vnc/' + data.ws_port + '/websockify';
-    document.getElementById('termContainer').appendChild(iframe);
-    switchTab(id);
-    renderTabs();
-    saveTabs();
-    showToast('Desktop ready');
-  } catch (e) {
-    showToast('Desktop error: ' + e.message, true);
-  }
+  tabCounter++;
+  const id = 'tab-' + tabCounter;
+  const tab = { id, name: 'Desktop', type: 'desktop' };
+  tabs.push(tab);
+  const iframe = document.createElement('iframe');
+  iframe.id = 'frame-' + id;
+  iframe.allow = 'clipboard-read; clipboard-write';
+  iframe.src = '/noVNC/vnc.html?autoconnect=true&resize=scale&reconnect=true&reconnect_delay=1000&path=noVNC/websockify';
+  document.getElementById('termContainer').appendChild(iframe);
+  switchTab(id);
+  renderTabs();
+  saveTabs();
+  showToast('Desktop ready');
 }
 
 function closeTab(id, e) {
@@ -2844,7 +2842,14 @@ function switchTab(id) {
   }
   getAllIframes().forEach(f => f.classList.remove('active'));
   const frame = document.getElementById('frame-' + id);
-  if (frame) frame.classList.add('active');
+  if (frame) {
+    // Lazy-load: if iframe hasn't loaded its real URL yet, load it now
+    if (frame.dataset.lazySrc && (!frame.src || frame.src === 'about:blank' || frame.src.endsWith('/blank'))) {
+      frame.src = frame.dataset.lazySrc;
+      delete frame.dataset.lazySrc;
+    }
+    frame.classList.add('active');
+  }
   // Update tab classes without rebuilding DOM
   document.querySelectorAll('#tabBar .tab').forEach(el => {
     el.classList.toggle('active', el.dataset.tabId === id);
@@ -3519,6 +3524,34 @@ function logout() {
   window.location.href = '/login';
 }
 
+// Help manual
+let helpLoaded = false;
+function showHelp() {
+  const modal = document.getElementById('helpModal');
+  modal.classList.add('open');
+  if (!helpLoaded) {
+    fetch('/api/help').then(r => r.text()).then(md => {
+      document.getElementById('helpContent').innerHTML = renderMarkdown(md);
+      // Rewrite relative image paths to absolute /api/help/images/
+      document.querySelectorAll('#helpContent img').forEach(img => {
+        const src = img.getAttribute('src');
+        if (src && !src.startsWith('http') && !src.startsWith('/')) {
+          img.src = '/api/help/' + src;
+        }
+      });
+      helpLoaded = true;
+    }).catch(() => {
+      document.getElementById('helpContent').innerHTML = '<p style="color:#e94560">Failed to load manual.</p>';
+    });
+  }
+}
+function closeHelp() {
+  document.getElementById('helpModal').classList.remove('open');
+}
+document.getElementById('helpModal').addEventListener('click', (e) => {
+  if (e.target.id === 'helpModal') closeHelp();
+});
+
 // Keyboard shortcuts
 document.addEventListener('keydown', (e) => {
   // Ctrl+Shift+T = new tab
@@ -3709,34 +3742,40 @@ function init() {
       const slot = Number.isInteger(t.windowSlot) && t.windowSlot >= 0 ? t.windowSlot : idx;
       nextWindowSlot = Math.max(nextWindowSlot, slot + 1);
       const tabObj = { id: 'tab-' + tabCounter, name: t.name || ('Shell ' + tabCounter), windowSlot: slot };
-      if (t.type === 'desktop') { tabObj.type = 'desktop'; tabObj.wsPort = t.wsPort; }
+      if (t.type === 'desktop') { tabObj.type = 'desktop'; }
       tabs.push(tabObj);
     });
     renderTabs();
     switchTab(tabs[0].id);
-    // Create iframes with staggered delays so each tmux grouped session
-    // can register before the next one counts existing sessions
-    const hasSplit = restoreSplitState();
+    // Clear stale split state — tab IDs are regenerated on reload so
+    // the saved split tree references are no longer reliable.
+    localStorage.removeItem('ttyd_split');
+    // Create iframes — only load the active tab immediately;
+    // defer hidden tabs to avoid tmux sizing the window to the
+    // smallest (hidden/zero-size) client.
     const activeSlots = tabs.filter(t => t.type !== 'desktop').map(t => t.windowSlot).join(',');
     tabs.forEach((t, i) => {
+      const isActive = (t.id === activeTabId);
       setTimeout(() => {
         const iframe = document.createElement('iframe');
         iframe.id = 'frame-' + t.id;
         iframe.allow = 'clipboard-read; clipboard-write';
-        if (t.type === 'desktop' && t.wsPort) {
-          iframe.src = '/noVNC/vnc.html?autoconnect=true&resize=scale&reconnect=true&reconnect_delay=1000&path=vnc/' + t.wsPort + '/websockify';
+        let url;
+        if (t.type === 'desktop') {
+          url = '/noVNC/vnc.html?autoconnect=true&resize=scale&reconnect=true&reconnect_delay=1000&path=noVNC/websockify';
         } else {
-          iframe.src = buildTermUrl(t, { _activeSlots: activeSlots });
+          url = buildTermUrl(t, { _activeSlots: activeSlots });
+        }
+        if (isActive) {
+          iframe.src = url;
+          iframe.classList.add('active');
+        } else {
+          iframe.dataset.lazySrc = url;
         }
         document.getElementById('termContainer').appendChild(iframe);
-        if (!hasSplit && t.id === activeTabId) iframe.classList.add('active');
-        // After all iframes created, render split layout if restored
-        if (hasSplit && i === tabs.length - 1) {
-          setTimeout(() => { renderSplitLayout(); updateSplitButtons(); }, 100);
-        }
-      }, i * 300);
+      }, isActive ? 0 : i * 300);
     });
-    if (!hasSplit) updateSplitButtons();
+    updateSplitButtons();
   } else {
     addTab();
     updateSplitButtons();
@@ -5164,8 +5203,8 @@ def spawn_user_ttyd(username, password):
     # while the base "main" session (and its windows) persist to keep processes alive.
     # On reconnect, tabs reattach to existing windows instead of creating new ones.
     tmux_cmd = (
-        r'tmux has-session -t main 2>/dev/null || exec tmux new-session -s main \; set -g mouse on \; set -g history-limit 10000 \; set -s set-clipboard on;'
-        r' tmux set -g mouse on 2>/dev/null; tmux set -g history-limit 10000 2>/dev/null; tmux set -s set-clipboard on 2>/dev/null; tmux set -g set-clipboard on 2>/dev/null;'
+        r'tmux has-session -t main 2>/dev/null || exec tmux new-session -s main \; set -g mouse on \; set -g history-limit 10000 \; set -s set-clipboard on \; setw -g aggressive-resize on;'
+        r' tmux set -g mouse on 2>/dev/null; tmux set -g history-limit 10000 2>/dev/null; tmux set -s set-clipboard on 2>/dev/null; tmux set -g set-clipboard on 2>/dev/null; tmux setw -g aggressive-resize on 2>/dev/null;'
         # Parse arg format "SLOT:ACTIVE_SLOTS" (e.g. "0:0,2,3") or plain "SLOT"
         r' RAW="$1"; case "$RAW" in *:*) SLOT="${RAW%%:*}"; ACTIVE="${RAW#*:}" ;; *) SLOT="$RAW"; ACTIVE="" ;; esac;'
         r' case "$SLOT" in (""|*[!0-9]*) SLOT=0 ;; esac;'
@@ -5495,6 +5534,53 @@ class AuthHandler(http.server.BaseHTTPRequestHandler):
         except Exception as e:
             import traceback; traceback.print_exc()
             self._send_error(500, f"failed to start desktop: {e}")
+
+    # --- Help manual handler ---
+
+    def _handle_help_request(self, path):
+        token = get_cookie_token(self.headers)
+        username, _port = verify_token(token)
+        if not username:
+            self._send_error(401, "not authenticated")
+            return
+        doc_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "doc")
+        if path == "/api/help":
+            # Serve manual.md text
+            md_path = os.path.join(doc_dir, "manual.md")
+            try:
+                with open(md_path, "r") as f:
+                    content = f.read()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(content.encode("utf-8"))
+            except FileNotFoundError:
+                self._send_error(404, "manual not found")
+        elif path.startswith("/api/help/images/"):
+            # Serve image files from doc/images/
+            fname = path.split("/api/help/images/", 1)[1]
+            # Security: no path traversal
+            if ".." in fname or "/" in fname:
+                self._send_error(403, "forbidden")
+                return
+            img_path = os.path.join(doc_dir, "images", fname)
+            if not os.path.isfile(img_path):
+                self._send_error(404, "image not found")
+                return
+            ext = fname.rsplit(".", 1)[-1].lower()
+            ct = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
+                  "gif": "image/gif", "svg": "image/svg+xml", "webp": "image/webp"}.get(ext, "application/octet-stream")
+            with open(img_path, "rb") as f:
+                data = f.read()
+            self.send_response(200)
+            self.send_header("Content-Type", ct)
+            self.send_header("Cache-Control", "public, max-age=3600")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        else:
+            self._send_error(404, "not found")
 
     # --- File API handlers ---
 
@@ -6287,6 +6373,8 @@ except Exception as ex:
             self.end_headers()
         elif path == "/api/desktop":
             self._handle_desktop_request(params)
+        elif path == "/api/help" or path.startswith("/api/help/"):
+            self._handle_help_request(path)
         elif path == "/api/files/list":
             self._handle_files_list(params)
         elif path == "/api/files/read":
