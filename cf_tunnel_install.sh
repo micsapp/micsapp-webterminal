@@ -2004,6 +2004,7 @@ APP_HTML = """<!DOCTYPE html>
   <button class="nav-btn nav-hide-mobile" id="settingsBtn" onclick="toggleSettings()">&#9881; Settings</button>
   <button class="nav-btn nav-hide-mobile" id="themeBtn" onclick="toggleThemePanel()">&#9673; Themes</button>
   <button class="nav-btn nav-hide-mobile" onclick="fullscreen()">&#9974; Fullscreen</button>
+  <button class="nav-btn nav-hide-mobile" onclick="addDesktopTab()">&#128421; Desktop</button>
   <button class="nav-btn nav-hide-mobile" onclick="reconnect()">&#8635; Reconnect</button>
   <button class="hamburger" onclick="toggleHamburger()" aria-label="Menu">&#9776;</button>
   <div class="nav-dropdown" id="navDropdown">
@@ -2015,6 +2016,7 @@ APP_HTML = """<!DOCTYPE html>
     <button class="nav-btn" onclick="toggleSettings();toggleHamburger()">&#9881; Settings</button>
     <button class="nav-btn" onclick="toggleThemePanel();toggleHamburger()">&#9673; Themes</button>
     <button class="nav-btn" onclick="fullscreen();toggleHamburger()">&#9974; Fullscreen</button>
+    <button class="nav-btn" onclick="addDesktopTab();toggleHamburger()">&#128421; Desktop</button>
     <button class="nav-btn" onclick="reconnect();toggleHamburger()">&#8635; Reconnect</button>
     <button class="nav-btn" onclick="logout()" style="color:#e94560;">&#9211; Logout</button>
   </div>
@@ -2726,7 +2728,7 @@ function buildTermUrl(tab, overrides) {
 }
 
 function saveTabs() {
-  try { localStorage.setItem('ttyd_tabs', JSON.stringify(tabs.map(t => ({ name: t.name, windowSlot: t.windowSlot })))); } catch(e) {}
+  try { localStorage.setItem('ttyd_tabs', JSON.stringify(tabs.map(t => ({ name: t.name, windowSlot: t.windowSlot, type: t.type || 'shell', wsPort: t.wsPort })))); } catch(e) {}
 }
 
 function nextTabWindowSlot() {
@@ -2750,6 +2752,44 @@ function addTab() {
   }
   renderTabs();
   saveTabs();
+}
+
+async function addDesktopTab() {
+  // If a desktop tab already exists, just switch to it
+  const existing = tabs.find(t => t.type === 'desktop');
+  if (existing) {
+    switchTab(existing.id);
+    return;
+  }
+  showToast('Starting desktop...');
+  try {
+    const res = await fetch('/api/desktop');
+    if (!res.ok) {
+      const d = await res.json().catch(() => ({}));
+      showToast(d.error || 'Failed to start desktop', true);
+      return;
+    }
+    const data = await res.json();
+    if (!data.ok || !data.ws_port) {
+      showToast(data.error || 'Desktop unavailable', true);
+      return;
+    }
+    tabCounter++;
+    const id = 'tab-' + tabCounter;
+    const tab = { id, name: 'Desktop', type: 'desktop', wsPort: data.ws_port };
+    tabs.push(tab);
+    const iframe = document.createElement('iframe');
+    iframe.id = 'frame-' + id;
+    iframe.allow = 'clipboard-read; clipboard-write';
+    iframe.src = '/noVNC/vnc.html?autoconnect=true&resize=scale&reconnect=true&reconnect_delay=1000&path=vnc/' + data.ws_port + '/websockify';
+    document.getElementById('termContainer').appendChild(iframe);
+    switchTab(id);
+    renderTabs();
+    saveTabs();
+    showToast('Desktop ready');
+  } catch (e) {
+    showToast('Desktop error: ' + e.message, true);
+  }
 }
 
 function closeTab(id, e) {
@@ -3668,20 +3708,26 @@ function init() {
       tabCounter++;
       const slot = Number.isInteger(t.windowSlot) && t.windowSlot >= 0 ? t.windowSlot : idx;
       nextWindowSlot = Math.max(nextWindowSlot, slot + 1);
-      tabs.push({ id: 'tab-' + tabCounter, name: t.name || ('Shell ' + tabCounter), windowSlot: slot });
+      const tabObj = { id: 'tab-' + tabCounter, name: t.name || ('Shell ' + tabCounter), windowSlot: slot };
+      if (t.type === 'desktop') { tabObj.type = 'desktop'; tabObj.wsPort = t.wsPort; }
+      tabs.push(tabObj);
     });
     renderTabs();
     switchTab(tabs[0].id);
     // Create iframes with staggered delays so each tmux grouped session
     // can register before the next one counts existing sessions
     const hasSplit = restoreSplitState();
-    const activeSlots = tabs.map(t => t.windowSlot).join(',');
+    const activeSlots = tabs.filter(t => t.type !== 'desktop').map(t => t.windowSlot).join(',');
     tabs.forEach((t, i) => {
       setTimeout(() => {
         const iframe = document.createElement('iframe');
         iframe.id = 'frame-' + t.id;
         iframe.allow = 'clipboard-read; clipboard-write';
-        iframe.src = buildTermUrl(t, { _activeSlots: activeSlots });
+        if (t.type === 'desktop' && t.wsPort) {
+          iframe.src = '/noVNC/vnc.html?autoconnect=true&resize=scale&reconnect=true&reconnect_delay=1000&path=vnc/' + t.wsPort + '/websockify';
+        } else {
+          iframe.src = buildTermUrl(t, { _activeSlots: activeSlots });
+        }
         document.getElementById('termContainer').appendChild(iframe);
         if (!hasSplit && t.id === activeTabId) iframe.classList.add('active');
         // After all iframes created, render split layout if restored
@@ -5050,6 +5096,8 @@ init();
 
 # --- Per-user ttyd instance management ---
 user_instances = {}  # {username: {"port": int, "proc": Popen}}
+user_vnc_instances = {}  # {username: {"vnc_port": int, "ws_port": int, "vnc_proc": Popen, "ws_proc": Popen}}
+WEBSOCKIFY_BIN = os.environ.get("WEBSOCKIFY_BIN") or shutil.which("websockify") or "/home/mli/miniconda3/bin/websockify"
 next_port = int(os.environ.get("TTYD_START_PORT", "7700"))
 
 
@@ -5163,6 +5211,102 @@ def get_user_port(username):
         if info["proc"].poll() is None:
             return info["port"]
         del user_instances[username]
+    return None
+
+
+def spawn_user_vnc(username, password):
+    """Spawn a per-user VNC desktop (Xtigervnc + xfce4 + websockify). Returns ws_port."""
+    # Reuse existing instance if still alive
+    if username in user_vnc_instances:
+        info = user_vnc_instances[username]
+        if info["ws_proc"].poll() is None:
+            return info["ws_port"]
+        _cleanup_vnc(username)
+
+    vnc_port = allocate_port()
+    ws_port = allocate_port()
+
+    # Pick a display number from the VNC port to avoid collisions
+    display_num = vnc_port - 5900
+    if display_num < 1:
+        display_num = vnc_port % 1000 + 100
+
+    # Spawn Xtigervnc + xfce4-session via SSH as the user
+    vnc_cmd = (
+        f"Xtigervnc :{display_num} -rfbport {vnc_port} -localhost=1"
+        f" -SecurityTypes None -geometry 1920x1080 -depth 24 &"
+        f" sleep 1; DISPLAY=:{display_num} xfce4-session"
+    )
+    vnc_proc = subprocess.Popen(
+        [SSHPASS_BIN, "-p", password, SSH_BIN,
+         "-o", "StrictHostKeyChecking=no",
+         "-o", "ConnectTimeout=5",
+         "-o", "PreferredAuthentications=password",
+         "-o", "PubkeyAuthentication=no",
+         "-o", "PasswordAuthentication=yes",
+         "-o", "ServerAliveInterval=30",
+         f"{username}@127.0.0.1",
+         "bash", "-lc", vnc_cmd],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    )
+
+    # Wait for VNC server to be ready
+    if not wait_for_ttyd_ready(vnc_port, timeout=6.0):
+        try:
+            vnc_proc.terminate()
+        except Exception:
+            pass
+        raise RuntimeError("VNC server failed to start")
+
+    # Spawn websockify to bridge WebSocket → VNC
+    ws_proc = subprocess.Popen(
+        [WEBSOCKIFY_BIN, "--heartbeat=30",
+         f"127.0.0.1:{ws_port}", f"localhost:{vnc_port}"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    )
+
+    if not wait_for_ttyd_ready(ws_port, timeout=4.0):
+        try:
+            ws_proc.terminate()
+            vnc_proc.terminate()
+        except Exception:
+            pass
+        raise RuntimeError("websockify failed to start")
+
+    user_vnc_instances[username] = {
+        "vnc_port": vnc_port,
+        "ws_port": ws_port,
+        "vnc_proc": vnc_proc,
+        "ws_proc": ws_proc,
+        "display": display_num,
+        "password": password,
+    }
+    logging.info("VNC desktop started for %s: display=:%d vnc_port=%d ws_port=%d",
+                 username, display_num, vnc_port, ws_port)
+    return ws_port
+
+
+def _cleanup_vnc(username):
+    """Clean up VNC instance for a user."""
+    info = user_vnc_instances.pop(username, None)
+    if not info:
+        return
+    for key in ("ws_proc", "vnc_proc"):
+        proc = info.get(key)
+        if proc:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+
+
+def get_user_vnc_port(username):
+    """Get the websockify port for a user's VNC session, or None."""
+    if username in user_vnc_instances:
+        info = user_vnc_instances[username]
+        if info["ws_proc"].poll() is None:
+            return info["ws_port"]
+        _cleanup_vnc(username)
     return None
 
 
@@ -5327,6 +5471,31 @@ class AuthHandler(http.server.BaseHTTPRequestHandler):
             return parse_path_token(username, token)
         raw = req.get("path", "")
         return os.path.expanduser(raw) if raw else None
+
+# --- Desktop VNC API handler ---
+
+    def _handle_desktop_request(self, params):
+        token = get_cookie_token(self.headers)
+        username, _port = verify_token(token)
+        if not username:
+            self._send_error(401, "not authenticated")
+            return
+        # Check if user already has a running VNC session
+        ws_port = get_user_vnc_port(username)
+        if ws_port:
+            self._send_json(200, {"ok": True, "ws_port": ws_port})
+            return
+        # Need password to spawn via SSH — retrieve from ttyd instance
+        info = user_instances.get(username)
+        if not info or not info.get("password"):
+            self._send_error(400, "no active session – please open a terminal first")
+            return
+        try:
+            ws_port = spawn_user_vnc(username, info["password"])
+            self._send_json(200, {"ok": True, "ws_port": ws_port})
+        except Exception as e:
+            logging.exception("Failed to spawn VNC for %s", username)
+            self._send_error(500, f"failed to start desktop: {e}")
 
     # --- File API handlers ---
 
@@ -6117,6 +6286,8 @@ except Exception as ex:
 
             self.send_response(200)
             self.end_headers()
+        elif path == "/api/desktop":
+            self._handle_desktop_request(params)
         elif path == "/api/files/list":
             self._handle_files_list(params)
         elif path == "/api/files/read":
