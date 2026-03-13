@@ -14,6 +14,65 @@ A browser-based, multi-tenant development environment that runs entirely on your
 
 - **[User Manual](doc/manual.md)** — Getting started, features, and usage guide.
 
+## Quick Start
+
+### Prerequisites
+
+- A Linux server (Ubuntu/Debian recommended) or macOS machine
+- A domain managed by Cloudflare (for the tunnel)
+- `git`, `python3`, `nginx`, `sshpass`, `tmux` (auto-installed on Linux by `deploy.sh`)
+
+### 1. Clone the repository
+
+```bash
+git clone https://github.com/micsapp/micsapp-webterminal.git
+cd micsapp-webterminal
+```
+
+### 2. Set up Cloudflare Tunnel
+
+Run the one-time installer to create a tunnel and configure all components:
+
+```bash
+./cf_tunnel_install.sh --name myterminal --hostname term.example.com --web-terminal --install-service
+```
+
+This will:
+- Install `cloudflared` if not present
+- Create a Cloudflare Tunnel and DNS route
+- Set up nginx, the auth service, and ttyd
+- Install everything as a persistent service
+
+### 3. Deploy services
+
+```bash
+./deploy.sh
+```
+
+This is idempotent — it health-checks each component and only starts what's down. Use `./deploy.sh --status` to check health, or `./deploy.sh --restart` to force-restart everything.
+
+### 4. Create users
+
+```bash
+./create-user.sh
+```
+
+Each system user gets their own isolated terminal session. Repeat for each user you want to grant access.
+
+### 5. Open your terminal
+
+Visit `https://term.example.com` (your configured hostname) in any browser. Log in with the system user credentials and you're in.
+
+### Configuration (optional)
+
+Copy `.env.example` to `.env` and adjust as needed:
+
+```bash
+cp .env.example .env
+```
+
+Key options: `AUTH_PORT`, `SESSION_MAX_AGE`, `COOKIE_SECURE`, and binary path overrides. See `.env.example` for details.
+
 ## How It Works
 
 The system connects your browser to a real Linux shell through a secure chain: **Browser → Cloudflare Tunnel → nginx → auth service → per-user terminal (ttyd)**. Each user logs in once and gets a full terminal session — no additional software to install.
