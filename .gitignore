@@ -4,3 +4,4 @@ __pycache__/
 .auth.pid
 .env
 .claude
+node_modules/
