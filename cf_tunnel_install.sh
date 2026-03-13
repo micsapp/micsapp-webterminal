@@ -1346,12 +1346,16 @@ APP_HTML = """<!DOCTYPE html>
     background: #16213e;
     border: 1px solid #0f3460;
     border-radius: 10px;
-    width: 90%;
-    max-width: 700px;
-    max-height: 80vh;
+    width: 700px;
+    max-width: 95vw;
+    max-height: 95vh;
+    min-width: 320px;
+    min-height: 200px;
     display: flex;
     flex-direction: column;
     box-shadow: 0 20px 60px rgba(0,0,0,0.5);
+    resize: both;
+    overflow: hidden;
   }
   .fp-modal-header {
     display: flex;
@@ -1452,6 +1456,8 @@ APP_HTML = """<!DOCTYPE html>
   .fp-modal-md-render hr { border: none; border-top: 2px solid #30363d; margin: 24px 0; }
   .fp-modal-md-render img { max-width: 100%; border-radius: 6px; }
   .fp-modal-md-render svg { max-width: 100%; height: auto; margin: 8px 0; display: block; }
+  .fp-modal-md-render pre.mermaid { background: none; border: none; padding: 0; text-align: center; }
+  .fp-modal-md-render pre.mermaid svg { display: inline-block; }
   .fp-modal-md-render strong { color: #e6edf3; font-weight: 600; }
   .fp-modal-md-render em { font-style: italic; }
   .fp-modal-body .fp-modal-image,
@@ -2147,6 +2153,7 @@ APP_HTML = """<!DOCTYPE html>
       <button class="fp-btn" onclick="document.getElementById('fpUploadInput').click()">&#8593; Upload</button>
       <button class="fp-btn" onclick="pasteImageFromClipboard()">&#128203; Paste Img</button>
       <button class="fp-btn" onclick="createFolder()">+ Folder</button>
+      <button class="fp-btn" onclick="fetchFiles(fpCurrentPathToken)" title="Refresh">&#8635;</button>
       <button class="fp-btn" onclick="toggleFilePanel()">&#10005;</button>
     </div>
     <div class="fp-breadcrumbs" id="fpBreadcrumbs" ondblclick="startPathEdit()"></div>
@@ -3531,14 +3538,16 @@ function showHelp() {
   modal.classList.add('open');
   if (!helpLoaded) {
     fetch('/api/help').then(r => r.text()).then(md => {
-      document.getElementById('helpContent').innerHTML = renderMarkdown(md);
+      var hc = document.getElementById('helpContent');
+      hc.innerHTML = renderMarkdown(md);
       // Rewrite relative image paths to absolute /api/help/images/
-      document.querySelectorAll('#helpContent img').forEach(img => {
+      hc.querySelectorAll('img').forEach(img => {
         const src = img.getAttribute('src');
         if (src && !src.startsWith('http') && !src.startsWith('/')) {
           img.src = '/api/help/' + src;
         }
       });
+      renderMermaidIn(hc);
       helpLoaded = true;
     }).catch(() => {
       document.getElementById('helpContent').innerHTML = '<p style="color:#e94560">Failed to load manual.</p>';
@@ -3837,19 +3846,23 @@ function isMdFile(name) {
 
 let fpModalMdRendered = false;
 
-function renderMarkdown(src) {
+function renderMarkdown(src, imgBaseUrl) {
   var placeholders = [];
   function ph(content) {
     placeholders.push(content);
     return '\\x00PH' + (placeholders.length - 1) + '\\x00';
   }
-  var h = src;
+  var h = src.replace(/\\r\\n/g, '\\n').replace(/\\r/g, '\\n');
   // 1. Extract raw HTML/SVG blocks (opening tag at line start, closing tag at line start)
   h = h.replace(/^(<(?:svg|div|details|figure|picture|section)(?:\\s[^>]*)?>(?:[\\s\\S]*?)\\n<\\/(?:svg|div|details|figure|picture|section)>)/gm, function(m) {
     return ph(m);
   });
+  // 2a. Mermaid code blocks (render as diagrams, before general fenced blocks)
+  h = h.replace(/^`{3,}[ \\t]*mermaid[ \\t]*\\n([\\s\\S]*?)\\n[ \\t]*`{3,}[ \\t]*$/gm, function(m, code) {
+    return ph('<pre class="mermaid">' + code.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;') + '</pre>');
+  });
   // 2. Fenced code blocks (before escaping)
-  h = h.replace(/```(\\w*)\\n([\\s\\S]*?)\\n```/g, function(m, lang, code) {
+  h = h.replace(/^`{3,}(\\w*)[ \\t]*\\n([\\s\\S]*?)\\n[ \\t]*`{3,}[ \\t]*$/gm, function(m, lang, code) {
     var escaped = code.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
     return ph('<pre><code class="language-' + (lang||'') + '">' + escaped + '</code></pre>');
   });
@@ -3903,8 +3916,13 @@ function renderMarkdown(src) {
   h = h.replace(/^[ \\t]*[-]{3,}[ \\t]*$/gm, function(m){ return ph('<hr>'); });
   h = h.replace(/^[ \\t]*[*]{3,}[ \\t]*$/gm, function(m){ return ph('<hr>'); });
   h = h.replace(/^[ \\t]*[_]{3,}[ \\t]*$/gm, function(m){ return ph('<hr>'); });
-  // 9. Images
-  h = h.replace(/!\\[([^\\]]*)\\]\\(([^)]+)\\)/g, '<img src="$2" alt="$1">');
+  // 9. Images (resolve relative paths via file API when imgBaseUrl provided)
+  h = h.replace(/!\\[([^\\]]*)\\]\\(([^)]+)\\)/g, function(m, alt, src) {
+    if (imgBaseUrl && !/^(?:https?:\\/\\/|data:|\\/)/.test(src)) {
+      src = imgBaseUrl + encodeURIComponent(src);
+    }
+    return '<img src="' + src + '" alt="' + alt + '">';
+  });
   // 10. Links
   h = h.replace(/\\[([^\\]]+)\\]\\(([^)]+)\\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
   // 11. Bold + italic (order matters)
@@ -3967,6 +3985,31 @@ function renderMarkdown(src) {
   return h;
 }
 
+function _mdImgBase() {
+  return fpCurrentPathToken
+    ? '/api/files/download?inline=1&dir_token=' + encodeURIComponent(fpCurrentPathToken) + '&rel='
+    : '';
+}
+
+var _mermaidMod = null, _mermaidLoading = false;
+function renderMermaidIn(container) {
+  var els = container.querySelectorAll('pre.mermaid:not([data-processed])');
+  if (!els.length) return;
+  function doRender() {
+    var targets = container.querySelectorAll('pre.mermaid:not([data-processed])');
+    if (!targets.length) return;
+    _mermaidMod.run({nodes: targets, suppressErrors: true});
+  }
+  if (_mermaidMod) { doRender(); return; }
+  if (_mermaidLoading) { var iv = setInterval(function() { if (_mermaidMod) { clearInterval(iv); doRender(); } }, 200); return; }
+  _mermaidLoading = true;
+  import('https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs').then(function(mod) {
+    _mermaidMod = mod.default;
+    _mermaidMod.initialize({startOnLoad: false, theme: 'dark', securityLevel: 'loose'});
+    doRender();
+  }).catch(function(e) { console.error('Mermaid load failed:', e); _mermaidLoading = false; });
+}
+
 function toggleMdView() {
   fpModalMdRendered = !fpModalMdRendered;
   var btn = document.getElementById('fpModalMdToggle');
@@ -3974,7 +4017,8 @@ function toggleMdView() {
   var pre = document.getElementById('fpModalContent');
   var md = document.getElementById('fpModalMdRender');
   if (fpModalMdRendered) {
-    md.innerHTML = renderMarkdown(fpModalText);
+    md.innerHTML = renderMarkdown(fpModalText, _mdImgBase());
+    renderMermaidIn(md);
     md.style.display = 'block';
     pre.style.display = 'none';
   } else {
@@ -4064,7 +4108,8 @@ function setModalEditing(editing) {
       mdToggle.style.display = 'inline-block';
       mdToggle.innerHTML = fpModalMdRendered ? '&#60;/&#62; Source' : '&#128196; Rendered';
       if (fpModalMdRendered) {
-        mdRender.innerHTML = renderMarkdown(fpModalText);
+        mdRender.innerHTML = renderMarkdown(fpModalText, _mdImgBase());
+        renderMermaidIn(mdRender);
         mdRender.style.display = 'block';
         pre.style.display = 'none';
       } else {
@@ -4150,7 +4195,7 @@ async function fetchFiles(pathToken) {
     if (pathToken) {
       url += '?path_token=' + encodeURIComponent(pathToken);
     }
-    const res = await fetch(url);
+    const res = await fetch(url, {cache: 'no-store'});
     if (!res.ok) throw new Error('HTTP ' + res.status);
     const data = await res.json();
     if (data.error) { list.innerHTML = '<div style="padding:12px;color:#e94560;">' + escHtml(data.error) + '</div>'; return; }
@@ -5765,7 +5810,22 @@ except Exception as ex:
         if not username:
             self._send_error(401, "not authenticated")
             return
-        path = self._path_from_params(username, params)
+        # Support dir_token + rel for relative path resolution (markdown images)
+        dir_token = params.get("dir_token", [""])[0]
+        rel = params.get("rel", [""])[0]
+        if dir_token and rel:
+            dir_path = parse_path_token(username, dir_token)
+            if not dir_path:
+                self._send_error(400, "invalid directory token")
+                return
+            full = os.path.normpath(os.path.join(dir_path, rel))
+            home = os.path.expanduser(f"~{username}")
+            if not (full == home or full.startswith(home + os.sep)):
+                self._send_error(403, "access denied")
+                return
+            path = full
+        else:
+            path = self._path_from_params(username, params)
         inline = params.get("inline", ["0"])[0].lower() in ("1", "true", "yes")
         if not path:
             self._send_error(400, "missing path")
