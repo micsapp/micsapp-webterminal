@@ -1,6 +1,22 @@
-# Web Terminal via Cloudflare Tunnel
+# Web Terminal — Server-Based Development Environment
 
-A browser-based multi-tenant terminal exposed securely over the internet using Cloudflare Tunnel, per-user ttyd instances, nginx, and a custom auth service. Each system user logs in once via the web login page and gets a shell running under their own UID — no double authentication.
+A browser-based, multi-tenant development environment that runs entirely on your server and is accessible from anywhere through a web browser.
+
+## Why Web Terminal?
+
+- **🖥️ Works on any platform** — Windows, macOS, Linux, Chromebook, even a tablet. If it has a browser, you can code.
+- **🌍 Access from anywhere** — Open your terminal from home, office, or on the go. No VPN needed.
+- **💾 All work stays on the server** — Your code, configs, and environment live on the server. Nothing to sync, nothing to lose when you switch devices.
+- **🔒 Auto tunnel, zero firewall hassle** — Uses Cloudflare Tunnel to securely expose the terminal over HTTPS. No port forwarding, no firewall rules, no dynamic DNS — it just works.
+- **👥 Multi-user with isolation** — Each user gets their own shell running under their own system UID. Secure and separated.
+
+## Documentation
+
+- **[User Manual](doc/manual.md)** — Getting started, features, and usage guide.
+
+## How It Works
+
+The system connects your browser to a real Linux shell through a secure chain: **Browser → Cloudflare Tunnel → nginx → auth service → per-user terminal (ttyd)**. Each user logs in once and gets a full terminal session — no additional software to install.
 
 ## Architecture
 
