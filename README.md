@@ -18,7 +18,7 @@ A browser-based, multi-tenant development environment that runs entirely on your
 
 ### Prerequisites
 
-- A Linux server (Ubuntu/Debian recommended) or macOS machine
+- A Linux server (Ubuntu/Debian recommended), macOS machine, or Windows with [WSL2](https://learn.microsoft.com/en-us/windows/wsl/install)
 - A domain managed by Cloudflare (for the tunnel)
 - `git`, `python3`, `nginx`, `sshpass`, `tmux` (auto-installed on Linux by `deploy.sh`)
 
