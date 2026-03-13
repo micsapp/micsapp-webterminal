@@ -1,0 +1,26 @@
+{
+  "name": "micsapp-webterminal-e2e",
+  "version": "1.0.0",
+  "description": "E2E test suite for micsapp-webterminal",
+  "private": true,
+  "scripts": {
+    "cy:open": "cypress open",
+    "cy:run": "cypress run",
+    "cy:run:headed": "cypress run --headed",
+    "cy:run:auth": "cypress run --spec 'cypress/e2e/01-authentication.cy.js'",
+    "cy:run:spa": "cypress run --spec 'cypress/e2e/02-spa-loading.cy.js'",
+    "cy:run:tabs": "cypress run --spec 'cypress/e2e/03-tabs.cy.js'",
+    "cy:run:split": "cypress run --spec 'cypress/e2e/04-split-panes.cy.js'",
+    "cy:run:settings": "cypress run --spec 'cypress/e2e/05-settings-themes.cy.js'",
+    "cy:run:files": "cypress run --spec 'cypress/e2e/06-file-browser.cy.js'",
+    "cy:run:commands": "cypress run --spec 'cypress/e2e/07-quick-commands.cy.js'",
+    "cy:run:keyboard": "cypress run --spec 'cypress/e2e/08-keyboard-shortcuts.cy.js'",
+    "cy:run:security": "cypress run --spec 'cypress/e2e/09-security.cy.js'",
+    "cy:run:mobile": "cypress run --spec 'cypress/e2e/10-mobile.cy.js'",
+    "cy:run:api": "cypress run --spec 'cypress/e2e/11-api-endpoints.cy.js'",
+    "cy:run:desktop": "cypress run --spec 'cypress/e2e/12-desktop-vnc.cy.js'"
+  },
+  "devDependencies": {
+    "cypress": "^13.17.0"
+  }
+}
