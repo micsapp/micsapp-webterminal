@@ -1335,14 +1335,13 @@ APP_HTML = """<!DOCTYPE html>
   .fp-modal-overlay {
     display: none;
     position: fixed;
-    inset: 0;
-    background: rgba(0,0,0,0.6);
     z-index: 200;
-    align-items: center;
-    justify-content: center;
+    pointer-events: none;
+    inset: 0;
   }
-  .fp-modal-overlay.open { display: flex; }
+  .fp-modal-overlay.open { display: flex; align-items: center; justify-content: center; }
   .fp-modal {
+    pointer-events: auto;
     background: #16213e;
     border: 1px solid #0f3460;
     border-radius: 10px;
@@ -1356,6 +1355,19 @@ APP_HTML = """<!DOCTYPE html>
     box-shadow: 0 20px 60px rgba(0,0,0,0.5);
     resize: both;
     overflow: hidden;
+    position: relative;
+  }
+  .fp-modal-overlay.fp-fullscreen .fp-modal {
+    width: 100vw !important;
+    height: 100vh !important;
+    max-width: 100vw;
+    max-height: 100vh;
+    border-radius: 0;
+    resize: none;
+  }
+  .fp-modal-overlay.fp-dragging .fp-modal,
+  .fp-modal-overlay.fp-dragged .fp-modal {
+    position: fixed;
   }
   .fp-modal-header {
     display: flex;
@@ -1363,7 +1375,10 @@ APP_HTML = """<!DOCTYPE html>
     padding: 10px 14px;
     border-bottom: 1px solid #0f3460;
     gap: 8px;
+    cursor: grab;
+    user-select: none;
   }
+  .fp-modal-header:active { cursor: grabbing; }
   .fp-modal-header .fp-modal-title {
     flex: 1;
     color: #e2e2e2;
@@ -2177,6 +2192,7 @@ APP_HTML = """<!DOCTYPE html>
       <button class="fp-btn" id="fpModalEdit" style="display:none">&#9998; Edit</button>
       <button class="fp-btn" id="fpModalSave" style="display:none">&#10003; Save</button>
       <button class="fp-btn" id="fpModalDownload">&#8595; Download</button>
+      <button class="fp-btn" id="fpModalFullscreen" onclick="toggleModalFullscreen()" title="Toggle fullscreen">&#x26F6;</button>
       <button class="fp-btn" onclick="closeFileModal()">&#10005;</button>
     </div>
     <div class="fp-modal-body">
@@ -4059,6 +4075,11 @@ function closeFileModal() {
   mdRender.style.display = 'none';
   mdRender.innerHTML = '';
   document.getElementById('fpModal').classList.remove('open');
+  document.getElementById('fpModal').classList.remove('fp-fullscreen');
+  document.getElementById('fpModal').classList.remove('fp-dragged');
+  const fpMod = document.getElementById('fpModal').querySelector('.fp-modal');
+  fpMod.style.left = ''; fpMod.style.top = '';
+  document.getElementById('fpModalFullscreen').innerHTML = '&#x26F6;';
   document.getElementById('fpModalContent').style.display = 'block';
   document.getElementById('fpModalEditor').style.display = 'none';
   document.getElementById('fpModalNote').style.display = 'none';
@@ -4066,6 +4087,47 @@ function closeFileModal() {
   document.getElementById('fpModalSave').style.display = 'none';
   document.getElementById('fpModalMdToggle').style.display = 'none';
 }
+
+function toggleModalFullscreen() {
+  const overlay = document.getElementById('fpModal');
+  const btn = document.getElementById('fpModalFullscreen');
+  overlay.classList.toggle('fp-fullscreen');
+  overlay.classList.remove('fp-dragged');
+  const fpMod = overlay.querySelector('.fp-modal');
+  fpMod.style.left = ''; fpMod.style.top = '';
+  btn.innerHTML = overlay.classList.contains('fp-fullscreen') ? '&#x2750;' : '&#x26F6;';
+}
+
+// Drag modal by header
+(function() {
+  let dragging = false, startX = 0, startY = 0, origX = 0, origY = 0;
+  const overlay = document.getElementById('fpModal');
+  const header = overlay.querySelector('.fp-modal-header');
+  const modal = overlay.querySelector('.fp-modal');
+
+  header.addEventListener('mousedown', function(e) {
+    if (e.target.tagName === 'BUTTON') return;
+    if (overlay.classList.contains('fp-fullscreen')) return;
+    dragging = true;
+    overlay.classList.add('fp-dragging');
+    const rect = modal.getBoundingClientRect();
+    startX = e.clientX; startY = e.clientY;
+    origX = rect.left; origY = rect.top;
+    e.preventDefault();
+  });
+  document.addEventListener('mousemove', function(e) {
+    if (!dragging) return;
+    const dx = e.clientX - startX, dy = e.clientY - startY;
+    modal.style.left = (origX + dx) + 'px';
+    modal.style.top = (origY + dy) + 'px';
+  });
+  document.addEventListener('mouseup', function() {
+    if (!dragging) return;
+    dragging = false;
+    overlay.classList.remove('fp-dragging');
+    if (modal.style.left || modal.style.top) overlay.classList.add('fp-dragged');
+  });
+})();
 
 function setModalEditing(editing) {
   fpModalEditing = !!editing;
