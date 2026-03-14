@@ -1492,6 +1492,14 @@ APP_HTML = """<!DOCTYPE html>
   .fp-modal-body .fp-modal-pdf {
     height: 70vh;
   }
+  .fp-modal-body .fp-modal-html {
+    display: none;
+    width: 100%;
+    height: 70vh;
+    border-radius: 8px;
+    background: #fff;
+    border: 1px solid #1a4a7a;
+  }
   .toast {
     position: fixed;
     left: 50%;
@@ -2188,6 +2196,7 @@ APP_HTML = """<!DOCTYPE html>
   <div class="fp-modal">
     <div class="fp-modal-header">
       <span class="fp-modal-title" id="fpModalTitle"></span>
+      <button class="fp-btn" id="fpModalHtmlToggle" style="display:none" onclick="toggleHtmlView()">&#9654; Render</button>
       <button class="fp-btn" id="fpModalMdToggle" style="display:none" onclick="toggleMdView()">&#60;/&#62; Source</button>
       <button class="fp-btn" id="fpModalEdit" style="display:none">&#9998; Edit</button>
       <button class="fp-btn" id="fpModalSave" style="display:none">&#10003; Save</button>
@@ -2204,6 +2213,7 @@ APP_HTML = """<!DOCTYPE html>
       <video id="fpModalVideo" class="fp-modal-video" controls preload="metadata"></video>
       <audio id="fpModalAudio" class="fp-modal-audio" controls preload="metadata"></audio>
       <iframe id="fpModalPdf" class="fp-modal-pdf" title="PDF preview"></iframe>
+      <iframe id="fpModalHtml" class="fp-modal-html" sandbox="allow-same-origin" title="HTML preview"></iframe>
     </div>
   </div>
 </div>
@@ -3860,6 +3870,12 @@ function isMdFile(name) {
   return /\\.(md|markdown|mkd|mdx)$/i.test(name || '');
 }
 
+function isHtmlFile(name) {
+  return /\\.(html?|xhtml)$/i.test(name || '');
+}
+
+let fpModalHtmlRendered = false;
+
 let fpModalMdRendered = false;
 
 function renderMarkdown(src, imgBaseUrl) {
@@ -4043,6 +4059,23 @@ function toggleMdView() {
   }
 }
 
+function toggleHtmlView() {
+  fpModalHtmlRendered = !fpModalHtmlRendered;
+  var btn = document.getElementById('fpModalHtmlToggle');
+  btn.innerHTML = fpModalHtmlRendered ? '&#60;/&#62; Source' : '&#9654; Render';
+  var pre = document.getElementById('fpModalContent');
+  var htmlIframe = document.getElementById('fpModalHtml');
+  if (fpModalHtmlRendered) {
+    htmlIframe.srcdoc = fpModalText;
+    htmlIframe.style.display = 'block';
+    pre.style.display = 'none';
+  } else {
+    htmlIframe.style.display = 'none';
+    htmlIframe.removeAttribute('srcdoc');
+    pre.style.display = 'block';
+  }
+}
+
 function getInlinePreviewUrl(pathToken) {
   return '/api/files/download?inline=1&path_token=' + encodeURIComponent(pathToken);
 }
@@ -4055,10 +4088,12 @@ function closeFileModal() {
   fpModalKind = 'binary';
   fpModalEncoding = 'utf-8';
   fpModalMdRendered = false;
+  fpModalHtmlRendered = false;
   const img = document.getElementById('fpModalImage');
   const vid = document.getElementById('fpModalVideo');
   const aud = document.getElementById('fpModalAudio');
   const pdf = document.getElementById('fpModalPdf');
+  const htmlIframe = document.getElementById('fpModalHtml');
   const mdRender = document.getElementById('fpModalMdRender');
   img.style.display = 'none';
   img.src = '';
@@ -4072,6 +4107,8 @@ function closeFileModal() {
   aud.load();
   pdf.style.display = 'none';
   pdf.removeAttribute('src');
+  htmlIframe.style.display = 'none';
+  htmlIframe.removeAttribute('srcdoc');
   mdRender.style.display = 'none';
   mdRender.innerHTML = '';
   document.getElementById('fpModal').classList.remove('open');
@@ -4086,6 +4123,7 @@ function closeFileModal() {
   document.getElementById('fpModalEdit').style.display = 'none';
   document.getElementById('fpModalSave').style.display = 'none';
   document.getElementById('fpModalMdToggle').style.display = 'none';
+  document.getElementById('fpModalHtmlToggle').style.display = 'none';
 }
 
 function toggleModalFullscreen() {
@@ -4143,6 +4181,8 @@ function setModalEditing(editing) {
 
   const mdRender = document.getElementById('fpModalMdRender');
   const mdToggle = document.getElementById('fpModalMdToggle');
+  const htmlIframe = document.getElementById('fpModalHtml');
+  const htmlToggle = document.getElementById('fpModalHtmlToggle');
 
   pre.style.display = 'none';
   editor.style.display = 'none';
@@ -4150,22 +4190,39 @@ function setModalEditing(editing) {
   vid.style.display = 'none';
   aud.style.display = 'none';
   pdf.style.display = 'none';
+  htmlIframe.style.display = 'none';
   mdRender.style.display = 'none';
   editBtn.style.display = 'none';
   saveBtn.style.display = 'none';
   note.style.display = 'none';
   mdToggle.style.display = 'none';
+  htmlToggle.style.display = 'none';
 
   if (fpModalKind === 'text') {
-    const isMd = isMdFile(document.getElementById('fpModalTitle').textContent);
+    const name = document.getElementById('fpModalTitle').textContent;
+    const isMd = isMdFile(name);
+    const isHtml = isHtmlFile(name);
     editBtn.style.display = 'inline-block';
     editBtn.innerHTML = fpModalEditing ? '&#10005; Cancel' : '&#9998; Edit';
     saveBtn.style.display = fpModalEditing ? 'inline-block' : 'none';
     if (fpModalEditing) {
       pre.style.display = 'none';
       mdRender.style.display = 'none';
+      htmlIframe.style.display = 'none';
       editor.style.display = 'block';
       mdToggle.style.display = 'none';
+      htmlToggle.style.display = 'none';
+    } else if (isHtml) {
+      htmlToggle.style.display = 'inline-block';
+      htmlToggle.innerHTML = fpModalHtmlRendered ? '&#60;/&#62; Source' : '&#9654; Render';
+      if (fpModalHtmlRendered) {
+        htmlIframe.srcdoc = fpModalText;
+        htmlIframe.style.display = 'block';
+        pre.style.display = 'none';
+      } else {
+        pre.style.display = 'block';
+        htmlIframe.style.display = 'none';
+      }
     } else if (isMd) {
       mdToggle.style.display = 'inline-block';
       mdToggle.innerHTML = fpModalMdRendered ? '&#60;/&#62; Source' : '&#128196; Rendered';
