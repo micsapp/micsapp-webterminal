@@ -650,8 +650,34 @@ APP_HTML = """<!DOCTYPE html>
     flex-direction: column;
     overflow: hidden;
     z-index: 10;
+    position: relative;
+    min-width: 200px;
+    max-width: 80vw;
   }
   .file-panel.open { display: flex; }
+  .file-panel.fp-fullscreen {
+    position: fixed;
+    inset: 0;
+    top: 0;
+    width: 100% !important;
+    max-width: 100vw !important;
+    z-index: 150;
+    border-right: none;
+  }
+  .fp-resize-handle {
+    position: absolute;
+    top: 0;
+    right: -3px;
+    width: 6px;
+    height: 100%;
+    cursor: col-resize;
+    z-index: 20;
+    background: transparent;
+  }
+  .fp-resize-handle:hover,
+  .fp-resize-handle.active {
+    background: #1a4a7a;
+  }
   .fp-header {
     display: flex;
     align-items: center;
@@ -678,6 +704,45 @@ APP_HTML = """<!DOCTYPE html>
     white-space: nowrap;
   }
   .fp-btn:hover { background: #0f3460; color: #e2e2e2; }
+  .fp-recent-wrap { position: relative; display: inline-block; }
+  .fp-recent-drop {
+    display: none;
+    position: absolute;
+    top: 100%;
+    right: 0;
+    margin-top: 4px;
+    min-width: 220px;
+    max-width: 350px;
+    background: #16213e;
+    border: 1px solid #1a4a7a;
+    border-radius: 6px;
+    box-shadow: 0 4px 16px rgba(0,0,0,0.5);
+    z-index: 200;
+    max-height: 300px;
+    overflow-y: auto;
+  }
+  .fp-recent-drop.open { display: block; }
+  .fp-recent-item {
+    display: block;
+    width: 100%;
+    padding: 7px 10px;
+    background: none;
+    border: none;
+    color: #c0c0e0;
+    font-size: 12px;
+    text-align: left;
+    cursor: pointer;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .fp-recent-item:hover { background: #0f3460; color: #fff; }
+  .fp-recent-empty {
+    padding: 10px;
+    color: #666;
+    font-size: 12px;
+    text-align: center;
+  }
   .fp-breadcrumbs {
     display: flex;
     align-items: center;
@@ -1442,8 +1507,12 @@ APP_HTML = """<!DOCTYPE html>
       position: fixed;
       inset: 0;
       width: 100% !important;
+      max-width: 100vw !important;
       z-index: 150;
       border-right: none;
+    }
+    .file-panel .fp-header {
+      flex-wrap: wrap;
     }
     .fp-item-actions { display: flex; }
 
@@ -1627,9 +1696,16 @@ APP_HTML = """<!DOCTYPE html>
       <button class="fp-btn" onclick="pasteImageFromClipboard()">&#128203; Paste Img</button>
       <button class="fp-btn" onclick="createFolder()">+ Folder</button>
       <button class="fp-btn" onclick="fetchFiles(fpCurrentPathToken)" title="Refresh">&#8635;</button>
+      <button class="fp-btn" id="fpFullscreenBtn" onclick="toggleFilePanelFullscreen()" title="Fullscreen">&#x26F6;</button>
       <button class="fp-btn" onclick="toggleFilePanel()">&#10005;</button>
     </div>
-    <div class="fp-breadcrumbs" id="fpBreadcrumbs" ondblclick="startPathEdit()"></div>
+    <div style="display:flex;align-items:center;gap:0;">
+      <div class="fp-breadcrumbs" id="fpBreadcrumbs" ondblclick="startPathEdit()" style="flex:1;min-width:0;"></div>
+      <div class="fp-recent-wrap" style="flex-shrink:0;padding-right:6px;">
+        <button class="fp-btn" id="fpRecentBtn" onclick="toggleRecentFolders()" title="Recent folders" style="font-size:11px;padding:2px 6px;">&#128338;</button>
+        <div class="fp-recent-drop" id="fpRecentDrop"></div>
+      </div>
+    </div>
     <input type="text" class="fp-path-input" id="fpPathInput" style="display:none"
       onkeydown="if(event.key==='Enter'){commitPathEdit();}else if(event.key==='Escape'){cancelPathEdit();}"
       onblur="cancelPathEdit()"
@@ -1638,6 +1714,7 @@ APP_HTML = """<!DOCTYPE html>
     <div class="fp-list" id="fpList"></div>
     <input type="file" id="fpUploadInput" multiple style="display:none" onchange="handleUpload(this.files);this.value='';">
     <div class="fp-drop-overlay">Drop files to upload</div>
+    <div class="fp-resize-handle" id="fpResizeHandle"></div>
   </div>
   <div class="term-container" id="termContainer"></div>
 </div>
@@ -3266,6 +3343,20 @@ function init() {
     updateSplitButtons();
   }
 
+  // Restore file panel open state
+  if (localStorage.getItem('ttyd_fp_open') === '1') {
+    const panel = document.getElementById('filePanel');
+    panel.classList.add('open');
+    document.getElementById('filesBtn').classList.add('active');
+    if (localStorage.getItem('ttyd_fp_fullscreen') === '1') {
+      panel.classList.add('fp-fullscreen');
+      document.getElementById('fpFullscreenBtn').innerHTML = '&#x2716;';
+      document.getElementById('fpFullscreenBtn').title = 'Exit fullscreen';
+    }
+    const savedToken = localStorage.getItem('ttyd_fp_last_token') || '';
+    fetchFiles(savedToken);
+  }
+
   // Copy modal wiring
   const cmClose = document.getElementById('copyModalClose');
   const cmCopy = document.getElementById('copyModalCopy');
@@ -3296,9 +3387,52 @@ let fpModalIsText = false;
 let fpModalEditing = false;
 let fpModalKind = 'binary';
 let fpModalEncoding = 'utf-8';
-let fpSortBy = 'name';
-let fpSortAsc = true;
+let fpSortBy = localStorage.getItem('ttyd_fp_sort_by') || 'name';
+let fpSortAsc = localStorage.getItem('ttyd_fp_sort_asc') !== '0';
 let fpCurrentEntries = [];
+const FP_RECENT_MAX = 10;
+
+function fpGetRecentFolders() {
+  try { return JSON.parse(localStorage.getItem('ttyd_fp_recent') || '[]'); } catch(e) { return []; }
+}
+function fpAddRecentFolder(path, token) {
+  if (!path || !token) return;
+  let recent = fpGetRecentFolders();
+  recent = recent.filter(r => r.token !== token);
+  recent.unshift({ path: path, token: token });
+  if (recent.length > FP_RECENT_MAX) recent = recent.slice(0, FP_RECENT_MAX);
+  localStorage.setItem('ttyd_fp_recent', JSON.stringify(recent));
+}
+function toggleRecentFolders() {
+  const drop = document.getElementById('fpRecentDrop');
+  const isOpen = drop.classList.toggle('open');
+  if (isOpen) {
+    const recent = fpGetRecentFolders();
+    if (recent.length === 0) {
+      drop.innerHTML = '<div class="fp-recent-empty">No recent folders</div>';
+    } else {
+      drop.innerHTML = '';
+      recent.forEach(r => {
+        const btn = document.createElement('button');
+        btn.className = 'fp-recent-item';
+        btn.textContent = r.path;
+        btn.title = r.path;
+        btn.onclick = () => { drop.classList.remove('open'); fetchFiles(r.token); };
+        drop.appendChild(btn);
+      });
+    }
+    // Close on outside click
+    setTimeout(() => {
+      const closer = (e) => {
+        if (!drop.contains(e.target) && e.target.id !== 'fpRecentBtn') {
+          drop.classList.remove('open');
+          document.removeEventListener('click', closer);
+        }
+      };
+      document.addEventListener('click', closer);
+    }, 0);
+  }
+}
 
 function isImageFile(name) {
   return /\\.(png|jpe?g|gif|webp|bmp|svg|ico|avif|heic)$/i.test(name || '');
@@ -3750,11 +3884,55 @@ function toggleFilePanel() {
   document.getElementById('settingsBtn').classList.remove('active');
   document.getElementById('themePanel').classList.remove('open');
   document.getElementById('themeBtn').classList.remove('active');
+  localStorage.setItem('ttyd_fp_open', open ? '1' : '0');
   if (open) {
     const savedToken = localStorage.getItem('ttyd_fp_last_token') || '';
     fetchFiles(fpCurrentPathToken || savedToken);
   }
 }
+
+function toggleFilePanelFullscreen() {
+  const panel = document.getElementById('filePanel');
+  const isFs = panel.classList.toggle('fp-fullscreen');
+  document.getElementById('fpFullscreenBtn').innerHTML = isFs ? '&#x2716;' : '&#x26F6;';
+  document.getElementById('fpFullscreenBtn').title = isFs ? 'Exit fullscreen' : 'Fullscreen';
+  localStorage.setItem('ttyd_fp_fullscreen', isFs ? '1' : '0');
+}
+
+// File panel resize
+(function() {
+  const handle = document.getElementById('fpResizeHandle');
+  const panel = document.getElementById('filePanel');
+  if (!handle || !panel) return;
+  let startX, startW;
+  handle.addEventListener('mousedown', function(e) {
+    if (panel.classList.contains('fp-fullscreen')) return;
+    e.preventDefault();
+    startX = e.clientX;
+    startW = panel.offsetWidth;
+    handle.classList.add('active');
+    // Block iframes from stealing mouse events and prevent text selection
+    document.body.style.userSelect = 'none';
+    document.querySelectorAll('iframe').forEach(f => f.style.pointerEvents = 'none');
+    const onMove = (e) => {
+      const w = Math.max(200, Math.min(startW + (e.clientX - startX), window.innerWidth * 0.8));
+      panel.style.width = w + 'px';
+    };
+    const onUp = () => {
+      handle.classList.remove('active');
+      document.body.style.userSelect = '';
+      document.querySelectorAll('iframe').forEach(f => f.style.pointerEvents = '');
+      document.removeEventListener('mousemove', onMove);
+      document.removeEventListener('mouseup', onUp);
+      localStorage.setItem('ttyd_fp_width', panel.style.width);
+    };
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup', onUp);
+  });
+  // Restore saved width
+  const savedW = localStorage.getItem('ttyd_fp_width');
+  if (savedW) panel.style.width = savedW;
+})();
 
 async function fetchFiles(pathToken) {
   const list = document.getElementById('fpList');
@@ -3773,6 +3951,7 @@ async function fetchFiles(pathToken) {
     fpParentToken = data.parent_token || '';
     localStorage.setItem('ttyd_fp_last_token', fpCurrentPathToken);
     localStorage.setItem('ttyd_fp_last_path', fpCurrentPath);
+    fpAddRecentFolder(fpCurrentPath, fpCurrentPathToken);
     renderBreadcrumbs(data.breadcrumbs || []);
     fpCurrentEntries = data.entries || [];
     renderSortBar();
@@ -3840,6 +4019,7 @@ async function commitPathEdit() {
     fpParentToken = data.parent_token || '';
     localStorage.setItem('ttyd_fp_last_token', fpCurrentPathToken);
     localStorage.setItem('ttyd_fp_last_path', fpCurrentPath);
+    fpAddRecentFolder(fpCurrentPath, fpCurrentPathToken);
     renderBreadcrumbs(data.breadcrumbs || []);
     fpCurrentEntries = data.entries || [];
     renderSortBar();
@@ -4289,6 +4469,8 @@ function setSortBy(field) {
     fpSortBy = field;
     fpSortAsc = field === 'name';
   }
+  localStorage.setItem('ttyd_fp_sort_by', fpSortBy);
+  localStorage.setItem('ttyd_fp_sort_asc', fpSortAsc ? '1' : '0');
   renderSortBar();
   renderFileList(fpCurrentEntries);
 }
