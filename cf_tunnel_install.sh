@@ -5638,7 +5638,8 @@ class AuthHandler(http.server.BaseHTTPRequestHandler):
             self.send_header(k, v)
         ct = getattr(self, "_resp_content_type", "") or ""
         ct_main = ct.split(";", 1)[0].strip().lower()
-        if ct_main == "text/html":
+        # Skip CSP/XFO for inline file previews so user HTML can load external resources.
+        if ct_main == "text/html" and not getattr(self, "_skip_csp", False):
             for k, v in HTML_ONLY_SECURITY_HEADERS.items():
                 self.send_header(k, v)
         super().end_headers()
@@ -5946,6 +5947,8 @@ except Exception as ex:
         else:
             path = self._path_from_params(username, params)
         inline = params.get("inline", ["0"])[0].lower() in ("1", "true", "yes")
+        if inline:
+            self._skip_csp = True
         if not path:
             self._send_error(400, "missing path")
             return
