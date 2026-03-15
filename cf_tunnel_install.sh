@@ -2213,7 +2213,7 @@ APP_HTML = """<!DOCTYPE html>
       <video id="fpModalVideo" class="fp-modal-video" controls preload="metadata"></video>
       <audio id="fpModalAudio" class="fp-modal-audio" controls preload="metadata"></audio>
       <iframe id="fpModalPdf" class="fp-modal-pdf" title="PDF preview"></iframe>
-      <iframe id="fpModalHtml" class="fp-modal-html" sandbox="allow-same-origin" title="HTML preview"></iframe>
+      <iframe id="fpModalHtml" class="fp-modal-html" title="HTML preview"></iframe>
     </div>
   </div>
 </div>
@@ -4066,12 +4066,12 @@ function toggleHtmlView() {
   var pre = document.getElementById('fpModalContent');
   var htmlIframe = document.getElementById('fpModalHtml');
   if (fpModalHtmlRendered) {
-    htmlIframe.srcdoc = fpModalText;
+    htmlIframe.src = getInlinePreviewUrl(fpModalPath);
     htmlIframe.style.display = 'block';
     pre.style.display = 'none';
   } else {
     htmlIframe.style.display = 'none';
-    htmlIframe.removeAttribute('srcdoc');
+    htmlIframe.src = 'about:blank';
     pre.style.display = 'block';
   }
 }
@@ -4108,7 +4108,7 @@ function closeFileModal() {
   pdf.style.display = 'none';
   pdf.removeAttribute('src');
   htmlIframe.style.display = 'none';
-  htmlIframe.removeAttribute('srcdoc');
+  htmlIframe.src = 'about:blank';
   mdRender.style.display = 'none';
   mdRender.innerHTML = '';
   document.getElementById('fpModal').classList.remove('open');
@@ -4216,7 +4216,7 @@ function setModalEditing(editing) {
       htmlToggle.style.display = 'inline-block';
       htmlToggle.innerHTML = fpModalHtmlRendered ? '&#60;/&#62; Source' : '&#9654; Render';
       if (fpModalHtmlRendered) {
-        htmlIframe.srcdoc = fpModalText;
+        htmlIframe.src = getInlinePreviewUrl(fpModalPath);
         htmlIframe.style.display = 'block';
         pre.style.display = 'none';
       } else {
@@ -5817,8 +5817,8 @@ import os, json
 p = os.path.expanduser({path!r})
 try:
     size = os.path.getsize(p)
-    if size > 2097152:
-        print(json.dumps({{"error": "file too large (>2MB)"}}))
+    if size > 8388608:
+        print(json.dumps({{"error": "file too large (>8MB)"}}))
     else:
         with open(p, "rb") as f:
             data = f.read()
@@ -5866,7 +5866,7 @@ except Exception as ex:
             return
 
         length = int(self.headers.get("Content-Length", 0))
-        if length > 4 * 1024 * 1024:
+        if length > 16 * 1024 * 1024:
             self._send_error(413, "payload too large")
             return
         body = self.rfile.read(length)
@@ -5886,8 +5886,8 @@ except Exception as ex:
             return
 
         content_size = len(content.encode(encoding, errors="replace"))
-        if content_size > 2097152:
-            self._send_error(400, "file too large (>2MB)")
+        if content_size > 8388608:
+            self._send_error(400, "file too large (>8MB)")
             return
 
         script = f'''
@@ -6041,8 +6041,8 @@ except Exception as ex:
             self._send_error(400, "missing path or name")
             return
         length = int(self.headers.get("Content-Length", 0))
-        if length > 10 * 1024 * 1024:
-            self._send_error(413, "file too large (>10MB)")
+        if length > 40 * 1024 * 1024:
+            self._send_error(413, "file too large (>40MB)")
             return
         body = self.rfile.read(length)
         b64data = base64.b64encode(body).decode()
@@ -6351,8 +6351,8 @@ except Exception as ex:
             self._send_error(401, "not authenticated")
             return
         length = int(self.headers.get("Content-Length", 0))
-        if length > 2 * 1024 * 1024:
-            self._send_error(413, "file too large (>2MB)")
+        if length > 8 * 1024 * 1024:
+            self._send_error(413, "file too large (>8MB)")
             return
         body = self.rfile.read(length)
         try:
