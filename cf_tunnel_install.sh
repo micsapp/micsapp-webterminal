@@ -6134,32 +6134,74 @@ except Exception as ex:
         if not path:
             self._send_error(400, "missing path")
             return
+
+        # Get file metadata (size, name) and stream content via a single
+        # subprocess.  The script writes a header line "OK <size> <basename>\n"
+        # then streams raw file bytes — no base64, no full-file buffering.
         script = f'''
-import os, sys, base64
+import os, sys
 p = os.path.expanduser({path!r})
 try:
+    st = os.stat(p)
+    if not os.path.isfile(p):
+        raise IsADirectoryError("not a regular file")
+    name = os.path.basename(p)
+    sys.stdout.buffer.write(f"OK {{st.st_size}} {{name}}\\n".encode())
+    sys.stdout.buffer.flush()
     with open(p, "rb") as f:
-        data = f.read()
-    sys.stdout.buffer.write(b"OK\\n")
-    sys.stdout.buffer.write(base64.b64encode(data))
-    sys.stdout.buffer.write(b"\\n")
-    sys.stdout.buffer.write(os.path.basename(p).encode())
+        while True:
+            chunk = f.read(262144)
+            if not chunk:
+                break
+            sys.stdout.buffer.write(chunk)
+    sys.stdout.buffer.flush()
 except Exception as ex:
-    sys.stdout.buffer.write(b"ERR\\n")
-    sys.stdout.buffer.write(str(ex).encode())
+    sys.stdout.buffer.write(f"ERR {{ex}}\\n".encode())
+    sys.stdout.buffer.flush()
 '''
-        rc, out, err = run_as_user(username, script, timeout=30)
-        if rc != 0:
-            self._send_error(500, err.decode(errors="replace"))
+        info = user_instances.get(username)
+        if not info or "password" not in info:
+            self._send_error(500, "no session")
             return
-        lines = out.split(b"\n", 2)
-        if lines[0] == b"OK" and len(lines) >= 3:
-            try:
-                file_data = base64.b64decode(lines[1])
-            except Exception:
-                self._send_error(500, "decode error")
+        password = info["password"]
+        try:
+            proc = subprocess.Popen(
+                [SSHPASS_BIN, "-p", password, SSH_BIN,
+                 "-o", "StrictHostKeyChecking=no",
+                 "-o", "PubkeyAuthentication=no",
+                 "-o", "ConnectTimeout=5",
+                 f"{username}@127.0.0.1", "python3", "-"],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            proc.stdin.write(script.encode())
+            proc.stdin.close()
+
+            # Read the header line (e.g. "OK 12345 myfile.zip\n")
+            header_line = proc.stdout.readline(4096)
+            if not header_line:
+                proc.terminate()
+                self._send_error(500, "no response from file reader")
                 return
-            fname = lines[2].decode(errors="replace").strip()
+            header = header_line.decode(errors="replace").strip()
+            if header.startswith("ERR "):
+                proc.terminate()
+                self._send_error(500, header[4:])
+                return
+            if not header.startswith("OK "):
+                proc.terminate()
+                self._send_error(500, "unexpected response")
+                return
+
+            # Parse "OK <size> <filename>"
+            parts = header.split(" ", 2)
+            if len(parts) < 3:
+                proc.terminate()
+                self._send_error(500, "bad metadata")
+                return
+            file_size = int(parts[1])
+            fname = parts[2]
+
             ext = os.path.splitext(fname.lower())[1]
             content_type = mimetypes.guess_type(fname)[0]
             if not content_type:
@@ -6188,12 +6230,32 @@ except Exception as ex:
             self.send_header("Content-Type", content_type if inline else "application/octet-stream")
             disp = "inline" if inline else "attachment"
             self.send_header("Content-Disposition", content_disposition(disp, fname))
-            self.send_header("Content-Length", str(len(file_data)))
+            self.send_header("Content-Length", str(file_size))
             self.end_headers()
-            self.wfile.write(file_data)
-        else:
-            msg = lines[1].decode(errors="replace") if len(lines) > 1 else "download failed"
-            self._send_error(500, msg)
+
+            # Stream file content in chunks
+            bytes_sent = 0
+            while bytes_sent < file_size:
+                chunk = proc.stdout.read(min(262144, file_size - bytes_sent))
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+                bytes_sent += len(chunk)
+
+            proc.stdout.close()
+            proc.wait(timeout=5)
+        except BrokenPipeError:
+            # Client disconnected mid-download
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+        except Exception as e:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+            self._send_error(500, str(e))
 
     def _handle_files_upload(self, params):
         username = self._get_authenticated_user()

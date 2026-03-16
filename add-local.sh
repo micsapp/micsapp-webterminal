@@ -12,7 +12,7 @@
 set -euo pipefail
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 NGINX_SRC="${PROJECT_DIR}/nginx/ttyd.conf"
-DEFAULT_LOCAL_PORT=7681
+DEFAULT_LOCAL_PORT=443
 DEFAULT_CERT_DIR="/etc/ssl/cloudflare"
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
