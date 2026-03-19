@@ -3727,28 +3727,38 @@ function toggleModalFullscreen() {
   const header = overlay.querySelector('.fp-modal-header');
   const modal = overlay.querySelector('.fp-modal');
 
-  header.addEventListener('mousedown', function(e) {
+  function endDrag() {
+    if (!dragging) return;
+    dragging = false;
+    header.style.cursor = 'grab';
+    overlay.classList.remove('fp-dragging');
+    if (modal.style.left || modal.style.top) overlay.classList.add('fp-dragged');
+  }
+  header.addEventListener('pointerdown', function(e) {
     if (e.target.tagName === 'BUTTON') return;
     if (overlay.classList.contains('fp-fullscreen')) return;
+    e.preventDefault();
     dragging = true;
+    header.style.cursor = 'grabbing';
     overlay.classList.add('fp-dragging');
     const rect = modal.getBoundingClientRect();
     startX = e.clientX; startY = e.clientY;
     origX = rect.left; origY = rect.top;
-    e.preventDefault();
   });
-  document.addEventListener('mousemove', function(e) {
+  document.addEventListener('pointermove', function(e) {
     if (!dragging) return;
     const dx = e.clientX - startX, dy = e.clientY - startY;
     modal.style.left = (origX + dx) + 'px';
     modal.style.top = (origY + dy) + 'px';
   });
-  document.addEventListener('mouseup', function() {
-    if (!dragging) return;
-    dragging = false;
-    overlay.classList.remove('fp-dragging');
-    if (modal.style.left || modal.style.top) overlay.classList.add('fp-dragged');
-  });
+  document.addEventListener('pointerup', endDrag);
+  document.addEventListener('pointercancel', endDrag);
+  window.addEventListener('blur', endDrag);
+  // After native CSS resize the browser can leave the resize cursor active;
+  // explicitly restore grab cursor whenever the modal size changes.
+  if (typeof ResizeObserver !== 'undefined') {
+    new ResizeObserver(function() { if (!dragging) header.style.cursor = 'grab'; }).observe(modal);
+  }
 })();
 
 function setModalEditing(editing) {
