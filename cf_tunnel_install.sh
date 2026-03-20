@@ -2269,31 +2269,7 @@ APP_HTML = """<!DOCTYPE html>
   <div class="term-container" id="termContainer"></div>
 </div>
 
-<div class="fp-modal-overlay" id="fpModal">
-  <div class="fp-modal">
-    <div class="fp-modal-header">
-      <span class="fp-modal-title" id="fpModalTitle"></span>
-      <button class="fp-btn" id="fpModalHtmlToggle" style="display:none" onclick="toggleHtmlView()">&#9654; Render</button>
-      <button class="fp-btn" id="fpModalMdToggle" style="display:none" onclick="toggleMdView()">&#60;/&#62; Source</button>
-      <button class="fp-btn" id="fpModalEdit" style="display:none">&#9998; Edit</button>
-      <button class="fp-btn" id="fpModalSave" style="display:none">&#10003; Save</button>
-      <button class="fp-btn" id="fpModalDownload">&#8595; Download</button>
-      <button class="fp-btn" id="fpModalFullscreen" onclick="toggleModalFullscreen()" title="Toggle fullscreen">&#x26F6;</button>
-      <button class="fp-btn" onclick="closeFileModal()">&#10005;</button>
-    </div>
-    <div class="fp-modal-body">
-      <div class="fp-modal-note" id="fpModalNote"></div>
-      <pre id="fpModalContent"></pre>
-      <div id="fpModalMdRender" class="fp-modal-md-render"></div>
-      <textarea id="fpModalEditor" spellcheck="false"></textarea>
-      <img id="fpModalImage" class="fp-modal-image" alt="Image preview">
-      <video id="fpModalVideo" class="fp-modal-video" controls preload="metadata"></video>
-      <audio id="fpModalAudio" class="fp-modal-audio" controls preload="metadata"></audio>
-      <iframe id="fpModalPdf" class="fp-modal-pdf" title="PDF preview"></iframe>
-      <iframe id="fpModalHtml" class="fp-modal-html" title="HTML preview"></iframe>
-    </div>
-  </div>
-</div>
+<!-- file preview modals are created dynamically by JS -->
 <div class="qc-overlay" id="qcOverlay">
   <div class="qc-modal">
     <div class="qc-header">
@@ -3931,12 +3907,11 @@ function init() {
 let fpCurrentPath = '~';
 let fpCurrentPathToken = '';
 let fpParentToken = '';
-let fpModalPath = '';
-let fpModalText = '';
-let fpModalIsText = false;
-let fpModalEditing = false;
-let fpModalKind = 'binary';
-let fpModalEncoding = 'utf-8';
+// Multi-window file modal system
+let _fmNextId = 0;
+let _fmTopZ = 200;
+const _fmModals = new Map();
+function _fmEl(st, sel) { return st.el.querySelector(sel); }
 let fpSortBy = localStorage.getItem('ttyd_fp_sort_by') || 'name';
 let fpSortAsc = localStorage.getItem('ttyd_fp_sort_asc') !== '0';
 let fpCurrentEntries = [];
@@ -4007,10 +3982,6 @@ function isMdFile(name) {
 function isHtmlFile(name) {
   return /\\.(html?|xhtml)$/i.test(name || '');
 }
-
-let fpModalHtmlRendered = false;
-
-let fpModalMdRendered = false;
 
 function renderMarkdown(src, imgBaseUrl) {
   var placeholders = [];
@@ -4176,14 +4147,112 @@ function renderMermaidIn(container) {
   }).catch(function(e) { console.error('Mermaid load failed:', e); _mermaidLoading = false; });
 }
 
-function toggleMdView() {
-  fpModalMdRendered = !fpModalMdRendered;
-  var btn = document.getElementById('fpModalMdToggle');
-  btn.innerHTML = fpModalMdRendered ? '&#60;/&#62; Source' : '&#128196; Rendered';
-  var pre = document.getElementById('fpModalContent');
-  var md = document.getElementById('fpModalMdRender');
-  if (fpModalMdRendered) {
-    md.innerHTML = renderMarkdown(fpModalText, _mdImgBase());
+function getInlinePreviewUrl(pathToken) {
+  return '/api/files/download?inline=1&path_token=' + encodeURIComponent(pathToken);
+}
+
+// --- Multi-window file modal: create / close / helpers ---
+function _fmCreate(name) {
+  const id = ++_fmNextId;
+  const z = ++_fmTopZ;
+  const cascade = ((id - 1) % 8) * 25;
+  const overlay = document.createElement('div');
+  overlay.className = 'fp-modal-overlay open';
+  overlay.style.zIndex = z;
+  overlay.innerHTML =
+    '<div class="fp-modal" style="transform:translate(' + cascade + 'px,' + cascade + 'px)">' +
+      '<div class="fp-modal-header">' +
+        '<span class="fp-modal-title"></span>' +
+        '<button class="fp-btn fp-btn-html-toggle" style="display:none">&#9654; Render</button>' +
+        '<button class="fp-btn fp-btn-md-toggle" style="display:none">&#60;/&#62; Source</button>' +
+        '<button class="fp-btn fp-btn-edit" style="display:none">&#9998; Edit</button>' +
+        '<button class="fp-btn fp-btn-save" style="display:none">&#10003; Save</button>' +
+        '<button class="fp-btn fp-btn-download">&#8595; Download</button>' +
+        '<button class="fp-btn fp-btn-fullscreen" title="Toggle fullscreen">&#x26F6;</button>' +
+        '<button class="fp-btn fp-btn-close">&#10005;</button>' +
+      '</div>' +
+      '<div class="fp-modal-body">' +
+        '<div class="fp-modal-note"></div>' +
+        '<pre></pre>' +
+        '<div class="fp-modal-md-render"></div>' +
+        '<textarea spellcheck="false"></textarea>' +
+        '<img class="fp-modal-image" alt="Image preview">' +
+        '<video class="fp-modal-video" controls preload="metadata"></video>' +
+        '<audio class="fp-modal-audio" controls preload="metadata"></audio>' +
+        '<iframe class="fp-modal-pdf" title="PDF preview"></iframe>' +
+        '<iframe class="fp-modal-html" title="HTML preview"></iframe>' +
+      '</div>' +
+    '</div>';
+
+  const st = {
+    id: id, el: overlay, path: '', text: '', isText: false, editing: false,
+    kind: 'binary', encoding: 'utf-8', mdRendered: false, htmlRendered: false
+  };
+  _fmModals.set(id, st);
+  document.body.appendChild(overlay);
+
+  // Bring to front on click (attach to .fp-modal since overlay is pointer-events:none)
+  _fmEl(st, '.fp-modal').addEventListener('pointerdown', function() { overlay.style.zIndex = ++_fmTopZ; });
+
+  // Wire buttons
+  _fmEl(st, '.fp-btn-close').onclick = function() { _fmClose(id); };
+  _fmEl(st, '.fp-btn-fullscreen').onclick = function() { _fmToggleFullscreen(st); };
+  _fmEl(st, '.fp-btn-md-toggle').onclick = function() { _fmToggleMd(st); };
+  _fmEl(st, '.fp-btn-html-toggle').onclick = function() { _fmToggleHtml(st); };
+  _fmEl(st, '.fp-modal-title').textContent = name || '';
+
+  // Per-modal drag
+  _fmInitDrag(st);
+  return st;
+}
+
+function _fmClose(id) {
+  const st = _fmModals.get(id);
+  if (!st) return;
+  const vid = _fmEl(st, '.fp-modal-video');
+  const aud = _fmEl(st, '.fp-modal-audio');
+  const htmlIf = _fmEl(st, '.fp-modal-html');
+  _fmEl(st, '.fp-modal-image').src = '';
+  vid.pause(); vid.removeAttribute('src'); vid.load();
+  aud.pause(); aud.removeAttribute('src'); aud.load();
+  _fmEl(st, '.fp-modal-pdf').removeAttribute('src');
+  htmlIf.src = 'about:blank';
+  if (st._dragAbort) st._dragAbort.abort();
+  if (st._dragRo) st._dragRo.disconnect();
+  st.el.remove();
+  _fmModals.delete(id);
+}
+
+function _fmCloseTop() {
+  let topId = null, topZ = -1;
+  for (const [id, st] of _fmModals) {
+    const z = parseInt(st.el.style.zIndex) || 0;
+    if (z > topZ) { topZ = z; topId = id; }
+  }
+  if (topId !== null) _fmClose(topId);
+}
+
+// Legacy wrappers (Escape key calls closeFileModal)
+function closeFileModal() { _fmCloseTop(); }
+
+function _fmToggleFullscreen(st) {
+  const overlay = st.el;
+  const modal = _fmEl(st, '.fp-modal');
+  const btn = _fmEl(st, '.fp-btn-fullscreen');
+  overlay.classList.toggle('fp-fullscreen');
+  overlay.classList.remove('fp-dragged');
+  modal.style.left = ''; modal.style.top = ''; modal.style.transform = '';
+  btn.innerHTML = overlay.classList.contains('fp-fullscreen') ? '&#x2750;' : '&#x26F6;';
+}
+
+function _fmToggleMd(st) {
+  st.mdRendered = !st.mdRendered;
+  var btn = _fmEl(st, '.fp-btn-md-toggle');
+  btn.innerHTML = st.mdRendered ? '&#60;/&#62; Source' : '&#128196; Rendered';
+  var pre = _fmEl(st, '.fp-modal-body pre');
+  var md = _fmEl(st, '.fp-modal-md-render');
+  if (st.mdRendered) {
+    md.innerHTML = renderMarkdown(st.text, _mdImgBase());
     renderMermaidIn(md);
     md.style.display = 'block';
     pre.style.display = 'none';
@@ -4193,14 +4262,14 @@ function toggleMdView() {
   }
 }
 
-function toggleHtmlView() {
-  fpModalHtmlRendered = !fpModalHtmlRendered;
-  var btn = document.getElementById('fpModalHtmlToggle');
-  btn.innerHTML = fpModalHtmlRendered ? '&#60;/&#62; Source' : '&#9654; Render';
-  var pre = document.getElementById('fpModalContent');
-  var htmlIframe = document.getElementById('fpModalHtml');
-  if (fpModalHtmlRendered) {
-    htmlIframe.src = getInlinePreviewUrl(fpModalPath);
+function _fmToggleHtml(st) {
+  st.htmlRendered = !st.htmlRendered;
+  var btn = _fmEl(st, '.fp-btn-html-toggle');
+  btn.innerHTML = st.htmlRendered ? '&#60;/&#62; Source' : '&#9654; Render';
+  var pre = _fmEl(st, '.fp-modal-body pre');
+  var htmlIframe = _fmEl(st, '.fp-modal-html');
+  if (st.htmlRendered) {
+    htmlIframe.src = getInlinePreviewUrl(st.path);
     htmlIframe.style.display = 'block';
     pre.style.display = 'none';
   } else {
@@ -4210,72 +4279,13 @@ function toggleHtmlView() {
   }
 }
 
-function getInlinePreviewUrl(pathToken) {
-  return '/api/files/download?inline=1&path_token=' + encodeURIComponent(pathToken);
-}
-
-function closeFileModal() {
-  fpModalPath = '';
-  fpModalText = '';
-  fpModalIsText = false;
-  fpModalEditing = false;
-  fpModalKind = 'binary';
-  fpModalEncoding = 'utf-8';
-  fpModalMdRendered = false;
-  fpModalHtmlRendered = false;
-  const img = document.getElementById('fpModalImage');
-  const vid = document.getElementById('fpModalVideo');
-  const aud = document.getElementById('fpModalAudio');
-  const pdf = document.getElementById('fpModalPdf');
-  const htmlIframe = document.getElementById('fpModalHtml');
-  const mdRender = document.getElementById('fpModalMdRender');
-  img.style.display = 'none';
-  img.src = '';
-  vid.pause();
-  vid.style.display = 'none';
-  vid.removeAttribute('src');
-  vid.load();
-  aud.pause();
-  aud.style.display = 'none';
-  aud.removeAttribute('src');
-  aud.load();
-  pdf.style.display = 'none';
-  pdf.removeAttribute('src');
-  htmlIframe.style.display = 'none';
-  htmlIframe.src = 'about:blank';
-  mdRender.style.display = 'none';
-  mdRender.innerHTML = '';
-  document.getElementById('fpModal').classList.remove('open');
-  document.getElementById('fpModal').classList.remove('fp-fullscreen');
-  document.getElementById('fpModal').classList.remove('fp-dragged');
-  const fpMod = document.getElementById('fpModal').querySelector('.fp-modal');
-  fpMod.style.left = ''; fpMod.style.top = '';
-  document.getElementById('fpModalFullscreen').innerHTML = '&#x26F6;';
-  document.getElementById('fpModalContent').style.display = 'block';
-  document.getElementById('fpModalEditor').style.display = 'none';
-  document.getElementById('fpModalNote').style.display = 'none';
-  document.getElementById('fpModalEdit').style.display = 'none';
-  document.getElementById('fpModalSave').style.display = 'none';
-  document.getElementById('fpModalMdToggle').style.display = 'none';
-  document.getElementById('fpModalHtmlToggle').style.display = 'none';
-}
-
-function toggleModalFullscreen() {
-  const overlay = document.getElementById('fpModal');
-  const btn = document.getElementById('fpModalFullscreen');
-  overlay.classList.toggle('fp-fullscreen');
-  overlay.classList.remove('fp-dragged');
-  const fpMod = overlay.querySelector('.fp-modal');
-  fpMod.style.left = ''; fpMod.style.top = '';
-  btn.innerHTML = overlay.classList.contains('fp-fullscreen') ? '&#x2750;' : '&#x26F6;';
-}
-
-// Drag modal by header
-(function() {
+function _fmInitDrag(st) {
   let dragging = false, startX = 0, startY = 0, origX = 0, origY = 0;
-  const overlay = document.getElementById('fpModal');
-  const header = overlay.querySelector('.fp-modal-header');
-  const modal = overlay.querySelector('.fp-modal');
+  const ac = new AbortController();
+  st._dragAbort = ac;
+  const overlay = st.el;
+  const header = _fmEl(st, '.fp-modal-header');
+  const modal = _fmEl(st, '.fp-modal');
 
   function endDrag() {
     if (!dragging) return;
@@ -4291,42 +4301,42 @@ function toggleModalFullscreen() {
     dragging = true;
     header.style.cursor = 'grabbing';
     overlay.classList.add('fp-dragging');
-    const rect = modal.getBoundingClientRect();
+    modal.style.transform = '';
+    var rect = modal.getBoundingClientRect();
     startX = e.clientX; startY = e.clientY;
     origX = rect.left; origY = rect.top;
   });
   document.addEventListener('pointermove', function(e) {
     if (!dragging) return;
-    const dx = e.clientX - startX, dy = e.clientY - startY;
+    var dx = e.clientX - startX, dy = e.clientY - startY;
     modal.style.left = (origX + dx) + 'px';
     modal.style.top = (origY + dy) + 'px';
-  });
-  document.addEventListener('pointerup', endDrag);
-  document.addEventListener('pointercancel', endDrag);
-  window.addEventListener('blur', endDrag);
-  // After native CSS resize the browser can leave the resize cursor active;
-  // explicitly restore grab cursor whenever the modal size changes.
+  }, { signal: ac.signal });
+  document.addEventListener('pointerup', endDrag, { signal: ac.signal });
+  document.addEventListener('pointercancel', endDrag, { signal: ac.signal });
+  window.addEventListener('blur', endDrag, { signal: ac.signal });
   if (typeof ResizeObserver !== 'undefined') {
-    new ResizeObserver(function() { if (!dragging) header.style.cursor = 'grab'; }).observe(modal);
+    var ro = new ResizeObserver(function() { if (!dragging) header.style.cursor = 'grab'; });
+    ro.observe(modal);
+    st._dragRo = ro;
   }
-})();
+}
 
-function setModalEditing(editing) {
-  fpModalEditing = !!editing;
-  const pre = document.getElementById('fpModalContent');
-  const editor = document.getElementById('fpModalEditor');
-  const editBtn = document.getElementById('fpModalEdit');
-  const saveBtn = document.getElementById('fpModalSave');
-  const note = document.getElementById('fpModalNote');
-  const img = document.getElementById('fpModalImage');
-  const vid = document.getElementById('fpModalVideo');
-  const aud = document.getElementById('fpModalAudio');
-  const pdf = document.getElementById('fpModalPdf');
-
-  const mdRender = document.getElementById('fpModalMdRender');
-  const mdToggle = document.getElementById('fpModalMdToggle');
-  const htmlIframe = document.getElementById('fpModalHtml');
-  const htmlToggle = document.getElementById('fpModalHtmlToggle');
+function _fmSetEditing(st, editing) {
+  st.editing = !!editing;
+  var pre = _fmEl(st, '.fp-modal-body pre');
+  var editor = _fmEl(st, '.fp-modal-body textarea');
+  var editBtn = _fmEl(st, '.fp-btn-edit');
+  var saveBtn = _fmEl(st, '.fp-btn-save');
+  var note = _fmEl(st, '.fp-modal-note');
+  var img = _fmEl(st, '.fp-modal-image');
+  var vid = _fmEl(st, '.fp-modal-video');
+  var aud = _fmEl(st, '.fp-modal-audio');
+  var pdf = _fmEl(st, '.fp-modal-pdf');
+  var mdRender = _fmEl(st, '.fp-modal-md-render');
+  var mdToggle = _fmEl(st, '.fp-btn-md-toggle');
+  var htmlIframe = _fmEl(st, '.fp-modal-html');
+  var htmlToggle = _fmEl(st, '.fp-btn-html-toggle');
 
   pre.style.display = 'none';
   editor.style.display = 'none';
@@ -4342,94 +4352,68 @@ function setModalEditing(editing) {
   mdToggle.style.display = 'none';
   htmlToggle.style.display = 'none';
 
-  if (fpModalKind === 'text') {
-    const name = document.getElementById('fpModalTitle').textContent;
-    const isMd = isMdFile(name);
-    const isHtml = isHtmlFile(name);
+  if (st.kind === 'text') {
+    var fname = _fmEl(st, '.fp-modal-title').textContent;
+    var isMd = isMdFile(fname);
+    var isHtml = isHtmlFile(fname);
     editBtn.style.display = 'inline-block';
-    editBtn.innerHTML = fpModalEditing ? '&#10005; Cancel' : '&#9998; Edit';
-    saveBtn.style.display = fpModalEditing ? 'inline-block' : 'none';
-    if (fpModalEditing) {
-      pre.style.display = 'none';
-      mdRender.style.display = 'none';
-      htmlIframe.style.display = 'none';
+    editBtn.innerHTML = st.editing ? '&#10005; Cancel' : '&#9998; Edit';
+    saveBtn.style.display = st.editing ? 'inline-block' : 'none';
+    if (st.editing) {
       editor.style.display = 'block';
-      mdToggle.style.display = 'none';
-      htmlToggle.style.display = 'none';
     } else if (isHtml) {
       htmlToggle.style.display = 'inline-block';
-      htmlToggle.innerHTML = fpModalHtmlRendered ? '&#60;/&#62; Source' : '&#9654; Render';
-      if (fpModalHtmlRendered) {
-        htmlIframe.src = getInlinePreviewUrl(fpModalPath);
+      htmlToggle.innerHTML = st.htmlRendered ? '&#60;/&#62; Source' : '&#9654; Render';
+      if (st.htmlRendered) {
+        htmlIframe.src = getInlinePreviewUrl(st.path);
         htmlIframe.style.display = 'block';
-        pre.style.display = 'none';
       } else {
         pre.style.display = 'block';
-        htmlIframe.style.display = 'none';
       }
     } else if (isMd) {
       mdToggle.style.display = 'inline-block';
-      mdToggle.innerHTML = fpModalMdRendered ? '&#60;/&#62; Source' : '&#128196; Rendered';
-      if (fpModalMdRendered) {
-        mdRender.innerHTML = renderMarkdown(fpModalText, _mdImgBase());
+      mdToggle.innerHTML = st.mdRendered ? '&#60;/&#62; Source' : '&#128196; Rendered';
+      if (st.mdRendered) {
+        mdRender.innerHTML = renderMarkdown(st.text, _mdImgBase());
         renderMermaidIn(mdRender);
         mdRender.style.display = 'block';
-        pre.style.display = 'none';
       } else {
         pre.style.display = 'block';
-        mdRender.style.display = 'none';
       }
     } else {
       pre.style.display = 'block';
     }
-    if (fpModalEncoding !== 'utf-8') note.style.display = 'block';
+    if (st.encoding !== 'utf-8') note.style.display = 'block';
     return;
   }
-
-  if (fpModalKind === 'image') {
-    img.style.display = 'block';
-    return;
-  }
-
-  if (fpModalKind === 'video') {
-    vid.style.display = 'block';
-    return;
-  }
-
-  if (fpModalKind === 'audio') {
-    aud.style.display = 'block';
-    return;
-  }
-
-  if (fpModalKind === 'pdf') {
-    pdf.style.display = 'block';
-    return;
-  }
-
+  if (st.kind === 'image') { img.style.display = 'block'; return; }
+  if (st.kind === 'video') { vid.style.display = 'block'; return; }
+  if (st.kind === 'audio') { aud.style.display = 'block'; return; }
+  if (st.kind === 'pdf') { pdf.style.display = 'block'; return; }
   note.style.display = 'block';
 }
 
-function startEditFile() {
-  if (!fpModalIsText) return;
-  document.getElementById('fpModalEditor').value = fpModalText;
-  setModalEditing(true);
+function _fmStartEdit(st) {
+  if (!st.isText) return;
+  _fmEl(st, '.fp-modal-body textarea').value = st.text;
+  _fmSetEditing(st, true);
 }
 
-async function saveEditedFile() {
-  if (!fpModalIsText || !fpModalPath) return;
-  const editor = document.getElementById('fpModalEditor');
-  const newContent = editor.value;
+async function _fmSave(st) {
+  if (!st.isText || !st.path) return;
+  var editor = _fmEl(st, '.fp-modal-body textarea');
+  var newContent = editor.value;
   try {
-    const res = await fetch('/api/files/write', {
+    var res = await fetch('/api/files/write', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ path_token: fpModalPath, content: newContent, encoding: fpModalEncoding }),
+      body: JSON.stringify({ path_token: st.path, content: newContent, encoding: st.encoding }),
     });
-    const data = await res.json().catch(() => ({}));
+    var data = await res.json().catch(function() { return {}; });
     if (!res.ok || data.error) throw new Error(data.error || ('HTTP ' + res.status));
-    fpModalText = newContent;
-    document.getElementById('fpModalContent').textContent = fpModalText;
-    setModalEditing(false);
+    st.text = newContent;
+    _fmEl(st, '.fp-modal-body pre').textContent = st.text;
+    _fmSetEditing(st, false);
     fetchFiles(fpCurrentPathToken);
   } catch (e) {
     await modalAlert('Save failed: ' + e.message, 'Save Failed');
@@ -4660,128 +4644,97 @@ function renderFileList(entries) {
 }
 
 async function previewFile(pathToken, name) {
-  const lowerName = (name || '').toLowerCase();
-  fpModalPath = pathToken;
-  document.getElementById('fpModalTitle').textContent = name;
-  document.getElementById('fpModalDownload').onclick = () => downloadFile(pathToken, name);
-  document.getElementById('fpModalSave').onclick = saveEditedFile;
-  document.getElementById('fpModalEdit').onclick = () => {
-    if (fpModalEditing) {
-      document.getElementById('fpModalEditor').value = fpModalText;
-      setModalEditing(false);
+  var lowerName = (name || '').toLowerCase();
+  var st = _fmCreate(name);
+  st.path = pathToken;
+
+  _fmEl(st, '.fp-btn-download').onclick = function() { downloadFile(pathToken, name); };
+  _fmEl(st, '.fp-btn-save').onclick = function() { _fmSave(st); };
+  _fmEl(st, '.fp-btn-edit').onclick = function() {
+    if (st.editing) {
+      _fmEl(st, '.fp-modal-body textarea').value = st.text;
+      _fmSetEditing(st, false);
     } else {
-      startEditFile();
+      _fmStartEdit(st);
     }
   };
 
   if (isImageFile(lowerName)) {
-    fpModalKind = 'image';
-    fpModalIsText = false;
-    document.getElementById('fpModalNote').textContent = '';
-    document.getElementById('fpModalImage').src = getInlinePreviewUrl(pathToken);
-    setModalEditing(false);
-    document.getElementById('fpModal').classList.add('open');
+    st.kind = 'image'; st.isText = false;
+    _fmEl(st, '.fp-modal-note').textContent = '';
+    _fmEl(st, '.fp-modal-image').src = getInlinePreviewUrl(pathToken);
+    _fmSetEditing(st, false);
     return;
   }
 
   if (isVideoFile(lowerName)) {
-    fpModalKind = 'video';
-    fpModalIsText = false;
-    document.getElementById('fpModalNote').textContent = '';
-    const vid = document.getElementById('fpModalVideo');
-    vid.src = getInlinePreviewUrl(pathToken);
-    setModalEditing(false);
-    document.getElementById('fpModal').classList.add('open');
+    st.kind = 'video'; st.isText = false;
+    _fmEl(st, '.fp-modal-note').textContent = '';
+    _fmEl(st, '.fp-modal-video').src = getInlinePreviewUrl(pathToken);
+    _fmSetEditing(st, false);
     return;
   }
 
   if (isAudioFile(lowerName)) {
-    fpModalKind = 'audio';
-    fpModalIsText = false;
-    document.getElementById('fpModalNote').textContent = '';
-    const aud = document.getElementById('fpModalAudio');
-    aud.src = getInlinePreviewUrl(pathToken);
-    setModalEditing(false);
-    document.getElementById('fpModal').classList.add('open');
+    st.kind = 'audio'; st.isText = false;
+    _fmEl(st, '.fp-modal-note').textContent = '';
+    _fmEl(st, '.fp-modal-audio').src = getInlinePreviewUrl(pathToken);
+    _fmSetEditing(st, false);
     return;
   }
 
   if (isPdfFile(lowerName)) {
-    const url = getInlinePreviewUrl(pathToken);
-    // Mobile: don't embed PDFs (commonly blocked/blank). Open directly in a new tab.
+    var url = getInlinePreviewUrl(pathToken);
     if (isCoarsePointer && isCoarsePointer()) {
+      _fmClose(st.id);
       openInNewTab(url);
       showToast('Opened PDF in a new tab', false);
       return;
     }
-    fpModalKind = 'pdf';
-    fpModalIsText = false;
-    const note = document.getElementById('fpModalNote');
-    note.textContent = '';
-    note.innerHTML = '';
-    const pdf = document.getElementById('fpModalPdf');
-
-    // iOS Safari often cannot display PDFs inside iframes and shows "content is blocked".
-    // Keep the user in the modal and provide explicit open actions instead.
+    st.kind = 'pdf'; st.isText = false;
+    var note = _fmEl(st, '.fp-modal-note');
+    note.textContent = ''; note.innerHTML = '';
+    var pdf = _fmEl(st, '.fp-modal-pdf');
     if (isIOS()) {
-      const msg = document.createElement('div');
+      var msg = document.createElement('div');
       msg.textContent = 'PDF preview is blocked by iOS Safari when embedded. Open it instead:';
       msg.style.marginBottom = '8px';
-
-      const row = document.createElement('div');
-      row.style.display = 'flex';
-      row.style.gap = '8px';
-      row.style.flexWrap = 'wrap';
-
-      const aNew = document.createElement('a');
-      aNew.className = 'fp-btn';
-      aNew.href = url;
-      aNew.target = '_blank';
-      aNew.rel = 'noopener';
+      var row = document.createElement('div');
+      row.style.display = 'flex'; row.style.gap = '8px'; row.style.flexWrap = 'wrap';
+      var aNew = document.createElement('a');
+      aNew.className = 'fp-btn'; aNew.href = url; aNew.target = '_blank'; aNew.rel = 'noopener';
       aNew.textContent = 'Open in new tab';
-
-      const aHere = document.createElement('a');
-      aHere.className = 'fp-btn';
-      aHere.href = url;
-      aHere.textContent = 'Open here';
-
-      row.appendChild(aNew);
-      row.appendChild(aHere);
-      note.appendChild(msg);
-      note.appendChild(row);
-
-      // Don't try to set iframe src on iOS.
+      var aHere = document.createElement('a');
+      aHere.className = 'fp-btn'; aHere.href = url; aHere.textContent = 'Open here';
+      row.appendChild(aNew); row.appendChild(aHere);
+      note.appendChild(msg); note.appendChild(row);
       pdf.removeAttribute('src');
-      setModalEditing(false);
-      document.getElementById('fpModal').classList.add('open');
+      _fmSetEditing(st, false);
       return;
     }
-
-    // Non-iOS: render inline in modal.
     pdf.src = url;
-    setModalEditing(false);
-    document.getElementById('fpModal').classList.add('open');
+    _fmSetEditing(st, false);
     return;
   }
 
   try {
-    const res = await fetch('/api/files/read?path_token=' + encodeURIComponent(pathToken));
+    var res = await fetch('/api/files/read?path_token=' + encodeURIComponent(pathToken));
     if (!res.ok) throw new Error('HTTP ' + res.status);
-    const data = await res.json();
-    if (data.error) { await modalAlert(data.error, 'Preview'); return; }
-    fpModalIsText = !!data.is_text;
-    fpModalKind = fpModalIsText ? 'text' : 'binary';
-    fpModalText = data.content || '';
-    fpModalEncoding = data.encoding || 'utf-8';
-    fpModalMdRendered = fpModalIsText && isMdFile(name);
-    document.getElementById('fpModalContent').textContent = fpModalText;
-    document.getElementById('fpModalEditor').value = fpModalText;
-    document.getElementById('fpModalNote').textContent = fpModalIsText
-      ? (fpModalEncoding !== 'utf-8' ? 'Encoding: ' + fpModalEncoding : '')
+    var data = await res.json();
+    if (data.error) { _fmClose(st.id); await modalAlert(data.error, 'Preview'); return; }
+    st.isText = !!data.is_text;
+    st.kind = st.isText ? 'text' : 'binary';
+    st.text = data.content || '';
+    st.encoding = data.encoding || 'utf-8';
+    st.mdRendered = st.isText && isMdFile(name);
+    _fmEl(st, '.fp-modal-body pre').textContent = st.text;
+    _fmEl(st, '.fp-modal-body textarea').value = st.text;
+    _fmEl(st, '.fp-modal-note').textContent = st.isText
+      ? (st.encoding !== 'utf-8' ? 'Encoding: ' + st.encoding : '')
       : 'Binary file preview is disabled. Use Download.';
-    setModalEditing(false);
-    document.getElementById('fpModal').classList.add('open');
+    _fmSetEditing(st, false);
   } catch (e) {
+    _fmClose(st.id);
     await modalAlert('Cannot preview: ' + e.message, 'Preview Failed');
   }
 }
