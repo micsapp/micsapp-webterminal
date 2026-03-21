@@ -3923,7 +3923,7 @@ function fpGetRecentFolders() {
 function fpAddRecentFolder(path, token) {
   if (!path || !token) return;
   let recent = fpGetRecentFolders();
-  recent = recent.filter(r => r.token !== token);
+  recent = recent.filter(r => r.path !== path);
   recent.unshift({ path: path, token: token });
   if (recent.length > FP_RECENT_MAX) recent = recent.slice(0, FP_RECENT_MAX);
   localStorage.setItem('ttyd_fp_recent', JSON.stringify(recent));
@@ -3942,7 +3942,7 @@ function toggleRecentFolders() {
         btn.className = 'fp-recent-item';
         btn.textContent = r.path;
         btn.title = r.path;
-        btn.onclick = () => { drop.classList.remove('open'); fetchFiles(r.token); };
+        btn.onclick = () => { drop.classList.remove('open'); fetchFiles(null, r.path); };
         drop.appendChild(btn);
       });
     }
@@ -4478,13 +4478,15 @@ function toggleFilePanelFullscreen() {
   if (savedW) panel.style.width = savedW;
 })();
 
-async function fetchFiles(pathToken) {
+async function fetchFiles(pathToken, rawPath) {
   const list = document.getElementById('fpList');
   list.innerHTML = '<div style="padding:20px;color:#7a7a9e;text-align:center;">Loading...</div>';
   try {
     let url = '/api/files/list';
     if (pathToken) {
       url += '?path_token=' + encodeURIComponent(pathToken);
+    } else if (rawPath) {
+      url += '?path=' + encodeURIComponent(rawPath);
     }
     const res = await fetch(url, {cache: 'no-store'});
     if (!res.ok) throw new Error('HTTP ' + res.status);
