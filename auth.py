@@ -1653,6 +1653,13 @@ APP_HTML = """<!DOCTYPE html>
     </div>
   </div>
   <button class="apply-btn" onclick="applySettings()">Apply to All Tabs</button>
+  <div style="flex-basis:100%;border-top:1px solid #0f3460;padding-top:14px;margin-top:4px;">
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;">
+      <span style="color:#7a7a9e;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">API Tokens</span>
+      <button class="fp-btn" onclick="apiTokenCreate()" style="font-size:12px;padding:3px 8px;">+ New Token</button>
+    </div>
+    <div id="apiTokenList" style="display:flex;flex-direction:column;gap:6px;max-height:200px;overflow-y:auto;"></div>
+  </div>
 </div>
 
 <div class="settings-panel" id="themePanel">
@@ -2554,7 +2561,8 @@ function dlgOpen(opts) {
 
   dlgKind = opts.kind || 'alert';
   titleEl.textContent = opts.title || (dlgKind === 'confirm' ? 'Confirm' : dlgKind === 'prompt' ? 'Input' : 'Notice');
-  bodyEl.textContent = opts.message || '';
+  if (opts.html) bodyEl.innerHTML = opts.message || '';
+  else bodyEl.textContent = opts.message || '';
 
   const showInput = dlgKind === 'prompt';
   inputEl.style.display = showInput ? 'block' : 'none';
@@ -3026,6 +3034,91 @@ function toggleSettings() {
   document.getElementById('themeBtn').classList.remove('active');
   document.getElementById('filePanel').classList.remove('open');
   document.getElementById('filesBtn').classList.remove('active');
+  if (open) apiTokenLoad();
+}
+
+// --- API Token management ---
+function _escHtml(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+async function apiTokenLoad() {
+  const list = document.getElementById('apiTokenList');
+  if (!list) return;
+  list.innerHTML = '<span style="color:#7a7a9e;font-size:12px;">Loading…</span>';
+  try {
+    const r = await fetch('/api/tokens');
+    if (!r.ok) { list.innerHTML = '<span style="color:#7a7a9e;font-size:12px;">Failed to load tokens.</span>'; return; }
+    const data = await r.json();
+    const tokens = data.tokens || [];
+    if (tokens.length === 0) {
+      list.innerHTML = '<span style="color:#7a7a9e;font-size:12px;">No tokens yet. Create one to enable scripted API access.</span>';
+      return;
+    }
+    list.innerHTML = tokens.map(t => {
+      const created = new Date(t.created_at * 1000).toLocaleDateString();
+      const used = t.last_used ? new Date(t.last_used * 1000).toLocaleDateString() : 'never';
+      return `<div style="display:flex;align-items:center;gap:8px;background:#0f3460;border-radius:6px;padding:6px 10px;">
+        <span style="flex:1;font-size:13px;color:#e2e2e2;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${_escHtml(t.name)}</span>
+        <span style="font-size:11px;color:#7a7a9e;flex-shrink:0;">created ${_escHtml(created)}</span>
+        <span style="font-size:11px;color:#7a7a9e;flex-shrink:0;">used ${_escHtml(used)}</span>
+        <button class="fp-btn" style="font-size:11px;padding:2px 7px;color:#e94560;flex-shrink:0;" onclick="apiTokenRevoke(${JSON.stringify(t.name)})">Revoke</button>
+      </div>`;
+    }).join('');
+  } catch(e) {
+    list.innerHTML = '<span style="color:#7a7a9e;font-size:12px;">Error loading tokens.</span>';
+  }
+}
+
+async function apiTokenCreate() {
+  const name = await modalPrompt('Token name (e.g. "ci-bot", "laptop"):', 'New API Token');
+  if (!name || !name.trim()) return;
+  try {
+    const r = await fetch('/api/tokens', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({name: name.trim()})
+    });
+    const data = await r.json();
+    if (!r.ok) { await modalAlert(data.error || 'Failed to create token', 'Error'); return; }
+    const token = data.token;
+    const origin = window.location.origin;
+    const curlEx = `curl -H "Authorization: Bearer ${token}" ${origin}/api/files/list`;
+    await dlgOpen({
+      kind: 'alert',
+      title: 'New API Token: ' + name.trim(),
+      html: true,
+      message:
+        '<b style="color:#e94560;">Copy this token now — it won\'t be shown again.</b><br><br>' +
+        '<label style="color:#7a7a9e;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">Token</label><br>' +
+        `<textarea style="width:100%;height:56px;background:#0a1628;border:1px solid #0f3460;color:#e2e2e2;font-family:monospace;font-size:11px;padding:6px;border-radius:6px;resize:vertical;margin-top:4px;" onclick="this.select()" readonly>${_escHtml(token)}</textarea><br><br>` +
+        '<label style="color:#7a7a9e;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">Example curl</label><br>' +
+        `<textarea style="width:100%;height:44px;background:#0a1628;border:1px solid #0f3460;color:#e2e2e2;font-family:monospace;font-size:11px;padding:6px;border-radius:6px;resize:vertical;margin-top:4px;" onclick="this.select()" readonly>${_escHtml(curlEx)}</textarea>`
+    });
+    apiTokenLoad();
+  } catch(e) {
+    await modalAlert('Error creating token: ' + e.message, 'Error');
+  }
+}
+
+async function apiTokenRevoke(name) {
+  const ok = await modalConfirm(`Revoke token "${name}"? This cannot be undone.`, 'Revoke Token', true);
+  if (!ok) return;
+  try {
+    const r = await fetch('/api/tokens/revoke', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({name})
+    });
+    if (!r.ok) {
+      const data = await r.json();
+      await modalAlert(data.error || 'Failed to revoke token', 'Error');
+      return;
+    }
+    apiTokenLoad();
+  } catch(e) {
+    await modalAlert('Error: ' + e.message, 'Error');
+  }
 }
 
 function toggleThemePanel() {
@@ -5166,6 +5259,68 @@ def get_cookie_token(headers):
     return ""
 
 
+# --- API Token helpers ---
+
+API_TOKENS_DIR = os.path.join(BASE_DIR, ".api_tokens")
+
+
+def _ensure_tokens_dir():
+    os.makedirs(API_TOKENS_DIR, mode=0o700, exist_ok=True)
+
+
+def _tokens_file(username):
+    safe = "".join(c for c in username if c.isalnum() or c in "-_.")
+    return os.path.join(API_TOKENS_DIR, f"{safe}.json")
+
+
+def _load_api_tokens(username):
+    try:
+        with open(_tokens_file(username), "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError, ValueError):
+        return []
+
+
+def _save_api_tokens(username, tokens):
+    _ensure_tokens_dir()
+    path = _tokens_file(username)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(tokens, f, indent=2)
+    os.replace(tmp, path)
+
+
+def _make_api_token(username):
+    """Generate a new raw token string (username:rand:hmac). Not stored server-side."""
+    rand = secrets.token_hex(32)
+    msg = f"{username}:{rand}"
+    sig = hmac.new(SECRET_KEY.encode(), msg.encode(), hashlib.sha256).hexdigest()
+    return f"{username}:{rand}:{sig}"
+
+
+def _verify_api_token(token_str):
+    """Verify HMAC signature and confirm token exists. Returns username or None."""
+    try:
+        parts = token_str.split(":", 2)
+        if len(parts) != 3:
+            return None
+        username, rand, sig = parts
+        msg = f"{username}:{rand}"
+        expected = hmac.new(SECRET_KEY.encode(), msg.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(sig, expected):
+            return None
+        token_hash = hashlib.sha256(token_str.encode()).hexdigest()
+        tokens = _load_api_tokens(username)
+        for t in tokens:
+            if t.get("hash") == token_hash:
+                t["last_used"] = int(time.time())
+                _save_api_tokens(username, tokens)
+                return username
+        return None
+    except Exception:
+        return None
+
+
 def make_path_token(username, path):
     """Return opaque signed token for an absolute path."""
     raw_path = os.path.abspath(path)
@@ -5259,7 +5414,13 @@ class AuthHandler(http.server.BaseHTTPRequestHandler):
     def _get_authenticated_user(self):
         token = get_cookie_token(self.headers)
         username, _port = verify_token(token)
-        return username
+        if username:
+            return username
+        # Fallback: bearer token for API / scripting access
+        auth = self.headers.get("Authorization", "")
+        if auth.lower().startswith("bearer "):
+            return _verify_api_token(auth[7:].strip())
+        return None
 
     def _send_json(self, code, data):
         body = json.dumps(data).encode()
@@ -6159,6 +6320,78 @@ except Exception as ex:
         else:
             self._send_json(200, data)
 
+    # --- API Tokens handlers ---
+
+    def _handle_tokens_list(self):
+        username = self._get_authenticated_user()
+        if not username:
+            self._send_error(401, "not authenticated")
+            return
+        tokens = _load_api_tokens(username)
+        safe = [{"name": t["name"], "created_at": t.get("created_at", 0),
+                 "last_used": t.get("last_used")} for t in tokens]
+        self._send_json(200, {"tokens": safe})
+
+    def _handle_tokens_create(self):
+        # Token creation requires a browser session (not a bearer token itself)
+        cookie_token = get_cookie_token(self.headers)
+        username, _ = verify_token(cookie_token)
+        if not username:
+            self._send_error(403, "token creation requires a browser session")
+            return
+        length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(length)
+        try:
+            req = json.loads(body)
+        except Exception:
+            self._send_error(400, "invalid json")
+            return
+        name = req.get("name", "").strip()
+        if not name:
+            self._send_error(400, "name is required")
+            return
+        if len(name) > 80:
+            self._send_error(400, "name too long (max 80 chars)")
+            return
+        tokens = _load_api_tokens(username)
+        if any(t["name"] == name for t in tokens):
+            self._send_error(409, "a token with that name already exists")
+            return
+        raw_token = _make_api_token(username)
+        token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
+        tokens.append({
+            "name": name,
+            "hash": token_hash,
+            "created_at": int(time.time()),
+            "last_used": None,
+        })
+        _save_api_tokens(username, tokens)
+        self._send_json(200, {"token": raw_token})
+
+    def _handle_tokens_revoke(self):
+        username = self._get_authenticated_user()
+        if not username:
+            self._send_error(401, "not authenticated")
+            return
+        length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(length)
+        try:
+            req = json.loads(body)
+        except Exception:
+            self._send_error(400, "invalid json")
+            return
+        name = req.get("name", "").strip()
+        if not name:
+            self._send_error(400, "name is required")
+            return
+        tokens = _load_api_tokens(username)
+        new_tokens = [t for t in tokens if t["name"] != name]
+        if len(new_tokens) == len(tokens):
+            self._send_error(404, "token not found")
+            return
+        _save_api_tokens(username, new_tokens)
+        self._send_json(200, {"ok": True})
+
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
@@ -6205,6 +6438,19 @@ except Exception as ex:
             token = get_cookie_token(self.headers)
             username, token_port = verify_token(token)
             if not username:
+                # Try bearer token (API scripting — no port binding, no /ut/ access)
+                auth = self.headers.get("Authorization", "")
+                if auth.lower().startswith("bearer "):
+                    api_user = _verify_api_token(auth[7:].strip())
+                    if api_user:
+                        # Bearer tokens cannot authorize /ut/ terminal access
+                        if (self.headers.get("X-TTYD-Port") or "").strip():
+                            self.send_response(401)
+                            self.end_headers()
+                            return
+                        self.send_response(200)
+                        self.end_headers()
+                        return
                 self.send_response(401)
                 self.end_headers()
                 return
@@ -6241,6 +6487,8 @@ except Exception as ex:
             self._handle_quick_commands_list()
         elif path == "/api/quick-commands/export":
             self._handle_quick_commands_export()
+        elif path == "/api/tokens":
+            self._handle_tokens_list()
         else:
             self.send_response(404)
             self.end_headers()
@@ -6304,6 +6552,10 @@ except Exception as ex:
             self._handle_quick_commands_action()
         elif path == "/api/quick-commands/import":
             self._handle_quick_commands_import()
+        elif path == "/api/tokens":
+            self._handle_tokens_create()
+        elif path == "/api/tokens/revoke":
+            self._handle_tokens_revoke()
         else:
             self.send_response(404)
             self.end_headers()
