@@ -42,6 +42,46 @@ Browser-based multi-tenant terminal: sshd -> ttyd (per-user, ports 7700+) -> ngi
 
 After changing auth.py, deploy.sh detects the change and restarts the auth service. Users must log out and back in to pick up frontend (HTML/JS) changes since the SPA is served on login.
 
+## HTTP API
+
+### POST /api/exec — Shell command execution
+
+Runs a shell command as the authenticated user and returns stdout/stderr/exit code. Requires a session cookie or bearer token.
+
+**Request:**
+```json
+{
+  "command": "ls -la /tmp",
+  "timeout": 30,
+  "cwd": "/home/mli",
+  "stdin": "optional stdin data"
+}
+```
+- `command` (required): shell command to run via `bash -c`.
+- `timeout` (optional, default 30): max seconds (1–300).
+- `cwd` (optional): working directory, defaults to user's home.
+- `stdin` (optional): string piped to stdin.
+- Request body max 64 KB.
+
+**Response (200):**
+```json
+{
+  "stdout": "...",
+  "stderr": "...",
+  "exit_code": 0
+}
+```
+
+**Example with bearer token:**
+```bash
+curl -X POST https://host/api/exec \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{"command": "whoami"}'
+```
+
+**Errors:** 400 (bad request), 401 (not authenticated), 408 (timeout), 413 (body too large), 500 (execution error).
+
 ## Environment Variables
 
 See `.env.example`. Key ones: `AUTH_PORT` (default 7682), `SESSION_MAX_AGE`, `COOKIE_SECURE`, binary path overrides (`TTYD_BIN`, `SSHPASS_BIN`, `SSH_BIN`).

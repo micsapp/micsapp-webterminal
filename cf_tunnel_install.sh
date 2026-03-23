@@ -3639,7 +3639,7 @@ async function apiTokenCreate() {
       title: 'New API Token: ' + name.trim(),
       html: true,
       message:
-        '<b style="color:#e94560;">Copy this token now — it won\'t be shown again.</b><br><br>' +
+        '<b style="color:#e94560;">Copy this token now — it won\\\'t be shown again.</b><br><br>' +
         '<label style="color:#7a7a9e;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">Token</label><br>' +
         `<textarea style="width:100%;height:56px;background:#0a1628;border:1px solid #0f3460;color:#e2e2e2;font-family:monospace;font-size:11px;padding:6px;border-radius:6px;resize:vertical;margin-top:4px;" onclick="this.select()" readonly>${_escHtml(token)}</textarea><br><br>` +
         '<label style="color:#7a7a9e;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">Example curl</label><br>' +
