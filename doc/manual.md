@@ -207,6 +207,69 @@ On smaller screens the interface adapts automatically:
 
 ---
 
+## API Tokens
+
+The Settings panel includes an **API Tokens** section at the bottom for creating bearer tokens that allow programmatic (non-browser) access to the HTTP API.
+
+### Creating a Token
+
+1. Open **Settings** in the toolbar
+2. Scroll to the **API Tokens** section
+3. Click **+ New Token** and enter a descriptive name (e.g. "ci-bot", "laptop")
+4. Copy the token immediately -- it is shown only once
+
+### Using a Token
+
+Pass the token in an `Authorization` header:
+
+```
+Authorization: Bearer <your-token>
+```
+
+Tokens authenticate the same API endpoints as a browser session (file operations, quick commands, etc.) but cannot access terminal WebSocket connections (`/ut/...`).
+
+### Revoking a Token
+
+Click **Revoke** next to any token in the Settings panel to permanently delete it.
+
+---
+
+## Shell Command Execution (`/api/exec`)
+
+The `/api/exec` endpoint lets you run shell commands remotely and receive structured output. Requires a session cookie or bearer token.
+
+### Request
+
+```bash
+curl -X POST https://host/api/exec \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{"command": "ls -la /tmp"}'
+```
+
+| Field | Required | Default | Description |
+|-------|----------|---------|-------------|
+| `command` | Yes | -- | Shell command to run (via `bash -c`) |
+| `timeout` | No | 30 | Max seconds to wait (1--300) |
+| `cwd` | No | User's home | Working directory |
+| `stdin` | No | -- | String piped to stdin |
+
+Request body is limited to 64 KB.
+
+### Response
+
+```json
+{
+  "stdout": "...",
+  "stderr": "...",
+  "exit_code": 0
+}
+```
+
+Stdout and stderr are each capped at 512 KB. Commands that exceed the timeout return HTTP 408.
+
+---
+
 ## Tips
 
 - **Session persistence** -- your shell processes run inside tmux. Even if you close the browser, processes keep running. Reopen the same tabs to reconnect.
