@@ -6927,6 +6927,51 @@ except Exception as ex:
         _save_api_tokens(username, new_tokens)
         self._send_json(200, {"ok": True})
 
+    # --- Exec handler ---
+
+    def _handle_exec(self):
+        username = self._get_authenticated_user()
+        if not username:
+            self._send_error(401, "not authenticated")
+            return
+        length = int(self.headers.get("Content-Length", 0))
+        if length > 64 * 1024:
+            self._send_error(413, "request body too large")
+            return
+        body = self.rfile.read(length) if length else b""
+        try:
+            req = json.loads(body)
+        except Exception:
+            self._send_error(400, "invalid json")
+            return
+        command = req.get("command", "").strip()
+        if not command:
+            self._send_error(400, "command is required")
+            return
+        timeout = max(1, min(int(req.get("timeout", 30)), 300))
+        cwd = req.get("cwd") or os.path.expanduser(f"~{username}")
+        if cwd.startswith("~"):
+            cwd = os.path.expanduser(f"~{username}") + cwd[1:]
+        stdin_str = req.get("stdin")
+        try:
+            result = subprocess.run(
+                ["sudo", "-u", username, "bash", "-c", command],
+                input=stdin_str.encode() if isinstance(stdin_str, str) else (stdin_str or b""),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=timeout,
+                cwd=cwd if os.path.isdir(cwd) else None,
+            )
+            self._send_json(200, {
+                "stdout": result.stdout[:512 * 1024].decode(errors="replace"),
+                "stderr": result.stderr[:512 * 1024].decode(errors="replace"),
+                "exit_code": result.returncode,
+            })
+        except subprocess.TimeoutExpired:
+            self._send_error(408, f"command timed out after {timeout}s")
+        except Exception as e:
+            self._send_error(500, str(e))
+
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
@@ -7091,6 +7136,8 @@ except Exception as ex:
             self._handle_tokens_create()
         elif path == "/api/tokens/revoke":
             self._handle_tokens_revoke()
+        elif path == "/api/exec":
+            self._handle_exec()
         else:
             self.send_response(404)
             self.end_headers()
