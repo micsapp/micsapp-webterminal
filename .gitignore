@@ -5,3 +5,4 @@ __pycache__/
 .env
 .claude
 node_modules/
+.api_tokens

@@ -1,0 +1,13 @@
+if [ -z $TERMINAL_TOKEN ];then 
+	echo "missing TERMINAL_TOKEN"
+	exit 99;
+fi
+if [ $# -ne 1 ];then
+	echo "missing command"
+	exit 99;
+fi
+CMD="$*"
+curl -X POST https://$HOST/api/exec \
+  -H "Authorization: Bearer $TERMINAL_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"command\": \"$CMD\"}"
