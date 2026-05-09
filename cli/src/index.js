@@ -4,6 +4,7 @@ const path = require('path');
 const { loadConfig, writeAuthFile, clearAuthFile, normalizeBaseUrl, AUTH_FILE } = require('./config');
 const { buildClient, ApiError } = require('./api');
 const { parseArgs } = require('./args');
+const wsClient = require('./ws');
 
 const VERSION = require('../package.json').version;
 
@@ -14,6 +15,7 @@ Usage:
 
 Commands:
   exec <command>             Run a shell command remotely (POST /api/exec)
+  shell                      Open an interactive shell over WebSocket
   ls [path]                  List files in a directory
   cat <path>                 Print a text file's contents
   download <path>            Download a file
@@ -63,6 +65,22 @@ Examples:
   mics_cli exec "uname -a"
   mics_cli exec "wc -l" --stdin-file ./big.log
   mics_cli exec "cat /etc/hostname" --json
+`,
+  shell: `mics_cli shell
+
+Opens an interactive shell on the remote server over WebSocket. Uses your
+bearer token for auth — no SSH password needed even if the server is only
+reachable through cloudflared.
+
+Behavior:
+  • A fresh \`bash -l\` is spawned as your user via sudo on the server.
+  • Your terminal is put into raw mode; keystrokes go to the remote pty.
+  • Window resize (SIGWINCH) is forwarded so curses apps stay correct.
+  • Type \`exit\` (or Ctrl+D) on the remote shell to disconnect.
+  • Ctrl+C is forwarded to the remote shell, not the CLI itself.
+
+Options:
+  --insecure             Don't verify the TLS certificate (testing only)
 `,
   ls: `mics_cli ls [path] [--json]
 
@@ -457,6 +475,86 @@ function warnIfShadowed(cfgPre) {
   }
 }
 
+async function cmdShell(rest) {
+  const f = parseArgs(rest, { boolFlags: ['insecure'] });
+  const { cfg } = buildContext(f);
+  if (!cfg.token) {
+    throw new Error('shell requires a bearer token. Run `mics_cli login` first.');
+  }
+  if (!cfg.baseUrl) throw new Error('shell requires MICS_URL or --url');
+
+  // Build wss:// URL from baseUrl. cfg.baseUrl is normalized (no /api suffix,
+  // no trailing slash) by config.js.
+  const httpsBase = cfg.baseUrl;
+  const wsBase = httpsBase.replace(/^http:/, 'ws:').replace(/^https:/, 'wss:');
+  const cols = (process.stdout.columns | 0) || 80;
+  const rows = (process.stdout.rows | 0) || 24;
+  const url = `${wsBase}/api/shell?cols=${cols}&rows=${rows}`;
+
+  let ws;
+  try {
+    ws = await wsClient.connect(url, {
+      headers: { Authorization: `Bearer ${cfg.token}` },
+      rejectUnauthorized: !f.insecure
+    });
+  } catch (e) {
+    throw new Error(`could not open shell: ${e.message}`);
+  }
+
+  const stdin = process.stdin;
+  const stdout = process.stdout;
+  const wasRaw = stdin.isTTY ? stdin.isRaw : false;
+
+  let restored = false;
+  const restore = () => {
+    if (restored) return;
+    restored = true;
+    try { if (stdin.isTTY) stdin.setRawMode(wasRaw); } catch {}
+    try { stdin.pause(); } catch {}
+    try { stdin.removeListener('data', onStdin); } catch {}
+    try { process.removeListener('SIGWINCH', onResize); } catch {}
+  };
+
+  const onStdin = (chunk) => {
+    try { ws.sendBinary(chunk); }
+    catch {}
+  };
+
+  const onResize = () => {
+    const c = (process.stdout.columns | 0) || 80;
+    const r = (process.stdout.rows | 0) || 24;
+    try { ws.sendText(JSON.stringify({ type: 'resize', cols: c, rows: r })); }
+    catch {}
+  };
+
+  if (stdin.isTTY) stdin.setRawMode(true);
+  stdin.resume();
+  stdin.on('data', onStdin);
+  process.on('SIGWINCH', onResize);
+
+  ws.on('frame', (opcode, payload) => {
+    if (opcode === wsClient.OPCODE.BINARY) {
+      stdout.write(payload);
+    }
+    // text frames carry no info we display today
+  });
+
+  let errored = false;
+  await new Promise((resolve) => {
+    ws.on('close', () => { restore(); resolve(); });
+    ws.on('error', (err) => {
+      errored = true;
+      restore();
+      process.stderr.write(`\nshell: ${err.message}\n`);
+      resolve();
+    });
+  });
+  // Force a clean process exit. stdin (especially after raw mode) and any
+  // remaining socket handles can keep the libuv loop alive even after we
+  // remove our listeners; explicit exit is the only reliable signal.
+  process.exit(errored ? 1 : 0);
+}
+
 async function cmdLogin(rest) {
   const f = parseArgs(rest, { boolFlags: ['no-validate'] });
   const { loadConfig } = require('./config');
@@ -501,15 +599,26 @@ async function cmdLogin(rest) {
     throw new Error(`could not reach ${baseUrl}/api/login: ${e.message}`);
   }
 
-  const tokenName = f.name || `mics_cli@${os.hostname()} ${new Date().toISOString().slice(0, 10)}`;
+  // Default name includes time-of-day so back-to-back logins on the same day
+  // don't collide (the server rejects duplicate names with HTTP 409). If the
+  // user passed --name and it still collides, append a numeric suffix.
+  const baseName = f.name || `mics_cli@${os.hostname()} ${new Date().toISOString().slice(0, 16).replace('T', ' ')}`;
+  let tokenName = baseName;
   let secretToken;
-  try {
-    secretToken = await api.mintToken(session.cookie, tokenName);
-  } catch (e) {
-    if (e instanceof ApiError) {
-      throw new Error(`failed to mint token (HTTP ${e.status}): ${e.body && e.body.error || ''}`);
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      secretToken = await api.mintToken(session.cookie, tokenName);
+      break;
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 409 && attempt < 4) {
+        tokenName = `${baseName} (${attempt + 2})`;
+        continue;
+      }
+      if (e instanceof ApiError) {
+        throw new Error(`failed to mint token (HTTP ${e.status}): ${e.body && e.body.error || ''}`);
+      }
+      throw e;
     }
-    throw e;
   }
 
   writeAuthFile({
@@ -535,6 +644,8 @@ async function cmdLogout() {
 
 const COMMANDS = {
   exec: cmdExec,
+  shell: cmdShell,
+  ssh: cmdShell,
   ls: cmdLs,
   list: cmdLs,
   cat: cmdCat,

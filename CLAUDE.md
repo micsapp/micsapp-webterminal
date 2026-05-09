@@ -44,6 +44,18 @@ After changing auth.py, deploy.sh detects the change and restarts the auth servi
 
 ## HTTP API
 
+### GET /api/shell — Interactive shell over WebSocket
+
+Upgrades the connection to a WebSocket and pumps bytes between the client and a fresh `sudo -u <user> -i` login shell on a PTY. Auth is the same bearer/cookie scheme as `/api/exec`.
+
+**Query params:** `cols=N`, `rows=M` (initial geometry, optional).
+
+**Protocol:**
+- Server → client: WebSocket binary frames carrying raw PTY output bytes.
+- Client → server: binary frames for keystrokes; text frames carrying JSON for control, e.g. `{"type":"resize","cols":120,"rows":40}`.
+
+The CLI's `mics_cli shell` is the canonical client. The auth service runs as `ThreadingHTTPServer` so a long-lived shell session doesn't block other requests; `STATE_LOCK` (an `RLock`) guards `user_instances`/`user_vnc_instances`/`next_port`.
+
 ### POST /api/exec — Shell command execution
 
 Runs a shell command as the authenticated user and returns stdout/stderr/exit code. Requires a session cookie or bearer token.

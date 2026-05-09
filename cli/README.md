@@ -71,6 +71,7 @@ mics_cli --token agt_… --url https://term.example.com ls
 
 ```text
 mics_cli exec <command>                  Run a shell command
+mics_cli shell                           Open an interactive shell (WebSocket)
 mics_cli ls [path]                       List files in a directory
 mics_cli cat <path>                      Print a text file
 mics_cli download <path> [-o file]       Download a file
@@ -106,6 +107,9 @@ Add `--json` to most commands for machine-readable output.
 ```sh
 # Confirm setup
 mics_cli whoami
+
+# Interactive shell over the same HTTPS the web UI uses
+mics_cli shell
 
 # One-shot remote command
 mics_cli exec "uname -a"
@@ -188,6 +192,15 @@ Distribute the binary alongside a sample `.env`. The binary still reads
 
 - No streaming output for long-running commands. `exec` waits for the remote
   command to finish (subject to `--timeout`) and returns the full output.
-  For interactive shells, use the web SPA.
+  Use `mics_cli shell` for interactive sessions.
 - No file rename/move (`mv`). Use `exec "mv …"` for now.
 - No symlink creation. Use `exec "ln -s …"`.
+
+## How `mics_cli shell` works
+
+`shell` opens a WebSocket to `/api/shell` on your webterminal host, attaches
+your bearer token as `Authorization: Bearer …`, and on the server spawns
+`sudo -u <you> -i` against a fresh PTY. Bytes flow both directions; window
+resize is sent as a JSON control frame. Because everything rides over the
+same HTTPS port the web UI uses, it works through a Cloudflare Tunnel
+without exposing SSH separately.

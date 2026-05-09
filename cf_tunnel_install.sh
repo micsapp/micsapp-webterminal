@@ -438,6 +438,8 @@ server {
         proxy_pass_request_body off;
         proxy_set_header Content-Length "";
         proxy_set_header Cookie \$http_cookie;
+        # Pass Authorization header so bearer tokens work for API scripting.
+        proxy_set_header Authorization \$http_authorization;
         # Used by auth.py to authorize /ut/<port>/ access (prevents cross-user port access).
         proxy_set_header X-TTYD-Port \$ttyd_port;
     }
@@ -464,6 +466,22 @@ server {
         error_page 401 = @login_redirect;
         proxy_pass http://127.0.0.1:${auth_port};
         client_max_body_size 2m;
+    }
+
+    # Interactive shell over WebSocket (requires auth)
+    location = /api/shell {
+        auth_request /api/auth;
+        error_page 401 = @login_redirect;
+        proxy_pass http://127.0.0.1:${auth_port};
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
+        proxy_set_header Authorization \$http_authorization;
+        proxy_buffering off;
+        proxy_request_buffering off;
+        proxy_read_timeout 86400s;
+        proxy_send_timeout 86400s;
     }
 
     # Wrapper app page (requires auth)
@@ -562,7 +580,9 @@ import secrets
 import shlex
 import shutil
 import socket
+import struct
 import subprocess
+import threading
 import time
 import urllib.parse
 
@@ -5541,6 +5561,12 @@ init();
 
 
 # --- Per-user ttyd instance management ---
+# STATE_LOCK guards user_instances, user_vnc_instances, and next_port — the
+# server runs as ThreadingHTTPServer so any handler may touch these from any
+# thread. Held across the spawn calls because port allocation + dict insert
+# need to be atomic relative to other logins. RLock so allocate_port() can
+# be called while spawn_user_ttyd already holds it.
+STATE_LOCK = threading.RLock()
 user_instances = {}  # {username: {"port": int, "proc": Popen}}
 user_vnc_instances = {}  # {username: {"vnc_port": int, "ws_port": int, "vnc_proc": Popen, "ws_proc": Popen}}
 WEBSOCKIFY_BIN = os.environ.get("WEBSOCKIFY_BIN") or shutil.which("websockify") or "/home/mli/miniconda3/bin/websockify"
@@ -5564,11 +5590,12 @@ def port_is_free(port):
 
 def allocate_port():
     global next_port
-    for _ in range(2000):
-        p = next_port
-        next_port += 1
-        if port_is_free(p):
-            return p
+    with STATE_LOCK:
+        for _ in range(2000):
+            p = next_port
+            next_port += 1
+            if port_is_free(p):
+                return p
     raise RuntimeError("unable to allocate free port")
 
 def wait_for_ttyd_ready(port, timeout=4.0):
@@ -5592,143 +5619,147 @@ def wait_for_ttyd_ready(port, timeout=4.0):
 def spawn_user_ttyd(username, password):
     """Spawn a ttyd instance for the user via SSH. Returns the port."""
     global next_port
-    # Reuse existing instance if still alive
-    if username in user_instances:
-        info = user_instances[username]
-        if info["proc"].poll() is None:
-            info["password"] = password  # refresh password
-            return info["port"]
-        # Dead, clean up
-        del user_instances[username]
+    with STATE_LOCK:
+        # Reuse existing instance if still alive
+        if username in user_instances:
+            info = user_instances[username]
+            if info["proc"].poll() is None:
+                info["password"] = password  # refresh password
+                return info["port"]
+            # Dead, clean up
+            del user_instances[username]
 
-    port = allocate_port()
+        port = allocate_port()
 
-    # Bind ttyd to localhost only, so the per-user port isn't reachable directly from the LAN/Internet.
-    # Use tmux so terminal sessions persist across page refreshes and re-logins.
-    # Each tab gets a grouped session pointing at a deterministic tmux window slot.
-    # Grouped sessions have destroy-unattached so they auto-clean on disconnect,
-    # while the base "main" session (and its windows) persist to keep processes alive.
-    # On reconnect, tabs reattach to existing windows instead of creating new ones.
-    tmux_cmd = (
-        r'tmux has-session -t main 2>/dev/null || exec tmux new-session -s main \; set -g mouse on \; set -g history-limit 10000 \; set -s set-clipboard on \; setw -g aggressive-resize on;'
-        r' tmux set -g mouse on 2>/dev/null; tmux set -g history-limit 10000 2>/dev/null; tmux set -s set-clipboard on 2>/dev/null; tmux set -g set-clipboard on 2>/dev/null; tmux setw -g aggressive-resize on 2>/dev/null;'
-        # Parse arg format "SLOT:ACTIVE_SLOTS" (e.g. "0:0,2,3") or plain "SLOT"
-        r' RAW="$1"; case "$RAW" in *:*) SLOT="${RAW%%:*}"; ACTIVE="${RAW#*:}" ;; *) SLOT="$RAW"; ACTIVE="" ;; esac;'
-        r' case "$SLOT" in (""|*[!0-9]*) SLOT=0 ;; esac;'
-        # Create window at exact SLOT index (no gap-filling)
-        r' tmux list-windows -t main -F "#{window_index}" | grep -q "^${SLOT}$" || tmux new-window -t main:${SLOT};'
-        # Clean up orphaned windows not in the active slots list
-        r' if [ -n "$ACTIVE" ]; then for _w in $(tmux list-windows -t main -F "#{window_index}"); do'
-        r' _k=0; _I="$IFS"; IFS=","; for _a in $ACTIVE; do [ "$_w" = "$_a" ] && _k=1; done; IFS="$_I";'
-        r' [ "$_k" = "0" ] && tmux kill-window -t "main:${_w}" 2>/dev/null; done; true; fi;'
-        r' exec tmux new-session -t main \; set-option destroy-unattached on \; select-window -t :${SLOT}'
-    )
-    ttyd_cmd = f"{shlex.quote(TTYD_BIN)} -W -a -i 127.0.0.1 -p {port} bash -lc {shlex.quote(tmux_cmd)} ttyd-tab"
-    proc = subprocess.Popen(
-        [SSHPASS_BIN, "-p", password, SSH_BIN,
-         "-o", "StrictHostKeyChecking=no",
-         "-o", "ConnectTimeout=5",
-         "-o", "PreferredAuthentications=password",
-         "-o", "PubkeyAuthentication=no",
-         "-o", "PasswordAuthentication=yes",
-         "-o", "ServerAliveInterval=30",
-         f"{username}@127.0.0.1",
-         ttyd_cmd],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-    )
-    user_instances[username] = {"port": port, "proc": proc, "password": password}
-    if not wait_for_ttyd_ready(port, timeout=4.0):
-        try:
-            proc.terminate()
-        except Exception:
-            pass
-        try:
-            user_instances.pop(username, None)
-        except Exception:
-            pass
-        raise RuntimeError("ttyd failed to start")
-    return port
+        # Bind ttyd to localhost only, so the per-user port isn't reachable directly from the LAN/Internet.
+        # Use tmux so terminal sessions persist across page refreshes and re-logins.
+        # Each tab gets a grouped session pointing at a deterministic tmux window slot.
+        # Grouped sessions have destroy-unattached so they auto-clean on disconnect,
+        # while the base "main" session (and its windows) persist to keep processes alive.
+        # On reconnect, tabs reattach to existing windows instead of creating new ones.
+        tmux_cmd = (
+            r'tmux has-session -t main 2>/dev/null || exec tmux new-session -s main \; set -g mouse on \; set -g history-limit 10000 \; set -s set-clipboard on \; setw -g aggressive-resize on;'
+            r' tmux set -g mouse on 2>/dev/null; tmux set -g history-limit 10000 2>/dev/null; tmux set -s set-clipboard on 2>/dev/null; tmux set -g set-clipboard on 2>/dev/null; tmux setw -g aggressive-resize on 2>/dev/null;'
+            # Parse arg format "SLOT:ACTIVE_SLOTS" (e.g. "0:0,2,3") or plain "SLOT"
+            r' RAW="$1"; case "$RAW" in *:*) SLOT="${RAW%%:*}"; ACTIVE="${RAW#*:}" ;; *) SLOT="$RAW"; ACTIVE="" ;; esac;'
+            r' case "$SLOT" in (""|*[!0-9]*) SLOT=0 ;; esac;'
+            # Create window at exact SLOT index (no gap-filling)
+            r' tmux list-windows -t main -F "#{window_index}" | grep -q "^${SLOT}$" || tmux new-window -t main:${SLOT};'
+            # Clean up orphaned windows not in the active slots list
+            r' if [ -n "$ACTIVE" ]; then for _w in $(tmux list-windows -t main -F "#{window_index}"); do'
+            r' _k=0; _I="$IFS"; IFS=","; for _a in $ACTIVE; do [ "$_w" = "$_a" ] && _k=1; done; IFS="$_I";'
+            r' [ "$_k" = "0" ] && tmux kill-window -t "main:${_w}" 2>/dev/null; done; true; fi;'
+            r' exec tmux new-session -t main \; set-option destroy-unattached on \; select-window -t :${SLOT}'
+        )
+        ttyd_cmd = f"{shlex.quote(TTYD_BIN)} -W -a -i 127.0.0.1 -p {port} bash -lc {shlex.quote(tmux_cmd)} ttyd-tab"
+        proc = subprocess.Popen(
+            [SSHPASS_BIN, "-p", password, SSH_BIN,
+             "-o", "StrictHostKeyChecking=no",
+             "-o", "ConnectTimeout=5",
+             "-o", "PreferredAuthentications=password",
+             "-o", "PubkeyAuthentication=no",
+             "-o", "PasswordAuthentication=yes",
+             "-o", "ServerAliveInterval=30",
+             f"{username}@127.0.0.1",
+             ttyd_cmd],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        user_instances[username] = {"port": port, "proc": proc, "password": password}
+        if not wait_for_ttyd_ready(port, timeout=4.0):
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+            try:
+                user_instances.pop(username, None)
+            except Exception:
+                pass
+            raise RuntimeError("ttyd failed to start")
+        return port
 
 
 def get_user_port(username):
     """Get the ttyd port for a user, or None if not running."""
-    if username in user_instances:
-        info = user_instances[username]
+    with STATE_LOCK:
+        info = user_instances.get(username)
+        if info is None:
+            return None
         if info["proc"].poll() is None:
             return info["port"]
-        del user_instances[username]
-    return None
+        user_instances.pop(username, None)
+        return None
 
 
 def spawn_user_vnc(username, password):
     """Spawn a per-user VNC desktop (Xtigervnc + xfce4 + websockify). Returns ws_port."""
-    # Reuse existing instance if still alive
-    if username in user_vnc_instances:
-        info = user_vnc_instances[username]
-        if info["ws_proc"].poll() is None:
-            return info["ws_port"]
-        _cleanup_vnc(username)
+    with STATE_LOCK:
+        # Reuse existing instance if still alive
+        if username in user_vnc_instances:
+            info = user_vnc_instances[username]
+            if info["ws_proc"].poll() is None:
+                return info["ws_port"]
+            _cleanup_vnc(username)
 
-    vnc_port = allocate_port()
-    ws_port = allocate_port()
+        vnc_port = allocate_port()
+        ws_port = allocate_port()
 
-    # Pick a display number from the VNC port to avoid collisions
-    display_num = vnc_port - 5900
-    if display_num < 1:
-        display_num = vnc_port % 1000 + 100
+        # Pick a display number from the VNC port to avoid collisions
+        display_num = vnc_port - 5900
+        if display_num < 1:
+            display_num = vnc_port % 1000 + 100
 
-    # Spawn Xtigervnc + xfce4-session via SSH as the user
-    vnc_cmd = (
-        f"Xtigervnc :{display_num} -rfbport {vnc_port} -localhost=1"
-        f" -SecurityTypes None -geometry 1920x1080 -depth 24 &"
-        f" sleep 1; DISPLAY=:{display_num} xfce4-session"
-    )
-    vnc_proc = subprocess.Popen(
-        [SSHPASS_BIN, "-p", password, SSH_BIN,
-         "-o", "StrictHostKeyChecking=no",
-         "-o", "ConnectTimeout=5",
-         "-o", "PreferredAuthentications=password",
-         "-o", "PubkeyAuthentication=no",
-         "-o", "PasswordAuthentication=yes",
-         "-o", "ServerAliveInterval=30",
-         f"{username}@127.0.0.1",
-         "bash", "-lc", vnc_cmd],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-    )
+        # Spawn Xtigervnc + xfce4-session via SSH as the user
+        vnc_cmd = (
+            f"Xtigervnc :{display_num} -rfbport {vnc_port} -localhost=1"
+            f" -SecurityTypes None -geometry 1920x1080 -depth 24 &"
+            f" sleep 1; DISPLAY=:{display_num} xfce4-session"
+        )
+        vnc_proc = subprocess.Popen(
+            [SSHPASS_BIN, "-p", password, SSH_BIN,
+             "-o", "StrictHostKeyChecking=no",
+             "-o", "ConnectTimeout=5",
+             "-o", "PreferredAuthentications=password",
+             "-o", "PubkeyAuthentication=no",
+             "-o", "PasswordAuthentication=yes",
+             "-o", "ServerAliveInterval=30",
+             f"{username}@127.0.0.1",
+             "bash", "-lc", vnc_cmd],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
 
-    # Wait for VNC server to be ready
-    if not wait_for_ttyd_ready(vnc_port, timeout=6.0):
-        try:
-            vnc_proc.terminate()
-        except Exception:
-            pass
-        raise RuntimeError("VNC server failed to start")
+        # Wait for VNC server to be ready
+        if not wait_for_ttyd_ready(vnc_port, timeout=6.0):
+            try:
+                vnc_proc.terminate()
+            except Exception:
+                pass
+            raise RuntimeError("VNC server failed to start")
 
-    # Spawn websockify to bridge WebSocket → VNC
-    ws_proc = subprocess.Popen(
-        [WEBSOCKIFY_BIN, "--heartbeat=30",
-         f"127.0.0.1:{ws_port}", f"localhost:{vnc_port}"],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-    )
+        # Spawn websockify to bridge WebSocket → VNC
+        ws_proc = subprocess.Popen(
+            [WEBSOCKIFY_BIN, "--heartbeat=30",
+             f"127.0.0.1:{ws_port}", f"localhost:{vnc_port}"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
 
-    if not wait_for_ttyd_ready(ws_port, timeout=4.0):
-        try:
-            ws_proc.terminate()
-            vnc_proc.terminate()
-        except Exception:
-            pass
-        raise RuntimeError("websockify failed to start")
+        if not wait_for_ttyd_ready(ws_port, timeout=4.0):
+            try:
+                ws_proc.terminate()
+                vnc_proc.terminate()
+            except Exception:
+                pass
+            raise RuntimeError("websockify failed to start")
 
-    user_vnc_instances[username] = {
-        "vnc_port": vnc_port,
-        "ws_port": ws_port,
-        "vnc_proc": vnc_proc,
-        "ws_proc": ws_proc,
-        "display": display_num,
-        "password": password,
-    }
-    print(f"[VNC] desktop started for {username}: display=:{display_num} vnc_port={vnc_port} ws_port={ws_port}")
-    return ws_port
+        user_vnc_instances[username] = {
+            "vnc_port": vnc_port,
+            "ws_port": ws_port,
+            "vnc_proc": vnc_proc,
+            "ws_proc": ws_proc,
+            "display": display_num,
+            "password": password,
+        }
+        print(f"[VNC] desktop started for {username}: display=:{display_num} vnc_port={vnc_port} ws_port={ws_port}")
+        return ws_port
 
 
 def _cleanup_vnc(username):
@@ -5922,6 +5953,76 @@ def run_as_user(username, python_script, timeout=10):
         return (1, b"", b"timeout")
     except Exception as e:
         return (1, b"", str(e).encode())
+
+
+# --- Minimal WebSocket helpers (RFC 6455, server-side only) -----------------
+# We implement the small subset needed for /api/shell so the project keeps
+# its "stdlib only, no pip deps" rule. Frame size cap prevents a malicious
+# client from making us allocate gigabytes for a single frame.
+WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+WS_MAX_FRAME = 16 * 1024 * 1024  # 16 MiB
+
+def _ws_recv_exact(sock, n):
+    buf = bytearray()
+    while len(buf) < n:
+        try:
+            chunk = sock.recv(n - len(buf))
+        except OSError:
+            return None
+        if not chunk:
+            return None
+        buf.extend(chunk)
+    return bytes(buf)
+
+def _ws_recv_frame(sock):
+    """Read one WebSocket frame. Returns (fin, opcode, payload) or None on close/error."""
+    hdr = _ws_recv_exact(sock, 2)
+    if not hdr:
+        return None
+    fin = (hdr[0] >> 7) & 1
+    opcode = hdr[0] & 0x0F
+    masked = (hdr[1] >> 7) & 1
+    plen = hdr[1] & 0x7F
+    if plen == 126:
+        ext = _ws_recv_exact(sock, 2)
+        if ext is None:
+            return None
+        plen = struct.unpack(">H", ext)[0]
+    elif plen == 127:
+        ext = _ws_recv_exact(sock, 8)
+        if ext is None:
+            return None
+        plen = struct.unpack(">Q", ext)[0]
+    if plen > WS_MAX_FRAME:
+        return None
+    mask = _ws_recv_exact(sock, 4) if masked else None
+    if masked and mask is None:
+        return None
+    payload = _ws_recv_exact(sock, plen) if plen else b""
+    if payload is None:
+        return None
+    if mask:
+        payload = bytes(b ^ mask[i & 3] for i, b in enumerate(payload))
+    return (fin, opcode, payload)
+
+def _ws_send_frame(sock, opcode, payload, lock=None):
+    """Send one unfragmented, unmasked WebSocket frame. Server frames must not be masked."""
+    n = len(payload)
+    hdr = bytearray([0x80 | (opcode & 0x0F)])
+    if n < 126:
+        hdr.append(n)
+    elif n < 65536:
+        hdr.append(126)
+        hdr += struct.pack(">H", n)
+    else:
+        hdr.append(127)
+        hdr += struct.pack(">Q", n)
+    data = bytes(hdr) + payload
+    if lock:
+        with lock:
+            sock.sendall(data)
+    else:
+        sock.sendall(data)
 
 
 class AuthHandler(http.server.BaseHTTPRequestHandler):
@@ -6975,6 +7076,194 @@ except Exception as ex:
         except Exception as e:
             self._send_error(500, str(e))
 
+    # --- Interactive shell over WebSocket -------------------------------------
+
+    def _handle_shell_ws(self, params):
+        """Upgrade to WebSocket and pump bytes between the client and a fresh
+        login shell running as the authenticated user. Protocol:
+          server -> client: binary frames of raw PTY output
+          client -> server: binary frames of raw input,
+                            or text frames carrying control JSON like
+                            {"type":"resize","cols":80,"rows":24}
+        """
+        username = self._get_authenticated_user()
+        if not username:
+            self.send_response(401); self.end_headers(); return
+        if self.headers.get("Upgrade", "").lower() != "websocket":
+            self.send_response(400); self.end_headers(); return
+        key = self.headers.get("Sec-WebSocket-Key", "")
+        if not key:
+            self.send_response(400); self.end_headers(); return
+
+        # Lazy import — pty/fcntl/termios are unix-only and not used elsewhere.
+        import pty, fcntl, termios, signal
+
+        accept = base64.b64encode(
+            hashlib.sha1((key + WS_GUID).encode()).digest()
+        ).decode()
+        self.send_response(101)
+        self.send_header("Upgrade", "websocket")
+        self.send_header("Connection", "Upgrade")
+        self.send_header("Sec-WebSocket-Accept", accept)
+        self.end_headers()
+        try:
+            self.wfile.flush()
+        except Exception:
+            return
+        # Tell the keep-alive logic this connection is finished after we return.
+        self.close_connection = True
+
+        sock = self.connection
+        sock_lock = threading.Lock()
+
+        # Optional initial geometry from query string (?cols=80&rows=24).
+        try:
+            cols = int(params.get("cols", ["80"])[0])
+            rows = int(params.get("rows", ["24"])[0])
+        except (TypeError, ValueError):
+            cols, rows = 80, 24
+        cols = max(20, min(cols, 500))
+        rows = max(5, min(rows, 200))
+
+        # Spawn a PTY running a fresh login shell as the user. Using sudo here
+        # matches the bearer-token model: there's no SSH password to forward.
+        try:
+            pid, master_fd = pty.fork()
+        except OSError as e:
+            try:
+                _ws_send_frame(sock, 0x2, f"pty.fork failed: {e}\n".encode(), sock_lock)
+                _ws_send_frame(sock, 0x8, b"\x03\xee", sock_lock)
+            except Exception:
+                pass
+            return
+
+        if pid == 0:
+            # Child: become the user via sudo. -i runs the login shell.
+            try:
+                env = {
+                    "TERM": "xterm-256color",
+                    "LANG": os.environ.get("LANG", "en_US.UTF-8"),
+                    "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                }
+                os.execvpe("sudo", ["sudo", "-iu", username], env)
+            except Exception as e:
+                os.write(2, f"exec failed: {e}\n".encode())
+            os._exit(127)
+
+        # Parent: set initial window size and pump bytes both ways.
+        try:
+            fcntl.ioctl(master_fd, termios.TIOCSWINSZ,
+                        struct.pack("HHHH", rows, cols, 0, 0))
+        except Exception:
+            pass
+
+        stop = threading.Event()
+
+        import select as _select
+
+        def pty_to_ws():
+            try:
+                while not stop.is_set():
+                    try:
+                        ready, _, _ = _select.select([master_fd], [], [], 0.5)
+                    except (OSError, ValueError):
+                        break
+                    if not ready:
+                        try:
+                            done, _ = os.waitpid(pid, os.WNOHANG)
+                            if done:
+                                break
+                        except OSError:
+                            break
+                        continue
+                    try:
+                        data = os.read(master_fd, 65536)
+                    except OSError:
+                        break
+                    if not data:
+                        break
+                    try:
+                        _ws_send_frame(sock, 0x2, data, sock_lock)
+                    except OSError:
+                        break
+            finally:
+                stop.set()
+                try:
+                    _ws_send_frame(sock, 0x8, b"\x03\xe8", sock_lock)
+                except Exception:
+                    pass
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except Exception:
+                    pass
+
+        t = threading.Thread(target=pty_to_ws, daemon=True, name=f"ws-shell-out:{username}")
+        t.start()
+
+        try:
+            while not stop.is_set():
+                frame = _ws_recv_frame(sock)
+                if frame is None:
+                    break
+                fin, opcode, payload = frame
+                if opcode == 0x8:  # close
+                    try:
+                        _ws_send_frame(sock, 0x8, payload[:2] if payload else b"", sock_lock)
+                    except Exception:
+                        pass
+                    break
+                if opcode == 0x9:  # ping → pong
+                    try:
+                        _ws_send_frame(sock, 0xA, payload, sock_lock)
+                    except Exception:
+                        break
+                    continue
+                if opcode == 0xA:  # pong
+                    continue
+                if opcode == 0x1:  # text — control JSON
+                    try:
+                        msg = json.loads(payload.decode("utf-8", errors="replace"))
+                    except Exception:
+                        continue
+                    if isinstance(msg, dict) and msg.get("type") == "resize":
+                        try:
+                            c = max(20, min(int(msg.get("cols", 80)), 500))
+                            r = max(5, min(int(msg.get("rows", 24)), 200))
+                            fcntl.ioctl(master_fd, termios.TIOCSWINSZ,
+                                        struct.pack("HHHH", r, c, 0, 0))
+                        except Exception:
+                            pass
+                    continue
+                if opcode == 0x2:  # binary — keystrokes
+                    try:
+                        os.write(master_fd, payload)
+                    except OSError:
+                        break
+                    continue
+                # Unknown opcode → ignore
+        finally:
+            stop.set()
+            try:
+                os.kill(pid, signal.SIGHUP)
+            except Exception:
+                pass
+            try:
+                os.close(master_fd)
+            except Exception:
+                pass
+            try:
+                for _ in range(20):
+                    pid_done, _status = os.waitpid(pid, os.WNOHANG)
+                    if pid_done:
+                        break
+                    time.sleep(0.05)
+                else:
+                    os.kill(pid, signal.SIGKILL)
+                    os.waitpid(pid, 0)
+            except Exception:
+                pass
+            t.join(timeout=1.0)
+
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
@@ -7072,6 +7361,8 @@ except Exception as ex:
             self._handle_quick_commands_export()
         elif path == "/api/tokens":
             self._handle_tokens_list()
+        elif path == "/api/shell":
+            self._handle_shell_ws(params)
         else:
             self.send_response(404)
             self.end_headers()
@@ -7147,7 +7438,11 @@ except Exception as ex:
 
 
 if __name__ == "__main__":
-    server = http.server.HTTPServer(("127.0.0.1", PORT), AuthHandler)
+    # ThreadingHTTPServer so a long-running /api/shell session (which holds
+    # the connection open for the entire interactive shell) doesn't block
+    # other requests. Daemon threads exit when the main process does.
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", PORT), AuthHandler)
+    server.daemon_threads = True
     print(f"Auth service running on http://127.0.0.1:{PORT}")
     server.serve_forever()
 AUTHEOF
