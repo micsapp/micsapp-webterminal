@@ -2594,6 +2594,11 @@ function renderSplitLayout() {
     if (!f) return;
     const pane = layout.panes.find(p => p.tabId === t.id);
     if (pane) {
+      // Trigger lazy-load if this pane's iframe was never visited.
+      if (f.dataset.lazySrc && (!f.src || f.src === 'about:blank' || f.src.endsWith('/blank'))) {
+        f.src = f.dataset.lazySrc;
+        delete f.dataset.lazySrc;
+      }
       f.style.position = 'absolute';
       f.style.display = 'block';
       f.style.left = pane.rect.left + '%';
@@ -3931,9 +3936,11 @@ function init() {
     // Clear stale split state — tab IDs are regenerated on reload so
     // the saved split tree references are no longer reliable.
     localStorage.removeItem('ttyd_split');
-    // Create iframes — only load the active tab immediately;
-    // defer hidden tabs to avoid tmux sizing the window to the
-    // smallest (hidden/zero-size) client.
+    // Load all iframes eagerly with a small stagger so each tab's tmux
+    // window is created at startup. Lazy-loading inactive tabs left their
+    // tmux slots unspawned, so the status bar showed fewer windows than
+    // browser tabs and split panes rendered empty when the second pane
+    // had never been visited.
     const activeSlots = tabs.filter(t => t.type !== 'desktop').map(t => t.windowSlot).join(',');
     tabs.forEach((t, i) => {
       const isActive = (t.id === activeTabId);
@@ -3947,12 +3954,8 @@ function init() {
         } else {
           url = buildTermUrl(t, { _activeSlots: activeSlots });
         }
-        if (isActive) {
-          iframe.src = url;
-          iframe.classList.add('active');
-        } else {
-          iframe.dataset.lazySrc = url;
-        }
+        iframe.src = url;
+        if (isActive) iframe.classList.add('active');
         document.getElementById('termContainer').appendChild(iframe);
       }, isActive ? 0 : i * 300);
     });
