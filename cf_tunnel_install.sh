@@ -639,6 +639,32 @@ TTYD_BIN = (
     or ("/usr/bin/ttyd" if _IS_LINUX else "/usr/local/bin/ttyd")
 )
 
+# --- App version / build info (shown in the SPA's About dialog) ---
+APP_VERSION = "1.0.0"
+
+def _git_build_info():
+    """Return (short_sha, commit_date) for the running checkout, or empty
+    strings if we can't shell out to git. Computed once at startup."""
+    try:
+        repo = BASE_DIR
+        sha = subprocess.run(
+            ["git", "-C", repo, "rev-parse", "--short", "HEAD"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=2
+        ).stdout.decode().strip()
+        date = subprocess.run(
+            ["git", "-C", repo, "log", "-1", "--format=%cd", "--date=short", "HEAD"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=2
+        ).stdout.decode().strip()
+        return sha, date
+    except Exception:
+        return "", ""
+
+_BUILD_SHA, _BUILD_DATE = _git_build_info()
+APP_BUILD = (
+    f"{_BUILD_SHA} · {_BUILD_DATE}"
+    if _BUILD_SHA and _BUILD_DATE else (_BUILD_SHA or "(dev)")
+)
+
 def _safe_ascii_filename(name):
     # Header values must be latin-1 encodable. Provide an ASCII fallback for
     # Content-Disposition and add a UTF-8 filename* parameter separately.
@@ -2125,6 +2151,7 @@ APP_HTML = """<!DOCTYPE html>
   <button class="nav-btn nav-hide-mobile" onclick="addDesktopTab()">&#128421; Desktop</button>
   <button class="nav-btn nav-hide-mobile" onclick="reconnect()">&#8635; Reconnect</button>
   <button class="nav-btn nav-hide-mobile" onclick="showHelp()">&#10068; Help</button>
+  <button class="nav-btn nav-hide-mobile" onclick="showAbout()" title="About this app">&#9432; About</button>
   <button class="hamburger" onclick="toggleHamburger()" aria-label="Menu">&#9776;</button>
   <div class="nav-dropdown" id="navDropdown">
     <button class="nav-btn nav-split-mobile" onclick="splitRight();toggleHamburger()" style="display:none">&#9707; Split Right</button>
@@ -2138,6 +2165,7 @@ APP_HTML = """<!DOCTYPE html>
     <button class="nav-btn" onclick="addDesktopTab();toggleHamburger()">&#128421; Desktop</button>
     <button class="nav-btn" onclick="reconnect();toggleHamburger()">&#8635; Reconnect</button>
     <button class="nav-btn" onclick="showHelp();toggleHamburger()">&#10068; Help</button>
+    <button class="nav-btn" onclick="showAbout();toggleHamburger()">&#9432; About</button>
     <button class="nav-btn" onclick="logout()" style="color:#e94560;">&#9211; Logout</button>
   </div>
   <div class="nav-right">
@@ -2341,6 +2369,33 @@ APP_HTML = """<!DOCTYPE html>
     </div>
     <div class="fp-modal-body" style="overflow-y:auto">
       <div id="helpContent" class="fp-modal-md-render" style="display:block"></div>
+    </div>
+  </div>
+</div>
+
+<div class="fp-modal-overlay" id="aboutModal">
+  <div class="fp-modal" style="max-width:520px;height:auto;max-height:80vh">
+    <div class="fp-modal-header">
+      <span class="fp-modal-title">&#9432; About</span>
+      <button class="fp-btn" onclick="closeAbout()">&#10005;</button>
+    </div>
+    <div class="fp-modal-body" style="overflow-y:auto;padding:24px 28px;line-height:1.6">
+      <div style="font-size:18px;font-weight:600;margin-bottom:6px">&#9611; Web Terminal</div>
+      <div style="color:#9a9abf;margin-bottom:18px">
+        Browser-based multi-tenant terminal with file management,
+        split panes, themes, and remote desktop access. Each user gets
+        an isolated shell session under their own system account.
+      </div>
+      <table style="width:100%;border-collapse:collapse;font-size:14px">
+        <tr><td style="color:#9a9abf;padding:4px 0;width:110px">Version</td><td id="aboutVersion" style="font-family:monospace"></td></tr>
+        <tr><td style="color:#9a9abf;padding:4px 0">Build</td><td id="aboutBuild" style="font-family:monospace"></td></tr>
+        <tr><td style="color:#9a9abf;padding:4px 0">User</td><td id="aboutUser" style="font-family:monospace"></td></tr>
+        <tr><td style="color:#9a9abf;padding:4px 0">Source</td><td><a href="https://github.com/micsapp/micsapp-webterminal" target="_blank" rel="noopener" style="color:#e94560">github.com/micsapp/micsapp-webterminal</a></td></tr>
+      </table>
+      <div style="margin-top:20px;display:flex;gap:8px;justify-content:flex-end">
+        <button class="fp-btn" onclick="showHelp();closeAbout()">View Manual</button>
+        <button class="fp-btn" onclick="closeAbout()">Close</button>
+      </div>
     </div>
   </div>
 </div>
@@ -3756,6 +3811,23 @@ function closeHelp() {
 }
 document.getElementById('helpModal').addEventListener('click', (e) => {
   if (e.target.id === 'helpModal') closeHelp();
+});
+
+// About dialog — version, build, brief description.
+const APP_VERSION = '__APP_VERSION__';
+const APP_BUILD = '__APP_BUILD__';
+const APP_USERNAME = '__USERNAME__';
+function showAbout() {
+  document.getElementById('aboutVersion').textContent = APP_VERSION;
+  document.getElementById('aboutBuild').textContent = APP_BUILD;
+  document.getElementById('aboutUser').textContent = APP_USERNAME;
+  document.getElementById('aboutModal').classList.add('open');
+}
+function closeAbout() {
+  document.getElementById('aboutModal').classList.remove('open');
+}
+document.getElementById('aboutModal').addEventListener('click', (e) => {
+  if (e.target.id === 'aboutModal') closeAbout();
 });
 
 // Keyboard shortcuts
@@ -7289,6 +7361,8 @@ except Exception as ex:
                 .replace("__TTYD_PORT__", str(port))
                 .replace("__USERNAME__", username)
                 .replace("__COOKIE_NAME__", COOKIE_NAME)
+                .replace("__APP_VERSION__", APP_VERSION)
+                .replace("__APP_BUILD__", APP_BUILD)
             )
             self.send_response(200)
             self.send_header("Content-Type", "text/html")

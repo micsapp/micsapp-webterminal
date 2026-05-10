@@ -17,10 +17,11 @@
   },
   "scripts": {
     "start": "node bin/mics_cli.js",
-    "build": "node scripts/build-host.js",
-    "build:linux": "pkg . --targets node20-linux-x64 --output dist/mics_cli-linux-x64 && pkg . --targets node20-linux-arm64 --output dist/mics_cli-linux-arm64",
-    "build:mac": "pkg . --targets node20-macos-x64 --output dist/mics_cli-macos-x64 && pkg . --targets node20-macos-arm64 --output dist/mics_cli-macos-arm64",
-    "build:win": "pkg . --targets node20-win-x64 --output dist/mics_cli-win-x64.exe",
+    "build-info": "node scripts/build-info.js",
+    "build": "npm run build-info && node scripts/build-host.js",
+    "build:linux": "npm run build-info && pkg . --targets node20-linux-x64 --output dist/mics_cli-linux-x64 && pkg . --targets node20-linux-arm64 --output dist/mics_cli-linux-arm64",
+    "build:mac": "npm run build-info && pkg . --targets node20-macos-x64 --output dist/mics_cli-macos-x64 && pkg . --targets node20-macos-arm64 --output dist/mics_cli-macos-arm64",
+    "build:win": "npm run build-info && pkg . --targets node20-win-x64 --output dist/mics_cli-win-x64.exe",
     "build:all": "npm run build:linux && npm run build:mac && npm run build:win",
     "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\""
   },
