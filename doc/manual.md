@@ -234,9 +234,73 @@ Click **Revoke** next to any token in the Settings panel to permanently delete i
 
 ---
 
+## Command-Line Client (`mics_cli`)
+
+A Node.js CLI distributed alongside the server in the `cli/` directory. It wraps the HTTP API so you can interact with the webterminal from any machine that has Node 18+ — or as a single packaged binary built with `./build_cli.sh`.
+
+The CLI keeps zero runtime dependencies and works entirely over the same HTTPS path the SPA uses, so it goes straight through cloudflared without needing SSH or any extra firewall rules.
+
+### Setup
+
+```sh
+cd cli
+npm link                                            # installs the `mics_cli` binary
+mics_cli login --url https://your-host              # mints a bearer token
+```
+
+The token is saved to `~/.mics-webterminal/auth.json` (mode 0600). You can also point at an existing token via a `.env` file:
+
+```
+MICS_TOKEN=agt_xxxxxxxxxxxxxxxx
+MICS_URL=https://your-host
+```
+
+### Commands
+
+```text
+mics_cli exec <command>                  Run a shell command (one-shot)
+mics_cli shell                           Open an interactive shell (WebSocket)
+mics_cli ls [path]                       List files in a directory
+mics_cli cat <path>                      Print a text file
+mics_cli download <path> [-o file]       Download a file
+mics_cli upload <local> <remote-dir>     Upload a local file
+mics_cli mkdir <path>                    Create a directory
+mics_cli rm <path>                       Delete a file or directory
+mics_cli tokens list                     List your bearer tokens
+mics_cli tokens revoke <name>            Revoke a token
+mics_cli quick-commands list/export/import
+mics_cli login / logout / whoami / help [cmd]
+```
+
+### Examples
+
+```sh
+mics_cli exec "uname -a"                            # one-shot command
+mics_cli exec "wc -l" --stdin-file ./access.log     # pipe stdin to remote
+mics_cli shell                                      # full interactive shell
+mics_cli ls ~                                       # browse files
+mics_cli upload ./build.tar.gz ~/uploads
+mics_cli download ~/notes.md -o ./notes.md
+```
+
+`exec` exits with the remote command's exit code, so it composes naturally with shell pipelines. See [`cli/README.md`](https://github.com/micsapp/micsapp-webterminal/blob/main/cli/README.md) for full per-command flags and options.
+
+### Building a standalone binary
+
+```sh
+./build_cli.sh           # current OS/arch  → cli/dist/mics_cli (~57MB)
+./build_cli.sh linux     # Linux x64 + arm64
+./build_cli.sh mac       # macOS x64 + arm64
+./build_cli.sh win       # Windows x64
+```
+
+The resulting binary bundles Node and runs on machines that don't have Node installed.
+
+---
+
 ## Shell Command Execution (`/api/exec`)
 
-The `/api/exec` endpoint lets you run shell commands remotely and receive structured output. Requires a session cookie or bearer token.
+The `/api/exec` endpoint lets you run shell commands remotely and receive structured output. Requires a session cookie or bearer token. The CLI's `mics_cli exec` is a thin wrapper over this endpoint.
 
 ### Request
 
@@ -267,6 +331,43 @@ Request body is limited to 64 KB.
 ```
 
 Stdout and stderr are each capped at 512 KB. Commands that exceed the timeout return HTTP 408.
+
+---
+
+## Interactive Shell (`/api/shell`)
+
+`/api/shell` upgrades the connection to a **WebSocket** and pumps bytes between the client and a fresh `sudo -u <user> -i` login shell on a PTY. Bearer-token auth, same as `/api/exec`. This is the endpoint behind `mics_cli shell`.
+
+Because the session rides on the existing HTTPS tunnel, it works through cloudflared with no extra SSH route — you don't need port 22 open anywhere.
+
+### Query parameters
+
+| Param | Default | Description |
+|-------|---------|-------------|
+| `cols` | 80 | Initial terminal width |
+| `rows` | 24 | Initial terminal height |
+
+### WebSocket protocol
+
+| Direction | Frame type | Meaning |
+|-----------|------------|---------|
+| Server → Client | Binary | Raw PTY output bytes |
+| Client → Server | Binary | Raw input bytes (keystrokes) |
+| Client → Server | Text | JSON control messages |
+
+The only control message defined today is window resize:
+
+```json
+{"type": "resize", "cols": 120, "rows": 40}
+```
+
+### Quickest way to use it
+
+```sh
+mics_cli shell
+```
+
+The CLI handles raw stdin mode, forwards `SIGWINCH`, echoes binary output to stdout, and tears down cleanly when the remote shell exits. Type `exit` (or `Ctrl+D`) to end the session.
 
 ---
 
