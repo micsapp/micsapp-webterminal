@@ -72,6 +72,8 @@ mics_cli --token agt_… --url https://term.example.com ls
 ```text
 mics_cli exec <command>                  Run a shell command
 mics_cli shell                           Open an interactive shell (WebSocket)
+mics_cli use <profile>                   Switch the active server profile
+mics_cli profiles [list|rm|rename]       Manage saved profiles
 mics_cli ls [path]                       List files in a directory
 mics_cli cat <path>                      Print a text file
 mics_cli download <path> [-o file]       Download a file
@@ -89,6 +91,29 @@ mics_cli whoami                          Show current config
 mics_cli help <command>                  Detailed help
 ```
 
+### Profiles (multi-server)
+
+Each `mics_cli login` saves a **profile** to `~/.mics-webterminal/profiles/<name>.json`.
+The active profile is recorded in `~/.mics-webterminal/current` and used by every
+command that doesn't pass `--token`/`--url` explicitly. Switch between servers
+without re-entering credentials:
+
+```sh
+mics_cli login --url https://dev-ssh.wetigu.com   # creates profile "dev-ssh", makes it active
+mics_cli login --url https://prod.example.com      # creates profile "prod", switches to it
+mics_cli use dev-ssh                               # switch back
+mics_cli profiles                                  # list all profiles, marks active
+mics_cli --profile prod exec "uname -a"            # one-shot use without switching
+```
+
+Profile name defaults to the URL's first hostname label (`dev-ssh.wetigu.com` → `dev-ssh`).
+Override with `--profile <name>`. Re-using an auto-derived name needs `--force`;
+explicit `--profile NAME` always overwrites.
+
+Migrating from an older single-file `auth.json`? The CLI auto-migrates on first
+run — your existing login keeps working under a profile name derived from the
+saved URL.
+
 ### Where the token comes from
 
 `mics_cli` resolves the token in this order (first match wins):
@@ -96,9 +121,12 @@ mics_cli help <command>                  Detailed help
 1. `--token <t>` flag
 2. `MICS_TOKEN` env var
 3. `.env` file (cwd or any parent)
-4. `~/.mics-webterminal/auth.json` (written by `mics_cli login`)
+4. `--profile NAME` flag (loads `profiles/NAME.json`)
+5. `MICS_PROFILE` env var
+6. The active profile (`~/.mics-webterminal/current`)
 
-`mics_cli whoami` prints which source the active token came from.
+`mics_cli whoami` prints which source the active token came from and lists every
+saved profile.
 
 Add `--json` to most commands for machine-readable output.
 

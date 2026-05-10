@@ -1,7 +1,8 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { loadConfig, writeAuthFile, clearAuthFile, normalizeBaseUrl, AUTH_FILE } = require('./config');
+const { loadConfig, normalizeBaseUrl } = require('./config');
+const profileMod = require('./profile');
 const { buildClient, ApiError } = require('./api');
 const { parseArgs } = require('./args');
 const wsClient = require('./ws');
@@ -16,6 +17,8 @@ Usage:
 Commands:
   exec <command>             Run a shell command remotely (POST /api/exec)
   shell                      Open an interactive shell over WebSocket
+  use <profile>              Switch the active profile
+  profiles [list|rm|rename]  Manage saved server profiles
   ls [path]                  List files in a directory
   cat <path>                 Print a text file's contents
   download <path>            Download a file
@@ -38,12 +41,18 @@ Global options:
   --env-file <path>          Load env from a specific file (default: walk up from cwd)
   --token <t>                Override MICS_TOKEN
   --url <baseurl>            Override MICS_URL (e.g. https://term.example.com)
+  --profile <name>           Use a specific saved profile for this call
   --json                     Print raw JSON output where applicable
   -h, --help                 Show help
 
+Profiles live in ~/.mics-webterminal/profiles/. Token resolution priority
+(highest first): --token  >  MICS_TOKEN env  >  .env MICS_TOKEN  >
+--profile NAME  >  MICS_PROFILE env  >  active profile (~/.mics-webterminal/current).
+
 Configuration via .env (in cwd or any parent directory):
-  MICS_TOKEN=agt_...         Required. Mint with \`mics_cli login\` or via the UI.
-  MICS_URL=https://...       Required. Site root, with or without /api suffix.
+  MICS_TOKEN=agt_...         Optional. Overrides any saved profile token.
+  MICS_URL=https://...       Optional. Overrides any saved profile URL.
+  MICS_PROFILE=name          Optional. Selects a saved profile by name.
 
 Run \`mics_cli help <command>\` for detailed usage.
 `;
@@ -125,23 +134,32 @@ Subcommands:
   export [-o file]           Export as JSON (stdout, or to file via -o)
   import <file> [--mode m]   Import from a JSON file. mode is 'merge' (default) or 'replace'.
 `,
-  whoami: `mics_cli whoami
+  whoami: `mics_cli whoami [--json]
 
-Prints the configured base URL, env file path, saved auth path, and which
-source the active token came from (flag / env / env-file / saved).
+Prints the active profile, the profile actually in use for this call,
+the configured base URL, env file path, token source, and the list of
+all saved profiles. The "active" profile is the one stored in
+~/.mics-webterminal/current; the "in use" profile may differ if you
+passed --profile or set MICS_PROFILE.
 `,
   login: `mics_cli login [options]
 
-Logs in with your webterminal username/password and mints a bearer token,
-saved to ~/.mics-webterminal/auth.json (mode 0600).
+Logs in with your webterminal username/password and saves a bearer token
+to a profile file (~/.mics-webterminal/profiles/<name>.json, mode 0600).
+The new profile becomes active by default.
 
 Options:
   --username <name>      Login username (otherwise prompted)
   --password <pw>        Login password (otherwise prompted, hidden)
-  --url <baseurl>        Base URL (defaults to MICS_URL or saved). Trailing
-                         /api is stripped automatically.
+  --url <baseurl>        Base URL (defaults to MICS_URL or current profile).
+                         Trailing /api is stripped automatically.
+  --profile <name>       Profile name (default: derived from URL hostname,
+                         e.g. https://dev-ssh.example.com → "dev-ssh")
+  --no-switch            Don't switch the active profile to this one
+  --force                Overwrite an existing auto-derived profile name
+                         (explicit --profile NAME always overwrites)
   --name <text>          Display name for the minted token (default:
-                         "mics_cli@<hostname> YYYY-MM-DD")
+                         "mics_cli@<hostname> YYYY-MM-DD HH:MM")
 
 Already have a bearer token? Skip the username/password flow:
   --token <agt_…>        Save this token directly (validated against
@@ -152,11 +170,39 @@ Token resolution priority (highest first):
   1. --token flag (on any command)
   2. MICS_TOKEN env var
   3. .env file (cwd or any parent)
-  4. ~/.mics-webterminal/auth.json
+  4. --profile NAME flag (loads profiles/NAME.json)
+  5. MICS_PROFILE env var
+  6. active profile (~/.mics-webterminal/current)
 `,
-  logout: `mics_cli logout
+  logout: `mics_cli logout [options]
 
-Removes ~/.mics-webterminal/auth.json. Does not touch any .env files.
+Removes the active profile file and clears ~/.mics-webterminal/current.
+If other profiles still exist, the first remaining one becomes active so
+you don't end up with no default.
+
+Options:
+  --profile <name>       Log out of a specific profile instead of the active one
+  --all                  Remove every profile (and the current pointer)
+
+Use \`mics_cli profiles rm <name>\` to delete one profile without affecting
+which is active.
+`,
+  use: `mics_cli use <profile>
+
+Switches the active profile (writes ~/.mics-webterminal/current). All
+later commands without an explicit --profile / --url use this one.
+Run \`mics_cli profiles\` to see the available names.
+`,
+  profiles: `mics_cli profiles [subcommand]
+
+Subcommands:
+  list                       (default) List all saved profiles
+  rm <name>                  Delete a profile (clears active if it was active)
+  rename <old> <new>         Rename a profile (updates active if needed)
+
+Profiles live in ~/.mics-webterminal/profiles/<name>.json (mode 0600).
+\`mics_cli use <name>\` switches which one is active; \`mics_cli login\`
+creates / overwrites a profile.
 `
 };
 
@@ -165,8 +211,14 @@ function out(s) { process.stdout.write(s + '\n'); }
 function err(s) { process.stderr.write(s + '\n'); }
 
 function buildContext(flags) {
-  const cfg = loadConfig({ envFile: flags['env-file'] });
-  if (flags.token) cfg.token = flags.token;
+  const cfg = loadConfig({
+    envFile: flags['env-file'],
+    profile: flags.profile
+  });
+  if (flags.token) {
+    cfg.token = flags.token;
+    cfg.tokenSource = 'flag';
+  }
   if (flags.url) cfg.baseUrl = normalizeBaseUrl(flags.url);
   return { cfg, api: buildClient(cfg) };
 }
@@ -375,16 +427,52 @@ async function cmdQuickCommands(rest) {
 }
 
 async function cmdWhoami(rest) {
-  const f = parseArgs(rest);
+  const f = parseArgs(rest, { boolFlags: ['json'] });
   const { cfg } = buildContext(f);
-  let source = cfg.tokenSource || 'none';
-  if (f.token) source = 'flag';
+  const allProfiles = profileMod.listProfiles();
+  const current = profileMod.getCurrent();
+
+  if (f.json) {
+    return printJson({
+      active_profile: current || null,
+      profile_in_use: cfg.profileName || null,
+      profile_source: cfg.profileSource,
+      base_url: cfg.baseUrl,
+      env_file: cfg.envFilePath || null,
+      token_source: cfg.tokenSource,
+      token_prefix: cfg.token ? cfg.token.slice(0, 8) + '…' : null,
+      username: cfg.savedUsername || null,
+      profiles: allProfiles.map(name => {
+        const p = profileMod.readProfile(name) || {};
+        return {
+          name,
+          base_url: p.baseUrl || null,
+          username: p.username || null,
+          active: name === current
+        };
+      })
+    });
+  }
+
+  out(`active:     ${current || '(none)'}`);
+  if (cfg.profileName && cfg.profileName !== current) {
+    out(`in use:     ${cfg.profileName} (via ${cfg.profileSource})`);
+  }
   out(`base url:   ${cfg.baseUrl}`);
   out(`env file:   ${cfg.envFilePath || '(none found)'}`);
-  out(`auth file:  ${AUTH_FILE}`);
-  out(`token src:  ${source}`);
+  out(`token src:  ${cfg.tokenSource || 'none'}`);
   out(`token:      ${cfg.token ? cfg.token.slice(0, 8) + '…' : '(not set)'}`);
   if (cfg.savedUsername) out(`username:   ${cfg.savedUsername}`);
+  if (allProfiles.length) {
+    out('profiles:');
+    for (const name of allProfiles) {
+      const p = profileMod.readProfile(name) || {};
+      const tag = name === current ? '  (active)' : '';
+      out(`  ${name.padEnd(16)}${(p.baseUrl || '').padEnd(40)}${tag}`);
+    }
+  } else {
+    out('profiles:   (none — run `mics_cli login` to create one)');
+  }
 }
 
 // Visible-input prompt — used for usernames, confirmations.
@@ -555,12 +643,34 @@ async function cmdShell(rest) {
   process.exit(errored ? 1 : 0);
 }
 
+// Resolve the profile name for this login + decide whether we'd overwrite.
+// Returns { name, exists, explicit }.
+function resolveLoginProfile(flags, baseUrl) {
+  const explicit = !!flags.profile;
+  let name = flags.profile || profileMod.deriveName(baseUrl);
+  profileMod.validateName(name);
+  return { name, exists: profileMod.profileExists(name), explicit };
+}
+
 async function cmdLogin(rest) {
-  const f = parseArgs(rest, { boolFlags: ['no-validate'] });
-  const { loadConfig } = require('./config');
+  const f = parseArgs(rest, { boolFlags: ['no-validate', 'no-switch', 'force'] });
   const cfgPre = loadConfig({ envFile: f['env-file'] });
   const baseUrl = normalizeBaseUrl(f.url || cfgPre.baseUrl);
   if (!baseUrl) throw new Error('login requires --url or MICS_URL set in your environment');
+
+  const { name: profileName, exists: profileExists, explicit: profileExplicit } =
+    resolveLoginProfile(f, baseUrl);
+
+  // Auto-derived name collisions need --force to overwrite. Explicit --profile
+  // is treated as the user asking for that name specifically, so we allow
+  // overwrite without --force (matches the old single-file overwrite UX).
+  if (profileExists && !profileExplicit && !f.force) {
+    throw new Error(
+      `profile "${profileName}" already exists. ` +
+      `Use --profile <new-name> to pick a different name, ` +
+      `or --force to overwrite (the old token will no longer be remembered).`
+    );
+  }
 
   // ── Path 1: --token escape hatch (save an existing bearer token directly).
   if (f.token) {
@@ -573,8 +683,12 @@ async function cmdLogin(rest) {
         throw new Error(`token validation failed: ${msg}`);
       }
     }
-    writeAuthFile({ token, baseUrl, saved_at: new Date().toISOString() });
-    out(`saved to  ${AUTH_FILE}`);
+    profileMod.writeProfile(profileName, {
+      token, baseUrl, saved_at: new Date().toISOString()
+    });
+    if (!f['no-switch']) profileMod.setCurrent(profileName);
+    out(`saved to  ${profileMod.profilePath(profileName)}`);
+    out(`profile:  ${profileName}${f['no-switch'] ? '' : '  (active)'}`);
     out(`base url: ${baseUrl}`);
     out(`token:    ${token.slice(0, 8)}…`);
     warnIfShadowed(cfgPre);
@@ -621,23 +735,123 @@ async function cmdLogin(rest) {
     }
   }
 
-  writeAuthFile({
+  profileMod.writeProfile(profileName, {
     token: secretToken,
     baseUrl,
     username,
     token_name: tokenName,
     saved_at: new Date().toISOString()
   });
+  if (!f['no-switch']) profileMod.setCurrent(profileName);
   out(`logged in as ${username}`);
-  out(`saved to  ${AUTH_FILE}`);
+  out(`saved to  ${profileMod.profilePath(profileName)}`);
+  out(`profile:  ${profileName}${f['no-switch'] ? '' : '  (active)'}`);
   out(`base url: ${baseUrl}`);
   out(`token:    ${secretToken.slice(0, 8)}…  (name: ${tokenName})`);
   warnIfShadowed(cfgPre);
 }
 
-async function cmdLogout() {
-  clearAuthFile();
-  out(`removed ${AUTH_FILE}`);
+async function cmdLogout(rest) {
+  const f = parseArgs(rest, { boolFlags: ['all'] });
+  if (f.all) {
+    const all = profileMod.listProfiles();
+    if (!all.length) { out('no profiles to remove'); return; }
+    for (const name of all) profileMod.deleteProfile(name);
+    profileMod.clearCurrent();
+    out(`removed ${all.length} profile${all.length === 1 ? '' : 's'}: ${all.join(', ')}`);
+    return;
+  }
+  const target = f.profile || profileMod.getCurrent();
+  if (!target) {
+    out('no active profile to log out of. Use `mics_cli profiles rm <name>` to delete a specific profile.');
+    return;
+  }
+  const removed = profileMod.deleteProfile(target);
+  if (target === profileMod.getCurrent()) profileMod.clearCurrent();
+  out(removed ? `removed profile: ${target}` : `profile not found: ${target}`);
+  // If there's still another profile, point `current` at the first one so
+  // the user isn't left without a default. Keeps `whoami` informative.
+  if (removed && !profileMod.getCurrent()) {
+    const remaining = profileMod.listProfiles();
+    if (remaining.length) {
+      profileMod.setCurrent(remaining[0]);
+      out(`active profile is now: ${remaining[0]}`);
+    }
+  }
+}
+
+async function cmdUse(rest) {
+  const f = parseArgs(rest);
+  const name = f._[0];
+  if (!name) throw new Error('use requires a profile name. Try `mics_cli profiles` to list available profiles.');
+  profileMod.validateName(name);
+  if (!profileMod.profileExists(name)) {
+    const all = profileMod.listProfiles();
+    throw new Error(
+      `no such profile: ${name}.${all.length ? ` Available: ${all.join(', ')}` : ' Run `mics_cli login` first.'}`
+    );
+  }
+  profileMod.setCurrent(name);
+  const p = profileMod.readProfile(name) || {};
+  out(`active profile: ${name}${p.baseUrl ? `  (${p.baseUrl})` : ''}`);
+}
+
+async function cmdProfiles(rest) {
+  const sub = rest[0] && !rest[0].startsWith('-') ? rest[0] : 'list';
+  const subRest = (sub === rest[0]) ? rest.slice(1) : rest;
+
+  if (sub === 'list') {
+    const f = parseArgs(subRest, { boolFlags: ['json'] });
+    const all = profileMod.listProfiles();
+    const current = profileMod.getCurrent();
+    if (f.json) {
+      return printJson({
+        active: current || null,
+        profiles: all.map(name => {
+          const p = profileMod.readProfile(name) || {};
+          return { name, base_url: p.baseUrl || null, username: p.username || null, active: name === current };
+        })
+      });
+    }
+    if (!all.length) { out('(no profiles — run `mics_cli login` to create one)'); return; }
+    for (const name of all) {
+      const p = profileMod.readProfile(name) || {};
+      const tag = name === current ? '  (active)' : '';
+      out(`${name.padEnd(16)}${(p.baseUrl || '').padEnd(40)}${tag}`);
+    }
+    return;
+  }
+
+  if (sub === 'rm' || sub === 'delete' || sub === 'remove') {
+    const f = parseArgs(subRest);
+    const name = f._[0];
+    if (!name) throw new Error('profiles rm requires a name');
+    profileMod.validateName(name);
+    if (!profileMod.profileExists(name)) throw new Error(`no such profile: ${name}`);
+    profileMod.deleteProfile(name);
+    if (profileMod.getCurrent() === name) profileMod.clearCurrent();
+    out(`removed profile: ${name}`);
+    return;
+  }
+
+  if (sub === 'rename' || sub === 'mv') {
+    const f = parseArgs(subRest);
+    const oldName = f._[0];
+    const newName = f._[1];
+    if (!oldName || !newName) throw new Error('profiles rename requires <old> <new>');
+    profileMod.validateName(oldName);
+    profileMod.validateName(newName);
+    if (!profileMod.profileExists(oldName)) throw new Error(`no such profile: ${oldName}`);
+    if (profileMod.profileExists(newName)) throw new Error(`profile already exists: ${newName}`);
+    const data = profileMod.readProfile(oldName);
+    profileMod.writeProfile(newName, data);
+    profileMod.deleteProfile(oldName);
+    if (profileMod.getCurrent() === oldName) profileMod.setCurrent(newName);
+    out(`renamed ${oldName} → ${newName}`);
+    return;
+  }
+
+  throw new Error(`unknown profiles subcommand: ${sub}\nrun \`mics_cli help profiles\` for usage.`);
 }
 
 // ── Dispatch ─────────────────────────────────────────────────────────────────
@@ -659,13 +873,16 @@ const COMMANDS = {
   qc: cmdQuickCommands,
   login: cmdLogin,
   logout: cmdLogout,
-  whoami: cmdWhoami
+  whoami: cmdWhoami,
+  use: cmdUse,
+  profiles: cmdProfiles,
+  profile: cmdProfiles
 };
 
 // Global flags accepted before the command; lifted out and appended to the
 // command's own argv so `mics_cli --url X exec foo` and `mics_cli exec foo
 // --url X` behave identically.
-const GLOBAL_VALUE_FLAGS = new Set(['--token', '--url', '--env-file']);
+const GLOBAL_VALUE_FLAGS = new Set(['--token', '--url', '--env-file', '--profile']);
 const GLOBAL_BOOL_FLAGS = new Set(['--json']);
 
 function liftGlobalFlags(argv) {

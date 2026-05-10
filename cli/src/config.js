@@ -1,6 +1,6 @@
 const fs = require('fs');
-const os = require('os');
 const path = require('path');
+const profileMod = require('./profile');
 
 // ── Minimal .env parser (no dotenv dependency) ─────────────────────────────
 // Supports `KEY=value`, `KEY="value"`, `KEY='value'`, comments via `#`, blank
@@ -48,23 +48,6 @@ function findEnvFile(startDir) {
   }
 }
 
-// ── Persisted auth state (~/.mics-webterminal/auth.json) ───────────────────
-const AUTH_DIR = path.join(os.homedir(), '.mics-webterminal');
-const AUTH_FILE = path.join(AUTH_DIR, 'auth.json');
-
-function readAuthFile() {
-  try { return JSON.parse(fs.readFileSync(AUTH_FILE, 'utf8')); } catch { return null; }
-}
-
-function writeAuthFile(state) {
-  fs.mkdirSync(AUTH_DIR, { recursive: true });
-  fs.writeFileSync(AUTH_FILE, JSON.stringify(state, null, 2), { mode: 0o600 });
-}
-
-function clearAuthFile() {
-  try { fs.unlinkSync(AUTH_FILE); } catch {}
-}
-
 // Strip trailing slashes and any "/api" suffix — the server's endpoints
 // already start with "/api/...". Storing the bare site root makes it easier
 // to reason about and matches how MICS_URL is typically written.
@@ -72,15 +55,41 @@ function normalizeBaseUrl(u) {
   return String(u).replace(/\/+$/, '').replace(/\/api$/, '');
 }
 
-function loadConfig({ envFile } = {}) {
+// Has the migration banner already been printed in this process? loadConfig
+// is called more than once per invocation (cmdLogin re-loads with --env-file
+// overrides), so guard against double-printing.
+let _migrationAnnounced = false;
+
+function loadConfig({ envFile, profile } = {}) {
+  // One-time migration of the legacy ~/.mics-webterminal/auth.json into a
+  // profile. After a successful migration the legacy file is gone, so this
+  // is a no-op on every subsequent run.
+  const migrated = profileMod.migrateLegacyIfNeeded();
+  if (migrated && !_migrationAnnounced) {
+    _migrationAnnounced = true;
+    process.stderr.write(
+      `migrated ~/.mics-webterminal/auth.json → profiles/${migrated}.json\n`
+    );
+  }
+
   const envPath = envFile
     ? path.resolve(envFile)
     : findEnvFile(process.cwd());
   const fileEnv = envPath ? loadEnvFile(envPath) : {};
   const merged = { ...fileEnv, ...process.env };
-  const saved = readAuthFile();
 
-  // Resolve token with explicit source tracking so `whoami` can explain.
+  // Resolve which profile (if any) is in play. --profile flag wins over env
+  // var, which wins over the persisted `current` pointer. Invalid names from
+  // env / current are silently ignored — the user can fix them with `use`.
+  let profileName = profile || process.env.MICS_PROFILE || profileMod.getCurrent();
+  if (profileName) {
+    try { profileMod.validateName(profileName); }
+    catch { profileName = null; }
+  }
+  const profileState = profileName ? profileMod.readProfile(profileName) : null;
+  const profileSource = profile ? 'flag' : (process.env.MICS_PROFILE ? 'env' : (profileState ? 'current' : null));
+
+  // Token: env > .env > profile.
   let token = '';
   let tokenSource = 'none';
   if (process.env.MICS_TOKEN) {
@@ -89,12 +98,13 @@ function loadConfig({ envFile } = {}) {
   } else if (fileEnv.MICS_TOKEN) {
     token = fileEnv.MICS_TOKEN;
     tokenSource = 'env-file';
-  } else if (saved && saved.token) {
-    token = saved.token;
-    tokenSource = 'saved';
+  } else if (profileState && profileState.token) {
+    token = profileState.token;
+    tokenSource = 'profile';
   }
 
-  let baseUrl = merged.MICS_URL || (saved && saved.baseUrl) || 'http://localhost';
+  // Base URL: env > .env > profile > default.
+  let baseUrl = merged.MICS_URL || (profileState && profileState.baseUrl) || 'http://localhost';
   baseUrl = normalizeBaseUrl(baseUrl);
 
   return {
@@ -102,17 +112,15 @@ function loadConfig({ envFile } = {}) {
     tokenSource,
     baseUrl,
     envFilePath: envPath,
-    authFilePath: saved ? AUTH_FILE : null,
-    savedUsername: saved && saved.username
+    profileName: profileState ? profileName : null,
+    profileSource,
+    savedUsername: profileState && profileState.username,
+    profilesDir: profileMod.PROFILES_DIR
   };
 }
 
 module.exports = {
   loadConfig,
   parseEnv,
-  readAuthFile,
-  writeAuthFile,
-  clearAuthFile,
-  normalizeBaseUrl,
-  AUTH_FILE
+  normalizeBaseUrl
 };
