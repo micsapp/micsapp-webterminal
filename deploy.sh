@@ -6,6 +6,15 @@ set -euo pipefail
 # Health-checks each component and only starts what's actually down.
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# On macOS, non-interactive SSH sessions get a minimal PATH that omits
+# Homebrew's bin dirs, so brew-installed nginx/ttyd/sshpass/cloudflared
+# wouldn't be found. Prepend both common prefixes (Apple Silicon + Intel).
+if [ "$(uname -s)" = "Darwin" ]; then
+  PATH="/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/local/sbin:${PATH}"
+  export PATH
+fi
+
 NGINX_SRC_CONF="${PROJECT_DIR}/nginx/ttyd.conf"
 AUTH_PY="${PROJECT_DIR}/auth.py"
 if [ "$(uname -s)" = "Darwin" ]; then
@@ -175,7 +184,9 @@ install_nginx_conf() {
   local tmp_conf=""
   if [ -n "$hostname" ]; then
     local src_hostname
-    src_hostname="$(grep -oP '^\s*server_name\s+\K\S+(?=;)' "${NGINX_SRC_CONF}" | head -1)"
+    # Portable extraction (BSD grep has no -P): take the first `server_name`
+    # directive's value and strip the trailing semicolon.
+    src_hostname="$(awk '/^[[:space:]]*server_name[[:space:]]+/ { sub(/;.*$/, "", $2); print $2; exit }' "${NGINX_SRC_CONF}")"
     if [ -n "$src_hostname" ] && [ "$src_hostname" != "$hostname" ]; then
       tmp_conf="$(mktemp)"
       sed "s/server_name ${src_hostname};/server_name ${hostname};/" "${NGINX_SRC_CONF}" > "$tmp_conf"
@@ -536,7 +547,10 @@ _port_listening() {
 
 check_nginx() {
   # Check if nginx master process is running AND listening on our port.
-  if ! pgrep -x nginx >/dev/null 2>&1; then
+  # `pgrep -x` requires exact comm match; on macOS the master's comm is
+  # truncated to "nginx: master pr" (15 chars), so use -f instead which
+  # matches the full command line on both Linux and macOS.
+  if ! pgrep -f '(^|/)nginx($|: master)' >/dev/null 2>&1; then
     return 1
   fi
   _port_listening "${NGINX_PORT}"
