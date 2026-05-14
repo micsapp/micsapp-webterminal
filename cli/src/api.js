@@ -1,5 +1,6 @@
 const fs = require('fs');
 const path = require('path');
+require('./fetch-polyfill');
 
 class ApiError extends Error {
   constructor(status, body) {
@@ -11,9 +12,6 @@ class ApiError extends Error {
 }
 
 function buildClient({ token, baseUrl }) {
-  if (typeof fetch !== 'function') {
-    throw new Error('Node 18+ is required (global fetch is missing)');
-  }
 
   function authHeaders(extra = {}) {
     if (!token) {

@@ -6,12 +6,13 @@ set -euo pipefail
 # argument to cross-compile (or 'all' for every supported target).
 #
 # Usage:
-#   ./build_cli.sh              # current host (fast)
-#   ./build_cli.sh linux        # Linux x64 + arm64
-#   ./build_cli.sh mac          # macOS x64 + arm64
-#   ./build_cli.sh win          # Windows x64
-#   ./build_cli.sh all          # all five
-#   ./build_cli.sh clean        # rm cli/dist/
+#   ./build_cli.sh                   # current host (fast)
+#   ./build_cli.sh linux             # Linux x64 + arm64 (node20, glibc 2.28+)
+#   ./build_cli.sh linux-portable    # Linux x64 + arm64 (node16, glibc 2.17 / Ubuntu 16.04+)
+#   ./build_cli.sh mac               # macOS x64 + arm64
+#   ./build_cli.sh win               # Windows x64
+#   ./build_cli.sh all               # everything (modern + portable Linux + mac + win)
+#   ./build_cli.sh clean             # rm cli/dist/
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CLI_DIR="${PROJECT_DIR}/cli"
@@ -55,8 +56,12 @@ case "${TARGET}" in
     npm run build
     ;;
   linux)
-    say "==> building Linux x64 + arm64"
+    say "==> building Linux x64 + arm64 (modern, glibc 2.28+)"
     npm run build:linux
+    ;;
+  linux-portable|portable)
+    say "==> building Linux x64 + arm64 (portable, glibc 2.17 / Ubuntu 16.04+)"
+    npm run build:linux-portable
     ;;
   mac|macos|darwin)
     say "==> building macOS x64 + arm64"
@@ -77,7 +82,7 @@ case "${TARGET}" in
     ;;
   *)
     err "unknown target: ${TARGET}"
-    err "use one of: host | linux | mac | win | all | clean"
+    err "use one of: host | linux | linux-portable | mac | win | all | clean"
     exit 1
     ;;
 esac
