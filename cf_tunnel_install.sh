@@ -505,12 +505,19 @@ server {
         # Allow sub_filter to operate (disable upstream compression).
         proxy_set_header Accept-Encoding "";
 
-        # Inject a small helper into ttyd HTML so the iframe exposes the xterm instance.
-        # This enables reliable buffer readback for mobile copy/select.
+        # Inject a helper script into ttyd HTML so the iframe exposes the xterm instance.
+        # Use an external script (same-origin) to avoid CSP issues with inline scripts.
         sub_filter_once on;
-        sub_filter '</body>' '<script>(function(){function L(o){return o&&typeof o.setOption==="function"&&(typeof o.write==="function"||typeof o.paste==="function"||typeof o.open==="function");}function F(w){try{var c=[w.term,w.terminal,w.xterm,w.ttyd&&w.ttyd.term,w.app&&w.app.term,w.app&&w.app.terminal];for(var i=0;i<c.length;i++){if(L(c[i]))return c[i];}var k=Object.getOwnPropertyNames(w);for(var j=0;j<k.length;j++){var n=k[j],v;try{v=w[n];}catch(e){continue;}if(L(v))return v;if(v&&typeof v==="object"){try{if(L(v.term))return v.term;if(L(v.terminal))return v.terminal;}catch(e2){}}}}catch(e3){}return null;}function E(){var t=F(window);if(t){window.term=t;window.terminal=t;window.xterm=t;return true;}return false;}if(!E()){var n=0,iv=setInterval(function(){n++;if(E()||n>50)clearInterval(iv);},200);}})();</script></body>';
+        sub_filter '</head>' '<script src="/api/term-hook.js"></script></head>';
         proxy_read_timeout 86400s;
         proxy_send_timeout 86400s;
+    }
+
+    # Helper script used by /ut/... injection (requires auth)
+    location = /api/term-hook.js {
+        auth_request /api/auth;
+        error_page 401 = @login_redirect;
+        proxy_pass http://127.0.0.1:${auth_port};
     }
 
     location @login_redirect {
@@ -858,8 +865,17 @@ document.getElementById('form').addEventListener('submit', async (e) => {
 TERM_HOOK_JS = r"""// ttyd term hook (injected by nginx into /ut/... HTML)
 (function () {
   function looksLikeTerminal(obj) {
-    return !!obj && typeof obj.setOption === 'function' &&
-      (typeof obj.write === 'function' || typeof obj.paste === 'function' || typeof obj.open === 'function');
+    return !!obj && (
+      typeof obj.scrollLines === 'function' ||
+      typeof obj.write === 'function' ||
+      typeof obj.paste === 'function' ||
+      typeof obj.open === 'function'
+    ) && (
+      typeof obj.loadAddon === 'function' ||
+      typeof obj.onData === 'function' ||
+      typeof obj.scrollLines === 'function' ||
+      !!obj._core
+    );
   }
 
   function findTerminalObject(win) {
@@ -917,10 +933,85 @@ TERM_HOOK_JS = r"""// ttyd term hook (injected by nginx into /ut/... HTML)
   // Hold Alt (Option on Mac) to temporarily bypass and send mouse events
   // to TUI apps (htop, vim, etc.) that need mouse interaction.
 
+  // ------------------------------------------------------------------
+  // Mobile touch scrollback. On phones/tablets tmux's "mouse on" turns
+  // single-finger drags into mouse-selection events, so the browser
+  // never gets to scroll the xterm viewport. Translate single-touch
+  // vertical drags into synthetic WheelEvent dispatches on the xterm
+  // element so touches go through the same pipeline as a desktop mouse
+  // wheel: xterm forwards as an SGR mouse escape to tmux when mouse
+  // reporting is on, or scrolls local scrollback when it's off. Capture
+  // phase + preventDefault on every single-touch touchmove suppresses
+  // synthetic mouse events that would otherwise activate selection.
+  // Multi-touch and plain taps are left alone (synthetic click still
+  // fires for tap-to-focus).
+  // ------------------------------------------------------------------
+  function _termElement(term) {
+    try {
+      if (term && term.element) return term.element;
+      if (term && term._core && term._core.element) return term._core.element;
+    } catch (e) {}
+    return document.querySelector('.xterm') || document.body;
+  }
+  function _sendWheel(dyPx) {
+    var el = _termElement(window.term);
+    if (!el || typeof WheelEvent === 'undefined') return false;
+    try {
+      el.dispatchEvent(new WheelEvent('wheel', {
+        bubbles: true, cancelable: true,
+        clientX: 0, clientY: 0,
+        deltaX: 0, deltaY: dyPx, deltaMode: 0
+      }));
+      return true;
+    } catch (e) { return false; }
+  }
+  var _touchY = null;
+  var _wheelAccum = 0;
+  var _touchActive = false;
+  document.addEventListener('touchstart', function (e) {
+    if (e.touches && e.touches.length === 1) {
+      _touchY = e.touches[0].clientY;
+      _wheelAccum = 0;
+      _touchActive = true;
+    } else {
+      _touchY = null;
+      _touchActive = false;
+    }
+  }, { passive: true, capture: true });
+  document.addEventListener('touchmove', function (e) {
+    if (_touchY === null || !e.touches || e.touches.length !== 1) return;
+    var y = e.touches[0].clientY;
+    _wheelAccum += (_touchY - y);
+    _touchY = y;
+    // Batch tiny touch samples until we have a meaningful pixel delta;
+    // xterm internally converts deltaY → lines and forwards to tmux.
+    if (Math.abs(_wheelAccum) >= 12) {
+      _sendWheel(_wheelAccum);
+      _wheelAccum = 0;
+    }
+    // Always preventDefault for single-finger drags so synthetic mouse
+    // events don't fire and trigger xterm selection / tmux mouse drag.
+    try { e.preventDefault(); } catch (err) {}
+  }, { passive: false, capture: true });
+  function _endTouch() {
+    _touchY = null;
+    _wheelAccum = 0;
+    // Hold the active flag briefly so the synthetic mouseup/click from
+    // a tap doesn't get its shiftKey faked by the mouse handler below.
+    setTimeout(function () { _touchActive = false; }, 500);
+  }
+  document.addEventListener('touchend', _endTouch, { passive: true, capture: true });
+  document.addEventListener('touchcancel', _endTouch, { passive: true, capture: true });
+
+  // Force xterm.js to bypass mouse reporting for click/drag events so that
+  // native text selection works, while leaving wheel events untouched so
+  // tmux mouse scroll keeps working. xterm.js skips mouse reporting when
+  // it sees shiftKey === true on the event. Hold Alt to bypass (lets TUI
+  // apps see real mouse). While a touch sequence is active we skip the
+  // fake so synthetic mouse events from touch don't start selection.
   ['mousedown', 'mousemove', 'mouseup', 'click', 'dblclick'].forEach(function (t) {
     document.addEventListener(t, function (e) {
-      // Alt+click: let mouse through to terminal app (for TUI interaction)
-      // Otherwise: fake shiftKey so xterm.js does native text selection
+      if (_touchActive) return;
       if (!e.shiftKey && !e.altKey) {
         Object.defineProperty(e, 'shiftKey', { get: function () { return true; } });
       }
@@ -2250,6 +2341,11 @@ APP_HTML = """<!DOCTYPE html>
       </label>
     </div>
   </div>
+  <div class="setting-group">
+    <label>Browser Tab Title</label>
+    <input type="text" id="titleTemplate" value="{tab} &mdash; Web Terminal" placeholder="{tab} &mdash; Web Terminal" spellcheck="false">
+    <div style="color:#7a7a9e;font-size:11px;margin-top:4px;">Placeholders: <code>{tab}</code> active tab, <code>{user}</code>, <code>{host}</code>, <code>{count}</code> tab count.</div>
+  </div>
   <button class="apply-btn" onclick="applySettings()">Apply to All Tabs</button>
   <div style="flex-basis:100%;border-top:1px solid #0f3460;padding-top:14px;margin-top:4px;">
     <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;">
@@ -2984,6 +3080,7 @@ function closeTab(id, e) {
 
 function switchTab(id) {
   activeTabId = id;
+  updateDocumentTitle();
   if (isSplitActive()) {
     const focusId = focusedPaneTabId;
     const focusedPane = focusId ? findPaneNode(splitRoot, focusId) : null;
@@ -3030,6 +3127,7 @@ function switchTab(id) {
 }
 
 function renderTabs() {
+  updateDocumentTitle();
   const bar = document.getElementById('tabBar');
   bar.innerHTML = '';
   tabs.forEach(t => {
@@ -3101,12 +3199,32 @@ function getSettings() {
     cursorBlink: document.getElementById('cursorBlink').checked,
     scrollback: document.getElementById('scrollback').value,
     disableLeaveAlert: document.getElementById('disableLeaveAlert').checked,
+    titleTemplate: document.getElementById('titleTemplate').value,
     theme: currentTheme,
     colorBg: document.getElementById('colorBg').value,
     colorFg: document.getElementById('colorFg').value,
     colorCursor: document.getElementById('colorCursor').value,
     colorSelection: document.getElementById('colorSelection').value,
   };
+}
+
+const DEFAULT_TITLE_TEMPLATE = '{tab} — Web Terminal';
+
+function updateDocumentTitle() {
+  let tpl = '';
+  try {
+    const el = document.getElementById('titleTemplate');
+    if (el) tpl = el.value;
+  } catch(e) {}
+  if (!tpl) tpl = DEFAULT_TITLE_TEMPLATE;
+  const active = tabs.find(t => t.id === activeTabId);
+  const tabName = active ? active.name : '';
+  const title = tpl
+    .replace(/\\{tab\\}/g, tabName)
+    .replace(/\\{user\\}/g, APP_USERNAME || '')
+    .replace(/\\{host\\}/g, window.location.host || '')
+    .replace(/\\{count\\}/g, String(tabs.length));
+  document.title = title || DEFAULT_TITLE_TEMPLATE.replace('{tab}', tabName);
 }
 
 function clampFontSize(v) {
@@ -3135,6 +3253,7 @@ function wireSettingsPersistence() {
   bindPersist('cursorBlink', 'change');
   bindPersist('scrollback', 'change');
   bindPersist('disableLeaveAlert', 'change');
+  bindPersist('titleTemplate', 'input', () => { saveSettingsOnly(); updateDocumentTitle(); });
   bindPersist('colorBg', 'input');
   bindPersist('colorFg', 'input');
   bindPersist('colorCursor', 'input');
@@ -3286,8 +3405,16 @@ function modalPrompt(message, title, defaultValue) {
 }
 
 function looksLikeTerminal(obj) {
-  return !!obj && typeof obj.setOption === 'function' && (
-    typeof obj.write === 'function' || typeof obj.paste === 'function'
+  return !!obj && (
+    typeof obj.scrollLines === 'function' ||
+    typeof obj.write === 'function' ||
+    typeof obj.paste === 'function' ||
+    typeof obj.open === 'function'
+  ) && (
+    typeof obj.loadAddon === 'function' ||
+    typeof obj.onData === 'function' ||
+    typeof obj.scrollLines === 'function' ||
+    !!obj._core
   );
 }
 
@@ -3325,12 +3452,21 @@ function applyFontSizeToFrame(frame, size) {
     const w = frame.contentWindow;
     const term = w ? findTerminalObject(w) : null;
     if (term) {
-      term.setOption('fontSize', size);
-      if (typeof term.refresh === 'function' && typeof term.rows === 'number') {
-        term.refresh(0, Math.max(0, term.rows - 1));
+      let changed = false;
+      if (typeof term.setOption === 'function') {
+        term.setOption('fontSize', size);
+        changed = true;
+      } else if (term.options && typeof term.options === 'object') {
+        term.options.fontSize = size;
+        changed = true;
       }
-      try { w.dispatchEvent(new Event('resize')); } catch (e) {}
-      return true;
+      if (changed) {
+        if (typeof term.refresh === 'function' && typeof term.rows === 'number') {
+          term.refresh(0, Math.max(0, term.rows - 1));
+        }
+        try { w.dispatchEvent(new Event('resize')); } catch (e) {}
+        return true;
+      }
     }
 
     const doc = frame.contentDocument;
@@ -3989,6 +4125,7 @@ function init() {
     if (s.cursorBlink !== undefined) document.getElementById('cursorBlink').checked = s.cursorBlink;
     if (s.scrollback) document.getElementById('scrollback').value = s.scrollback;
     if (s.disableLeaveAlert) document.getElementById('disableLeaveAlert').checked = s.disableLeaveAlert;
+    if (typeof s.titleTemplate === 'string') document.getElementById('titleTemplate').value = s.titleTemplate;
     if (s.theme) { currentTheme = s.theme; applyThemeUI(s.theme); }
     if (s.colorBg) document.getElementById('colorBg').value = s.colorBg;
     if (s.colorFg) document.getElementById('colorFg').value = s.colorFg;

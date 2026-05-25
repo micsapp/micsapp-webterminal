@@ -87,10 +87,33 @@ Click **Settings** in the toolbar to configure the terminal.
 | **Cursor Blink** | On / Off | On |
 | **Scrollback Lines** | 100 -- 100,000 | 10,000 |
 | **Disable Leave Alert** | On / Off | Off |
+| **Browser Tab Title** | Template string (see below) | `{tab} — Web Terminal` |
 
 Click **Apply to All Tabs** to push changes to every open terminal. Settings are saved in your browser and restored on next visit.
 
 The **A-** and **A+** buttons in the toolbar provide quick font size adjustment without opening the settings panel.
+
+### Browser Tab Title
+
+Customize the title shown in the browser tab / OS window title bar. The value is a template with placeholders that get expanded live as you switch tabs, rename a tab, or open/close tabs. Changes apply immediately as you type — no Apply needed.
+
+| Placeholder | Expands to |
+|-------------|------------|
+| `{tab}` | Name of the currently active terminal tab (e.g. `Shell 1`, or whatever you renamed it to) |
+| `{user}` | Logged-in username |
+| `{host}` | Current hostname (e.g. `dev-ssh.wetigu.com`) |
+| `{count}` | Total number of open tabs |
+
+Examples:
+
+| Template | Result |
+|----------|--------|
+| `{tab} — Web Terminal` | `Shell 1 — Web Terminal` (default) |
+| `{tab}` | `Shell 1` |
+| `{user}@{host}` | `mli@dev-ssh.wetigu.com` |
+| `[{count}] {tab} — {user}` | `[3] Shell 2 — mli` |
+
+Leave the field empty to fall back to the default.
 
 ---
 
