@@ -36,7 +36,8 @@
       ".env.example",
       "README.md"
     ],
-    "outputPath": "dist"
+    "outputPath": "dist",
+    "fallbackToSource": true
   },
   "devDependencies": {
     "@yao-pkg/pkg": "^6.7.0"

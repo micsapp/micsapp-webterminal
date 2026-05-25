@@ -277,6 +277,21 @@ main_install() {
   runp cp -f "$tmp" "$target"
   runp chmod 0755 "$target"
 
+  # macOS: pkg cross-builds these binaries on Linux without any code
+  # signature, but Apple Silicon's AMFI kills unsigned arm64 Mach-Os with
+  # SIGKILL ("Killed: 9"). Ad-hoc re-signing fixes it; codesign ships with
+  # macOS so it's always available. Also strip com.apple.quarantine in case a
+  # downloader set it.
+  if [[ "$OS" == macos ]]; then
+    if command -v codesign >/dev/null 2>&1; then
+      runp codesign --force --sign - "$target" 2>/dev/null \
+        || warn "codesign failed; if '$BIN_NAME' dies with 'Killed: 9' run: codesign --force --sign - $target"
+    fi
+    if command -v xattr >/dev/null 2>&1; then
+      runp xattr -d com.apple.quarantine "$target" 2>/dev/null || true
+    fi
+  fi
+
   rm -f "$tmp"; trap - EXIT
 
   ok "Installed $BIN_NAME → $target"
