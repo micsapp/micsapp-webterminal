@@ -5343,41 +5343,26 @@ def spawn_user_vnc(username, password):
             display_num = vnc_port % 1000 + 100
 
         # Spawn Xtigervnc + xfce4-session via SSH as the user
-        # Kill any stale Xtigervnc on this display before starting
         vnc_cmd = (
-            f"rm -f /tmp/.X{display_num}-lock /tmp/.X11-unix/X{display_num} 2>/dev/null;"
-            f" unset DISPLAY;"
-            f" Xtigervnc :{display_num} -rfbport {vnc_port} -localhost=1"
+            f"Xtigervnc :{display_num} -rfbport {vnc_port} -localhost=1"
             f" -SecurityTypes None -geometry 1920x1080 -depth 24 &"
             f" sleep 1; DISPLAY=:{display_num} xfce4-session"
         )
-        # Clear DISPLAY from env to prevent SSH X11 forwarding interference
-        clean_env = {k: v for k, v in os.environ.items() if k != "DISPLAY"}
         vnc_proc = subprocess.Popen(
             [SSHPASS_BIN, "-p", password, SSH_BIN,
              "-o", "StrictHostKeyChecking=no",
              "-o", "ConnectTimeout=5",
-             "-o", "ForwardX11=no",
              "-o", "PreferredAuthentications=password",
              "-o", "PubkeyAuthentication=no",
              "-o", "PasswordAuthentication=yes",
              "-o", "ServerAliveInterval=30",
              f"{username}@127.0.0.1",
              "bash", "-lc", vnc_cmd],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            env=clean_env,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
         )
 
         # Wait for VNC server to be ready
         if not wait_for_ttyd_ready(vnc_port, timeout=6.0):
-            # Capture output for debugging
-            try:
-                out, err = vnc_proc.communicate(timeout=2)
-            except Exception:
-                out, err = b"", b""
-            print(f"[VNC] FAILED for {username} display=:{display_num} port={vnc_port}")
-            print(f"[VNC] stdout: {out[:500]}")
-            print(f"[VNC] stderr: {err[:500]}")
             try:
                 vnc_proc.terminate()
             except Exception:
@@ -5736,7 +5721,7 @@ class AuthHandler(http.server.BaseHTTPRequestHandler):
         raw = req.get("path", "")
         return os.path.expanduser(raw) if raw else None
 
-    # --- Desktop VNC API handler ---
+# --- Desktop VNC API handler ---
 
     def _handle_desktop_request(self, params):
         token = get_cookie_token(self.headers)
@@ -5808,7 +5793,7 @@ class AuthHandler(http.server.BaseHTTPRequestHandler):
         else:
             self._send_error(404, "not found")
 
-# --- File API handlers ---
+    # --- File API handlers ---
 
     def _handle_files_list(self, params):
         username = self._get_authenticated_user()
@@ -6813,10 +6798,6 @@ except Exception as ex:
         def pty_to_ws():
             try:
                 while not stop.is_set():
-                    # select() with a small timeout so we can also notice the
-                    # child exited even if read() hasn't returned yet (some
-                    # platforms latch EOF on the master fd a moment after the
-                    # final process closes the slave).
                     try:
                         ready, _, _ = _select.select([master_fd], [], [], 0.5)
                     except (OSError, ValueError):
@@ -6841,8 +6822,6 @@ except Exception as ex:
                         break
             finally:
                 stop.set()
-                # Send a close frame so the client sees a clean shutdown,
-                # then half-close the socket so the recv loop wakes up.
                 try:
                     _ws_send_frame(sock, 0x8, b"\x03\xe8", sock_lock)
                 except Exception:
@@ -6907,7 +6886,6 @@ except Exception as ex:
             except Exception:
                 pass
             try:
-                # Reap the child without blocking forever.
                 for _ in range(20):
                     pid_done, _status = os.waitpid(pid, os.WNOHANG)
                     if pid_done:
