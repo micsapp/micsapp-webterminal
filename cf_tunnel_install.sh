@@ -655,16 +655,11 @@ TTYD_BIN = (
 )
 
 # --- App version / build info (shown in the SPA's About dialog) ---
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 
 def _git_build_info():
-    """Return (short_sha, commit_date) for the running checkout, or empty
-    strings if we can't shell out to git. Computed once at startup.
-
-    A dirty working tree (uncommitted changes — e.g. code deployed straight
-    from edits without committing) is flagged with a "-dirty" suffix, and the
-    date is taken from the running file's mtime instead of the HEAD commit
-    date, since the deployed code no longer matches HEAD."""
+    """Return (short_sha, commit_date, dirty) for the running checkout, or
+    ("", "", False) if we can't shell out to git. Computed once at startup."""
     try:
         repo = BASE_DIR
         sha = subprocess.run(
@@ -675,25 +670,43 @@ def _git_build_info():
             ["git", "-C", repo, "log", "-1", "--format=%cd", "--date=short", "HEAD"],
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=2
         ).stdout.decode().strip()
-        dirty = subprocess.run(
+        dirty = bool(subprocess.run(
             ["git", "-C", repo, "status", "--porcelain"],
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=2
-        ).stdout.decode().strip()
-        if dirty:
-            sha = (sha + "-dirty") if sha else "dirty"
-            try:
-                date = time.strftime("%Y-%m-%d", time.localtime(os.path.getmtime(__file__)))
-            except Exception:
-                pass
-        return sha, date
+        ).stdout.decode().strip())
+        return sha, date, dirty
+    except Exception:
+        return "", "", False
+
+def _src_fingerprint():
+    """Short content hash + mtime (to the second) of the running source file.
+    Lets you confirm, while testing uncommitted edits, that the page you opened
+    is built from your latest save — the served SPA HTML and this stamp come
+    from the same process, so a matching hash means matching code."""
+    try:
+        with open(os.path.abspath(__file__), "rb") as fh:
+            h = hashlib.sha256(fh.read()).hexdigest()[:8]
+        ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(os.path.getmtime(__file__)))
+        return h, ts
     except Exception:
         return "", ""
 
-_BUILD_SHA, _BUILD_DATE = _git_build_info()
-APP_BUILD = (
-    f"{_BUILD_SHA} · {_BUILD_DATE}"
-    if _BUILD_SHA and _BUILD_DATE else (_BUILD_SHA or "(dev)")
-)
+_BUILD_SHA, _BUILD_DATE, _BUILD_DIRTY = _git_build_info()
+if _BUILD_DIRTY:
+    # Uncommitted/test build: the deployed code no longer matches HEAD, so show
+    # a fine-grained stamp (content hash + edit timestamp) instead of the
+    # misleading commit date. Compare the "src" hash against
+    # `sha256sum auth.py | cut -c1-8` to be certain the page is your latest code.
+    _SRC_HASH, _SRC_TS = _src_fingerprint()
+    APP_BUILD = " · ".join(x for x in [
+        (f"{_BUILD_SHA}-dirty" if _BUILD_SHA else "dirty"),
+        (_SRC_TS or _BUILD_DATE),
+        (f"src {_SRC_HASH}" if _SRC_HASH else ""),
+    ] if x)
+elif _BUILD_SHA and _BUILD_DATE:
+    APP_BUILD = f"{_BUILD_SHA} · {_BUILD_DATE}"
+else:
+    APP_BUILD = _BUILD_SHA or "(dev)"
 
 def _safe_ascii_filename(name):
     # Header values must be latin-1 encodable. Provide an ASCII fallback for
