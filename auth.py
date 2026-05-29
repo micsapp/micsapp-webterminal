@@ -76,7 +76,12 @@ APP_VERSION = "1.0.0"
 
 def _git_build_info():
     """Return (short_sha, commit_date) for the running checkout, or empty
-    strings if we can't shell out to git. Computed once at startup."""
+    strings if we can't shell out to git. Computed once at startup.
+
+    A dirty working tree (uncommitted changes — e.g. code deployed straight
+    from edits without committing) is flagged with a "-dirty" suffix, and the
+    date is taken from the running file's mtime instead of the HEAD commit
+    date, since the deployed code no longer matches HEAD."""
     try:
         repo = BASE_DIR
         sha = subprocess.run(
@@ -87,6 +92,16 @@ def _git_build_info():
             ["git", "-C", repo, "log", "-1", "--format=%cd", "--date=short", "HEAD"],
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=2
         ).stdout.decode().strip()
+        dirty = subprocess.run(
+            ["git", "-C", repo, "status", "--porcelain"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=2
+        ).stdout.decode().strip()
+        if dirty:
+            sha = (sha + "-dirty") if sha else "dirty"
+            try:
+                date = time.strftime("%Y-%m-%d", time.localtime(os.path.getmtime(__file__)))
+            except Exception:
+                pass
         return sha, date
     except Exception:
         return "", ""
@@ -1652,6 +1667,7 @@ APP_HTML = """<!DOCTYPE html>
   <div class="title"><span>&#9611;</span> __USERNAME__</div>
   <div class="nav-sep"></div>
   <button class="nav-btn" onclick="addTab()">&#43; New Tab</button>
+  <button class="nav-btn" id="sessionsBtn" onclick="openSessions()" title="Session list — bring a session to this device">&#9776; Sessions</button>
   <button class="nav-btn nav-hide-mobile" id="splitRightBtn" onclick="splitRight()" title="Split Right (Ctrl+Shift+\\)">&#9707; Split Right</button>
   <button class="nav-btn nav-hide-mobile" id="splitDownBtn" onclick="splitDown()" title="Split Down (Ctrl+Shift+-)">&#9707; Split Down</button>
   <button class="nav-btn nav-hide-mobile" id="unsplitBtn" onclick="unsplit()" title="Close Split Pane" style="display:none">&#9746; Unsplit</button>
@@ -1920,6 +1936,28 @@ APP_HTML = """<!DOCTYPE html>
     </div>
   </div>
 </div>
+
+<div class="fp-modal-overlay" id="sessionsModal">
+  <div class="fp-modal" style="max-width:560px;height:auto;max-height:80vh">
+    <div class="fp-modal-header">
+      <span class="fp-modal-title">&#9776; Sessions</span>
+      <button class="fp-btn" onclick="openSessions()" title="Refresh">&#8635;</button>
+      <button class="fp-btn" onclick="closeSessions()">&#10005;</button>
+    </div>
+    <div class="fp-modal-body" style="overflow-y:auto;padding:12px 16px">
+      <div style="color:#9a9abf;font-size:12px;margin-bottom:10px">Live terminal sessions for your account. Open one to attach it on this device — it stays in sync (live-mirrored) across devices. Double-click a tab to rename; the name syncs everywhere.</div>
+      <div id="sessionsList"></div>
+    </div>
+  </div>
+</div>
+<style>
+  .session-row { display:flex; align-items:center; justify-content:space-between; gap:10px; padding:10px 12px; border:1px solid #2a2a4a; border-radius:6px; margin-bottom:8px; background:#16213e; }
+  .session-info { min-width:0; flex:1; }
+  .session-name { font-size:14px; font-weight:600; color:#e2e2e2; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .session-sub { font-size:12px; color:#9a9abf; margin-top:2px; }
+  .session-badge { font-size:10px; font-weight:600; color:#1fae6b; border:1px solid #1fae6b; border-radius:3px; padding:0 4px; margin-left:6px; }
+  .session-actions { display:flex; gap:6px; flex-shrink:0; }
+</style>
 
 <div id="toast" class="toast"></div>
 
@@ -2445,10 +2483,15 @@ function nextTabWindowSlot() {
   return slot;
 }
 
-function addTab() {
+function addTab(slot, name) {
   tabCounter++;
   const id = 'tab-' + tabCounter;
-  const tab = { id, name: 'Shell ' + tabCounter, windowSlot: nextTabWindowSlot() };
+  // When opened from the session picker, attach to a specific existing tmux
+  // window slot; otherwise grab the next free slot. (Guard against being called
+  // as an event handler where the first arg would be an Event.)
+  const useSlot = Number.isInteger(slot) ? slot : nextTabWindowSlot();
+  if (Number.isInteger(slot) && slot >= nextWindowSlot) nextWindowSlot = slot + 1;
+  const tab = { id, name: (typeof name === 'string' && name) ? name : ('Shell ' + tabCounter), windowSlot: useSlot };
   tabs.push(tab);
   const iframe = document.createElement('iframe');
   iframe.id = 'frame-' + id;
@@ -2484,6 +2527,19 @@ function addDesktopTab() {
   showToast('Desktop ready');
 }
 
+// Explicitly tear down a single tab's tmux window. The server no longer infers
+// deletions from a client's tab list (that wiped other devices' sessions), so a
+// closed tab must close its own window directly. Shell tabs only — desktop tabs
+// are VNC and have no tmux window.
+function killTabWindow(slot) {
+  if (!Number.isInteger(slot)) return;
+  fetch('/api/exec', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ command: 'tmux kill-window -t main:' + slot + ' 2>/dev/null || true' })
+  }).catch(() => {});
+}
+
 function closeTab(id, e) {
   if (e) e.stopPropagation();
   if (tabs.length <= 1) return;
@@ -2492,6 +2548,7 @@ function closeTab(id, e) {
     closeSplitPane(id);
   }
   const idx = tabs.findIndex(t => t.id === id);
+  const closing = tabs[idx];
   const iframe = document.getElementById('frame-' + id);
   if (iframe) iframe.remove();
   tabs.splice(idx, 1);
@@ -2501,6 +2558,9 @@ function closeTab(id, e) {
   }
   renderTabs();
   saveTabs();
+  if (closing && closing.type !== 'desktop' && Number.isInteger(closing.windowSlot)) {
+    killTabWindow(closing.windowSlot);
+  }
 }
 
 function switchTab(id) {
@@ -2595,7 +2655,7 @@ function startRename(id, labelEl) {
     if (done) return;
     done = true;
     const val = input.value.trim();
-    if (val) t.name = val;
+    if (val) { t.name = val; if (t.type !== 'desktop') syncWindowName(t.windowSlot, val); }
     renderTabs();
     saveTabs();
   };
@@ -2614,6 +2674,134 @@ function startRename(id, labelEl) {
 function renameTab(id, name) {
   const t = tabs.find(t => t.id === id);
   if (t) { t.name = name; renderTabs(); }
+}
+
+// --- Session picker: list/open/rename/kill tmux windows across devices ---
+// Every terminal "session" is a tmux window under the shared `main` session for
+// this user, so it already persists server-side and across devices. The picker
+// just enumerates those windows (via /api/exec) and lets the user attach any of
+// them on the current device. Opening = attach (live-mirrored, not a copy).
+
+function sessEscHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+function sessShq(s) { return "'" + String(s).replace(/'/g, "'\\''") + "'"; }
+
+// Persist a tab's name as the tmux window name so it shows identically on every
+// device. automatic-rename is turned off so the chosen label sticks instead of
+// reverting to the running command.
+function syncWindowName(slot, name) {
+  if (!Number.isInteger(slot) || !name) return;
+  const cmd = 'tmux setw -t main:' + slot + ' automatic-rename off 2>/dev/null; '
+            + 'tmux rename-window -t main:' + slot + ' ' + sessShq(name) + ' 2>/dev/null || true';
+  fetch('/api/exec', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ command: cmd })
+  }).catch(() => {});
+}
+
+function sessFmtAgo(epoch) {
+  const n = parseInt(epoch, 10);
+  if (!n) return '';
+  const d = Math.max(0, Math.floor(Date.now() / 1000) - n);
+  if (d < 5) return 'active now';
+  if (d < 60) return d + 's ago';
+  if (d < 3600) return Math.floor(d / 60) + 'm ago';
+  if (d < 86400) return Math.floor(d / 3600) + 'h ago';
+  return Math.floor(d / 86400) + 'd ago';
+}
+
+async function fetchSessions() {
+  const fmt = '#{window_index}\\t#{window_name}\\t#{pane_current_command}\\t#{window_activity}\\t#{window_panes}';
+  const res = await fetch('/api/exec', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ command: "tmux list-windows -t main -F '" + fmt + "' 2>/dev/null" })
+  });
+  const data = await res.json().catch(() => ({}));
+  const out = [];
+  (data.stdout || '').split('\\n').forEach(line => {
+    if (!line.trim()) return;
+    const p = line.split('\\t');
+    const slot = parseInt(p[0], 10);
+    if (!Number.isInteger(slot)) return;
+    out.push({ slot: slot, name: p[1] || ('Shell ' + slot), cmd: p[2] || '', activity: p[3] || '', panes: p[4] || '1' });
+  });
+  out.sort((a, b) => a.slot - b.slot);
+  return out;
+}
+
+async function openSessions() {
+  const overlay = document.getElementById('sessionsModal');
+  const body = document.getElementById('sessionsList');
+  if (!overlay || !body) return;
+  overlay.classList.add('open');
+  body.innerHTML = '<div style="color:#9a9abf;padding:16px">Loading sessions…</div>';
+  try { renderSessionList(await fetchSessions()); }
+  catch (e) { body.innerHTML = '<div style="color:#e94560;padding:16px">Failed to load sessions.</div>'; }
+}
+
+function closeSessions() {
+  const overlay = document.getElementById('sessionsModal');
+  if (overlay) overlay.classList.remove('open');
+}
+
+function renderSessionList(sessions) {
+  const body = document.getElementById('sessionsList');
+  if (!body) return;
+  if (!sessions.length) {
+    body.innerHTML = '<div style="color:#9a9abf;padding:16px">No live sessions found.</div>';
+    return;
+  }
+  const openHere = new Set(tabs.filter(t => t.type !== 'desktop' && Number.isInteger(t.windowSlot)).map(t => t.windowSlot));
+  body.innerHTML = '';
+  sessions.forEach(s => {
+    const here = openHere.has(s.slot);
+    const sub = [s.cmd, sessFmtAgo(s.activity), (parseInt(s.panes, 10) > 1 ? s.panes + ' panes' : '')].filter(Boolean).join(' · ');
+    const row = document.createElement('div');
+    row.className = 'session-row';
+    const info = document.createElement('div');
+    info.className = 'session-info';
+    info.innerHTML = '<div class="session-name">' + sessEscHtml(s.name) + (here ? ' <span class="session-badge">open here</span>' : '') + '</div>'
+                   + '<div class="session-sub">slot ' + s.slot + (sub ? ' · ' + sessEscHtml(sub) : '') + '</div>';
+    const actions = document.createElement('div');
+    actions.className = 'session-actions';
+    const openBtn = document.createElement('button');
+    openBtn.className = 'fp-btn';
+    openBtn.textContent = here ? 'Focus' : 'Open';
+    openBtn.onclick = () => { openSessionSlot(s.slot, s.name); closeSessions(); };
+    const killBtn = document.createElement('button');
+    killBtn.className = 'fp-btn danger';
+    killBtn.innerHTML = '&#10005;';
+    killBtn.title = 'Kill session';
+    killBtn.onclick = (ev) => { ev.stopPropagation(); killSession(s.slot, s.name); };
+    actions.appendChild(openBtn);
+    actions.appendChild(killBtn);
+    row.appendChild(info);
+    row.appendChild(actions);
+    body.appendChild(row);
+  });
+}
+
+function openSessionSlot(slot, name) {
+  const existing = tabs.find(t => t.type !== 'desktop' && t.windowSlot === slot);
+  if (existing) { switchTab(existing.id); return; }
+  addTab(slot, name);
+}
+
+async function killSession(slot, name) {
+  const ok = await dlgOpen({ kind: 'confirm', danger: true, title: 'Kill session', okText: 'Kill',
+    message: 'Kill session "' + name + '" (slot ' + slot + ')? This closes it on every device.' });
+  if (!ok) return;
+  const t = tabs.find(t => t.type !== 'desktop' && t.windowSlot === slot);
+  if (t && tabs.length > 1) {
+    closeTab(t.id);        // removes the local tab and kills its window
+  } else {
+    killTabWindow(slot);   // not open here (or it's the last tab): kill directly
+  }
+  setTimeout(async () => { try { renderSessionList(await fetchSessions()); } catch (e) {} }, 250);
 }
 
 function getSettings() {
@@ -2652,6 +2840,39 @@ function updateDocumentTitle() {
   document.title = title || DEFAULT_TITLE_TEMPLATE.replace('{tab}', tabName);
 }
 
+// The tab-title template is stored server-side (per user) so every one of the
+// user's clients/devices shows the same browser-tab title. localStorage is kept
+// only as a fast initial value; the server value is the source of truth.
+let _titleSaveTimer = null;
+function saveTitleTemplateToServer() {
+  const el = document.getElementById('titleTemplate');
+  if (!el) return;
+  const val = el.value;
+  if (_titleSaveTimer) clearTimeout(_titleSaveTimer);
+  _titleSaveTimer = setTimeout(() => {
+    fetch('/api/settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ titleTemplate: val }),
+    }).catch(() => {});
+  }, 400);
+}
+
+async function loadTitleTemplateFromServer() {
+  try {
+    const r = await fetch('/api/settings');
+    if (r.ok) {
+      const data = await r.json();
+      const s = (data && data.settings) || {};
+      if (typeof s.titleTemplate === 'string') {
+        const el = document.getElementById('titleTemplate');
+        if (el) el.value = s.titleTemplate;
+      }
+    }
+  } catch (e) {}
+  updateDocumentTitle();
+}
+
 function clampFontSize(v) {
   return Math.max(8, Math.min(36, v));
 }
@@ -2678,7 +2899,7 @@ function wireSettingsPersistence() {
   bindPersist('cursorBlink', 'change');
   bindPersist('scrollback', 'change');
   bindPersist('disableLeaveAlert', 'change');
-  bindPersist('titleTemplate', 'input', () => { saveSettingsOnly(); updateDocumentTitle(); });
+  bindPersist('titleTemplate', 'input', () => { saveSettingsOnly(); updateDocumentTitle(); saveTitleTemplateToServer(); });
   bindPersist('colorBg', 'input');
   bindPersist('colorFg', 'input');
   bindPersist('colorCursor', 'input');
@@ -3390,6 +3611,9 @@ function closeAbout() {
 document.getElementById('aboutModal').addEventListener('click', (e) => {
   if (e.target.id === 'aboutModal') closeAbout();
 });
+document.getElementById('sessionsModal').addEventListener('click', (e) => {
+  if (e.target.id === 'sessionsModal') closeSessions();
+});
 
 // Keyboard shortcuts
 document.addEventListener('keydown', (e) => {
@@ -3560,6 +3784,9 @@ function init() {
   updateQuickFontDisplay(parseInt(document.getElementById('fontSize').value || '15', 10) || 15);
 
   wireSettingsPersistence();
+
+  // Override the cached localStorage tab-title with the shared server value.
+  loadTitleTemplateFromServer();
 
   document.getElementById('fontSize').addEventListener('input', () => {
     const input = document.getElementById('fontSize');
@@ -5279,10 +5506,11 @@ def spawn_user_ttyd(username, password):
             r' case "$SLOT" in (""|*[!0-9]*) SLOT=0 ;; esac;'
             # Create window at exact SLOT index (no gap-filling)
             r' tmux list-windows -t main -F "#{window_index}" | grep -q "^${SLOT}$" || tmux new-window -t main:${SLOT};'
-            # Clean up orphaned windows not in the active slots list
-            r' if [ -n "$ACTIVE" ]; then for _w in $(tmux list-windows -t main -F "#{window_index}"); do'
-            r' _k=0; _I="$IFS"; IFS=","; for _a in $ACTIVE; do [ "$_w" = "$_a" ] && _k=1; done; IFS="$_I";'
-            r' [ "$_k" = "0" ] && tmux kill-window -t "main:${_w}" 2>/dev/null; done; true; fi;'
+            # NOTE: ACTIVE (a single client's tab list) is intentionally NOT used to kill
+            # windows. A second device (phone/laptop) has its own tab layout, so trusting
+            # one client's list would destroy another device's running windows. Windows
+            # are closed explicitly via /api/exec `tmux kill-window` only when the user
+            # closes a tab (see killTabWindow in the SPA).
             r' exec tmux new-session -t main \; set-option destroy-unattached on \; select-window -t :${SLOT}'
         )
         ttyd_cmd = f"{shlex.quote(TTYD_BIN)} -W -a -i 127.0.0.1 -p {port} bash -lc {shlex.quote(tmux_cmd)} ttyd-tab"
@@ -6273,6 +6501,105 @@ except Exception as ex:
 
     # --- Quick Commands API handlers ---
 
+    def _handle_settings_get(self):
+        # Per-user server-side settings shared across all of the user's clients
+        # (currently just the browser tab-title template). Stored in the user's
+        # home so each tenant is isolated under their own UID.
+        username = self._get_authenticated_user()
+        if not username:
+            self._send_error(401, "not authenticated")
+            return
+        script = '''
+import os, json
+p = os.path.expanduser("~/.ttyd_settings.json")
+try:
+    if os.path.exists(p):
+        with open(p, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            data = {}
+    else:
+        data = {}
+    print(json.dumps({"ok": True, "settings": data}))
+except Exception as ex:
+    print(json.dumps({"error": str(ex)}))
+'''
+        rc, out, err = run_as_user(username, script)
+        if rc != 0:
+            self._send_error(500, err.decode(errors="replace"))
+            return
+        try:
+            data = json.loads(out)
+        except Exception:
+            self._send_error(500, out.decode(errors="replace"))
+            return
+        if "error" in data:
+            self._send_error(400, data["error"])
+        else:
+            self._send_json(200, data)
+
+    def _handle_settings_set(self):
+        username = self._get_authenticated_user()
+        if not username:
+            self._send_error(401, "not authenticated")
+            return
+        length = int(self.headers.get("Content-Length", 0))
+        if length > 64 * 1024:
+            self._send_error(413, "payload too large")
+            return
+        body = self.rfile.read(length) if length > 0 else b""
+        try:
+            req = json.loads(body)
+        except Exception as e:
+            self._send_error(400, f"invalid json: {str(e)}")
+            return
+        if not isinstance(req, dict):
+            self._send_error(400, "body must be a JSON object")
+            return
+        # Whitelist + validate the keys we persist server-side.
+        updates = {}
+        if "titleTemplate" in req:
+            tpl = req.get("titleTemplate")
+            if not isinstance(tpl, str):
+                self._send_error(400, "titleTemplate must be a string")
+                return
+            updates["titleTemplate"] = tpl[:300]
+        if not updates:
+            self._send_error(400, "no recognized settings to update")
+            return
+        upd_b64 = base64.b64encode(json.dumps(updates).encode()).decode()
+        script = f'''
+import os, json, base64
+p = os.path.expanduser("~/.ttyd_settings.json")
+updates = json.loads(base64.b64decode({upd_b64!r}).decode())
+try:
+    data = {{}}
+    if os.path.exists(p):
+        with open(p, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            data = {{}}
+    data.update(updates)
+    with open(p, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    print(json.dumps({{"ok": True, "settings": data}}))
+except Exception as ex:
+    print(json.dumps({{"error": str(ex)}}))
+'''
+        rc, out, err = run_as_user(username, script)
+        if rc != 0:
+            self._send_error(500, err.decode(errors="replace"))
+            return
+        try:
+            data = json.loads(out)
+        except Exception:
+            self._send_error(500, out.decode(errors="replace"))
+            return
+        if "error" in data:
+            self._send_error(400, data["error"])
+        else:
+            self._send_json(200, data)
+
     def _handle_quick_commands_list(self):
         username = self._get_authenticated_user()
         if not username:
@@ -6995,6 +7322,8 @@ except Exception as ex:
             self._handle_quick_commands_list()
         elif path == "/api/quick-commands/export":
             self._handle_quick_commands_export()
+        elif path == "/api/settings":
+            self._handle_settings_get()
         elif path == "/api/tokens":
             self._handle_tokens_list()
         elif path == "/api/shell":
@@ -7062,6 +7391,8 @@ except Exception as ex:
             self._handle_quick_commands_action()
         elif path == "/api/quick-commands/import":
             self._handle_quick_commands_import()
+        elif path == "/api/settings":
+            self._handle_settings_set()
         elif path == "/api/tokens":
             self._handle_tokens_create()
         elif path == "/api/tokens/revoke":
