@@ -1,6 +1,6 @@
 {
   "name": "mics-webterminal-cli",
-  "version": "0.1.0",
+  "version": "1.1.0",
   "description": "Command-line client for micsapp-webterminal — run remote shell commands, manage files, tokens, and quick commands over HTTPS.",
   "bin": {
     "mics_cli": "bin/mics_cli.js"
