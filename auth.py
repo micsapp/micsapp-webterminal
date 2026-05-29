@@ -1954,6 +1954,8 @@ APP_HTML = """<!DOCTYPE html>
   <div class="fp-modal" style="max-width:560px;height:auto;max-height:80vh">
     <div class="fp-modal-header">
       <span class="fp-modal-title">&#9776; Sessions</span>
+      <button class="fp-btn" id="tileSelectedBtn" onclick="tileSelectedSessions()" title="Tile checked sessions evenly into a grid" disabled>&#9707; Tile selected</button>
+      <button class="fp-btn" onclick="tileAllSessions()" title="Tile all sessions evenly into a grid">&#9707; Tile all</button>
       <button class="fp-btn" onclick="openSessions()" title="Refresh">&#8635;</button>
       <button class="fp-btn" onclick="closeSessions()">&#10005;</button>
     </div>
@@ -1970,6 +1972,7 @@ APP_HTML = """<!DOCTYPE html>
   .session-sub { font-size:12px; color:#9a9abf; margin-top:2px; }
   .session-badge { font-size:10px; font-weight:600; color:#1fae6b; border:1px solid #1fae6b; border-radius:3px; padding:0 4px; margin-left:6px; }
   .session-actions { display:flex; gap:6px; flex-shrink:0; }
+  .session-check { width:16px; height:16px; flex-shrink:0; cursor:pointer; accent-color:#e94560; }
 </style>
 
 <div id="toast" class="toast"></div>
@@ -2130,6 +2133,73 @@ function splitDirection(dir) {
 
 function splitRight() { splitDirection('h'); }
 function splitDown() { splitDirection('v'); }
+
+// Build a balanced binary split whose leaves all end up the same size along `dir`.
+// Ratio is weighted by leaf count so each pane gets equal share.
+function buildEvenSplit(items, dir) {
+  if (items.length === 1) return items[0];
+  const mid = Math.ceil(items.length / 2);
+  const left = items.slice(0, mid);
+  const right = items.slice(mid);
+  return {
+    type: 'split', direction: dir, ratio: left.length / items.length,
+    children: [ buildEvenSplit(left, dir), buildEvenSplit(right, dir) ]
+  };
+}
+
+// Arrange leaf panes into an even grid (cols = ceil(sqrt(n)) columns per row,
+// rows stacked vertically). Columns within a row are equal width; rows equal height.
+function buildGridSplit(leaves) {
+  const n = leaves.length;
+  const cols = Math.ceil(Math.sqrt(n));
+  const rows = Math.ceil(n / cols);
+  const rowNodes = [];
+  for (let r = 0; r < rows; r++) {
+    rowNodes.push(buildEvenSplit(leaves.slice(r * cols, (r + 1) * cols), 'h'));
+  }
+  return buildEvenSplit(rowNodes, 'v');
+}
+
+// Tile every live session evenly across the screen. Opens any session not yet
+// attached on this device, then lays them all out in a grid of split panes.
+// `slotFilter` (a Set of slots) limits tiling to those sessions; null = all.
+async function tileSessions(slotFilter) {
+  if (!canSplit()) { showToast('Tiling needs a wider screen', true); return; }
+  let sessions;
+  try { sessions = await fetchSessions(); }
+  catch (e) { showToast('Failed to load sessions', true); return; }
+  if (slotFilter) sessions = sessions.filter(s => slotFilter.has(s.slot));
+  if (!sessions.length) { showToast('No sessions to tile', true); return; }
+  // Attach any session that isn't already open as a tab on this device.
+  sessions.forEach(s => {
+    if (!tabs.find(t => t.type !== 'desktop' && t.windowSlot === s.slot)) addTab(s.slot, s.name);
+  });
+  // Order the tabs to match the session list (slot order).
+  const bySlot = {};
+  tabs.filter(t => t.type !== 'desktop' && Number.isInteger(t.windowSlot)).forEach(t => { bySlot[t.windowSlot] = t; });
+  let ordered = sessions.map(s => bySlot[s.slot]).filter(Boolean);
+  // Nesting (>2 panes) is desktop-only; cap panes so they stay usable.
+  const maxPanes = canNest() ? 9 : 2;
+  if (ordered.length > maxPanes) {
+    showToast('Tiling first ' + maxPanes + ' of ' + ordered.length + ' sessions');
+    ordered = ordered.slice(0, maxPanes);
+  }
+  closeSessions();
+  if (ordered.length <= 1) { if (ordered[0]) switchTab(ordered[0].id); unsplit(); return; }
+  splitRoot = buildGridSplit(ordered.map(t => ({ type: 'pane', tabId: t.id })));
+  focusedPaneTabId = ordered[0].id;
+  activeTabId = ordered[0].id;
+  renderSplitLayout();
+  updateSplitButtons();
+  saveSplitState();
+}
+
+function tileAllSessions() { return tileSessions(null); }
+
+function tileSelectedSessions() {
+  if (!sessSelected.size) { showToast('Check the sessions you want to tile first', true); return; }
+  return tileSessions(new Set(sessSelected));
+}
 
 function unsplit() {
   if (!isSplitActive()) return;
@@ -2695,6 +2765,18 @@ function renameTab(id, name) {
 // just enumerates those windows (via /api/exec) and lets the user attach any of
 // them on the current device. Opening = attach (live-mirrored, not a copy).
 
+// Slots checked in the session picker, for "Tile selected". Persists across
+// refreshes; pruned to live slots whenever the list re-renders.
+let sessSelected = new Set();
+
+function updateTileSelectedBtn() {
+  const btn = document.getElementById('tileSelectedBtn');
+  if (!btn) return;
+  const n = sessSelected.size;
+  btn.disabled = n === 0;
+  btn.innerHTML = '&#9707; Tile selected' + (n ? ' (' + n + ')' : '');
+}
+
 function sessEscHtml(s) {
   return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
@@ -2766,15 +2848,27 @@ function renderSessionList(sessions) {
   if (!body) return;
   if (!sessions.length) {
     body.innerHTML = '<div style="color:#9a9abf;padding:16px">No live sessions found.</div>';
+    sessSelected.clear();
+    updateTileSelectedBtn();
     return;
   }
   const openHere = new Set(tabs.filter(t => t.type !== 'desktop' && Number.isInteger(t.windowSlot)).map(t => t.windowSlot));
+  // Drop any checked slots that no longer exist, then refresh the button.
+  const liveSlots = new Set(sessions.map(s => s.slot));
+  [...sessSelected].forEach(sl => { if (!liveSlots.has(sl)) sessSelected.delete(sl); });
   body.innerHTML = '';
   sessions.forEach(s => {
     const here = openHere.has(s.slot);
     const sub = [s.cmd, sessFmtAgo(s.activity), (parseInt(s.panes, 10) > 1 ? s.panes + ' panes' : '')].filter(Boolean).join(' · ');
     const row = document.createElement('div');
     row.className = 'session-row';
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.className = 'session-check';
+    cb.title = 'Select for "Tile selected"';
+    cb.checked = sessSelected.has(s.slot);
+    cb.onchange = () => { if (cb.checked) sessSelected.add(s.slot); else sessSelected.delete(s.slot); updateTileSelectedBtn(); };
+    row.appendChild(cb);
     const info = document.createElement('div');
     info.className = 'session-info';
     info.innerHTML = '<div class="session-name">' + sessEscHtml(s.name) + (here ? ' <span class="session-badge">open here</span>' : '') + '</div>'
@@ -2796,6 +2890,7 @@ function renderSessionList(sessions) {
     row.appendChild(actions);
     body.appendChild(row);
   });
+  updateTileSelectedBtn();
 }
 
 function openSessionSlot(slot, name) {
