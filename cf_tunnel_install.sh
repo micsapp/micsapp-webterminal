@@ -452,6 +452,11 @@ server {
         proxy_pass http://127.0.0.1:${auth_port};
     }
 
+    # PWA assets (no auth required — manifest, service worker, icons, offline page)
+    location ~ ^/(manifest\.webmanifest|sw\.js|offline\.html|icon\.svg|icon-192\.png|icon-512\.png|apple-touch-icon\.png)$ {
+        proxy_pass http://127.0.0.1:${auth_port};
+    }
+
     # File browser API (requires auth)
     location /api/files/ {
         auth_request /api/auth;
@@ -600,6 +605,7 @@ import subprocess
 import threading
 import time
 import urllib.parse
+import zlib
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -776,11 +782,190 @@ def authenticate(username, password):
         print(f"authenticate error: {e}", flush=True)
         return False
 
+# ---------------------------------------------------------------------------
+# PWA assets — web manifest, service worker, icons. All generated/served
+# inline (zero external files) so the app is installable to a home screen /
+# desktop. Icons are rasterized with stdlib zlib (no Pillow dependency).
+# ---------------------------------------------------------------------------
+
+# Common <head> snippet injected into both the login and app shells.
+PWA_HEAD = """\
+<meta name="theme-color" content="#16213e">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Web Terminal">
+<link rel="manifest" href="/manifest.webmanifest" crossorigin="use-credentials">
+<link rel="icon" type="image/svg+xml" href="/icon.svg">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<script>
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', function () {
+    navigator.serviceWorker.register('/sw.js').catch(function () {});
+  });
+}
+</script>"""
+
+PWA_DEFAULT_NAME = "Web Terminal"
+
+
+def build_pwa_manifest(name=None):
+    """Build the web app manifest JSON. ``name`` is the per-user configurable
+    app name (shown when installed to a home screen / desktop); it falls back to
+    the default. ``short_name`` is capped for compact home-screen labels."""
+    if not isinstance(name, str):
+        name = ""
+    name = name.strip() or PWA_DEFAULT_NAME
+    short = name if len(name) <= 12 else name[:12].rstrip()
+    return json.dumps({
+        "name": name,
+        "short_name": short,
+        "description": "Browser-based multi-tenant terminal",
+        "start_url": "/",
+        "scope": "/",
+        "display": "standalone",
+        "orientation": "any",
+        "background_color": "#1a1a2e",
+        "theme_color": "#16213e",
+        "icons": [
+            {"src": "/icon.svg", "sizes": "any", "type": "image/svg+xml",
+             "purpose": "any maskable"},
+            {"src": "/icon-192.png", "sizes": "192x192", "type": "image/png",
+             "purpose": "any"},
+            {"src": "/icon-512.png", "sizes": "512x512", "type": "image/png",
+             "purpose": "any"},
+            {"src": "/icon-512.png", "sizes": "512x512", "type": "image/png",
+             "purpose": "maskable"},
+        ],
+    })
+
+# Terminal-prompt glyph (">_") on the brand background. Scales to any size.
+ICON_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+<rect width="512" height="512" rx="96" fill="#16213e"/>
+<g fill="none" stroke="#e94560" stroke-width="34" stroke-linecap="round" stroke-linejoin="round">
+<path d="M168 160 L256 256 L168 352"/>
+<path d="M300 360 L420 360"/>
+</g>
+</svg>"""
+
+OFFLINE_HTML = """<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Offline</title>
+<style>
+  body { margin:0; height:100vh; display:flex; align-items:center; justify-content:center;
+         background:#1a1a2e; color:#9a9abf; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif; }
+  .box { text-align:center; }
+  .box h1 { color:#e94560; font-size:20px; margin-bottom:8px; }
+  .box p { font-size:14px; }
+</style></head>
+<body><div class="box"><h1>You're offline</h1>
+<p>The terminal needs a live connection. Reconnect and reload.</p></div></body></html>"""
+
+# Service worker: safe pass-through for everything dynamic (auth, terminal,
+# websockets), cache-first only for static PWA assets. Versioned cache name so
+# a new app version invalidates the old shell. __APP_VERSION__ replaced at serve.
+SW_JS = """\
+const CACHE = 'webterm-__APP_VERSION__';
+const PRECACHE = ['/icon.svg', '/offline.html'];
+
+self.addEventListener('install', function (e) {
+  e.waitUntil(caches.open(CACHE).then(function (c) { return c.addAll(PRECACHE); })
+    .then(function () { return self.skipWaiting(); }));
+});
+
+self.addEventListener('activate', function (e) {
+  e.waitUntil(caches.keys().then(function (keys) {
+    return Promise.all(keys.filter(function (k) { return k !== CACHE; })
+      .map(function (k) { return caches.delete(k); }));
+  }).then(function () { return self.clients.claim(); }));
+});
+
+self.addEventListener('fetch', function (e) {
+  var req = e.request;
+  if (req.method !== 'GET') return;
+  var url = new URL(req.url);
+  if (url.origin !== self.location.origin) return;
+  // Never intercept auth / terminal / dynamic endpoints. The manifest is
+  // per-user (configurable app name) so it must always hit the network.
+  if (url.pathname.startsWith('/api/') || url.pathname.startsWith('/ut/') ||
+      url.pathname === '/app' || url.pathname === '/login' ||
+      url.pathname === '/manifest.webmanifest') return;
+  // App-shell navigations: network-first with an offline fallback.
+  if (req.mode === 'navigate') {
+    e.respondWith(fetch(req).catch(function () { return caches.match('/offline.html'); }));
+    return;
+  }
+  // Static assets (icons, manifest): cache-first, then populate.
+  e.respondWith(caches.match(req).then(function (r) {
+    return r || fetch(req).then(function (resp) {
+      var copy = resp.clone();
+      caches.open(CACHE).then(function (c) { c.put(req, copy); });
+      return resp;
+    });
+  }));
+});"""
+
+
+def _png_chunk(typ, data):
+    return (struct.pack(">I", len(data)) + typ + data +
+            struct.pack(">I", zlib.crc32(typ + data) & 0xffffffff))
+
+
+def _encode_png(width, height, rgba):
+    raw = bytearray()
+    stride = width * 4
+    for y in range(height):
+        raw.append(0)  # filter type 0 (None) per scanline
+        raw.extend(rgba[y * stride:(y + 1) * stride])
+    comp = zlib.compress(bytes(raw), 9)
+    return (b"\x89PNG\r\n\x1a\n"
+            + _png_chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0))
+            + _png_chunk(b"IDAT", comp)
+            + _png_chunk(b"IEND", b""))
+
+
+def _make_icon_png(size):
+    """Rasterize the brand icon (">_" prompt) at the given square size."""
+    w = h = size
+    bg = (0x16, 0x21, 0x3e, 255)
+    fg = (0xe9, 0x45, 0x60, 255)
+    buf = bytearray(bytes(bg) * (w * h))
+
+    def px(x, y, c):
+        if 0 <= x < w and 0 <= y < h:
+            i = (y * w + x) * 4
+            buf[i:i + 4] = bytes(c)
+
+    def stroke(x0, y0, x1, y1, t, c):
+        x0, y0, x1, y1 = x0 * size, y0 * size, x1 * size, y1 * size
+        steps = max(1, int(max(abs(x1 - x0), abs(y1 - y0))))
+        for s in range(steps + 1):
+            x = round(x0 + (x1 - x0) * s / steps)
+            y = round(y0 + (y1 - y0) * s / steps)
+            for dx in range(-t, t + 1):
+                for dy in range(-t, t + 1):
+                    if dx * dx + dy * dy <= t * t:
+                        px(x + dx, y + dy, c)
+
+    t = max(2, int(size * 0.066))
+    stroke(0.33, 0.31, 0.50, 0.50, t, fg)   # ">" upper stroke
+    stroke(0.50, 0.50, 0.33, 0.69, t, fg)   # ">" lower stroke
+    stroke(0.59, 0.70, 0.82, 0.70, t, fg)   # "_" cursor bar
+    return _encode_png(w, h, bytes(buf))
+
+
+ICON_PNG_192 = _make_icon_png(192)
+ICON_PNG_512 = _make_icon_png(512)
+ICON_PNG_180 = _make_icon_png(180)  # apple-touch-icon
+
+
 LOGIN_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+__PWA_HEAD__
 <title>Terminal Login</title>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -1061,6 +1246,7 @@ APP_HTML = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+__PWA_HEAD__
 <title>Web Terminal</title>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -2383,6 +2569,11 @@ APP_HTML = """<!DOCTYPE html>
     <input type="text" id="titleTemplate" value="{tab} &mdash; Web Terminal" placeholder="{tab} &mdash; Web Terminal" spellcheck="false">
     <div style="color:#7a7a9e;font-size:11px;margin-top:4px;">Placeholders: <code>{tab}</code> active tab, <code>{user}</code>, <code>{host}</code>, <code>{count}</code> tab count.</div>
   </div>
+  <div class="setting-group">
+    <label>App Name (PWA)</label>
+    <input type="text" id="pwaName" value="Web Terminal" placeholder="Web Terminal" spellcheck="false" maxlength="100">
+    <div style="color:#7a7a9e;font-size:11px;margin-top:4px;">Name shown when installed to a home screen / desktop. Takes effect on next install or app refresh.</div>
+  </div>
   <button class="apply-btn" onclick="applySettings()">Apply to All Tabs</button>
   <div style="flex-basis:100%;border-top:1px solid #0f3460;padding-top:14px;margin-top:4px;">
     <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;">
@@ -3549,6 +3740,37 @@ function saveTitleTemplateToServer() {
   }, 400);
 }
 
+// The PWA app name (shown when installed) is also stored server-side so it is
+// shared across the user's devices. It is applied to the manifest the next time
+// the browser fetches it; we re-point the <link> to nudge an immediate refresh.
+let _pwaNameSaveTimer = null;
+function savePwaNameToServer() {
+  const el = document.getElementById('pwaName');
+  if (!el) return;
+  const val = el.value;
+  if (_pwaNameSaveTimer) clearTimeout(_pwaNameSaveTimer);
+  _pwaNameSaveTimer = setTimeout(() => {
+    fetch('/api/settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pwaName: val }),
+    }).then(() => refreshManifestLink()).catch(() => {});
+  }, 400);
+}
+
+// Force the browser to re-read the (now updated) manifest by replacing the
+// <link rel="manifest"> element. Installed PWAs pick up the new name on their
+// next manifest update check.
+function refreshManifestLink() {
+  const old = document.querySelector('link[rel="manifest"]');
+  if (!old) return;
+  const link = document.createElement('link');
+  link.rel = 'manifest';
+  link.crossOrigin = 'use-credentials';
+  link.href = '/manifest.webmanifest?v=' + Date.now();
+  old.parentNode.replaceChild(link, old);
+}
+
 async function loadTitleTemplateFromServer() {
   try {
     const r = await fetch('/api/settings');
@@ -3558,6 +3780,10 @@ async function loadTitleTemplateFromServer() {
       if (typeof s.titleTemplate === 'string') {
         const el = document.getElementById('titleTemplate');
         if (el) el.value = s.titleTemplate;
+      }
+      if (typeof s.pwaName === 'string') {
+        const el = document.getElementById('pwaName');
+        if (el) el.value = s.pwaName;
       }
     }
   } catch (e) {}
@@ -3591,6 +3817,7 @@ function wireSettingsPersistence() {
   bindPersist('scrollback', 'change');
   bindPersist('disableLeaveAlert', 'change');
   bindPersist('titleTemplate', 'input', () => { saveSettingsOnly(); updateDocumentTitle(); saveTitleTemplateToServer(); });
+  bindPersist('pwaName', 'input', () => { savePwaNameToServer(); });
   bindPersist('colorBg', 'input');
   bindPersist('colorFg', 'input');
   bindPersist('colorCursor', 'input');
@@ -7192,9 +7419,36 @@ except Exception as ex:
 
     # --- Quick Commands API handlers ---
 
+    def _load_user_settings(self, username):
+        """Return the user's persisted settings dict (best-effort; {} on error).
+        Used by callers that just need a value (e.g. the PWA manifest name)."""
+        script = '''
+import os, json
+p = os.path.expanduser("~/.ttyd_settings.json")
+try:
+    if os.path.exists(p):
+        with open(p, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            data = {}
+    else:
+        data = {}
+    print(json.dumps({"settings": data}))
+except Exception:
+    print(json.dumps({"settings": {}}))
+'''
+        rc, out, err = run_as_user(username, script)
+        if rc != 0:
+            return {}
+        try:
+            s = json.loads(out).get("settings")
+            return s if isinstance(s, dict) else {}
+        except Exception:
+            return {}
+
     def _handle_settings_get(self):
         # Per-user server-side settings shared across all of the user's clients
-        # (currently just the browser tab-title template). Stored in the user's
+        # (browser tab-title template + PWA app name). Stored in the user's
         # home so each tenant is isolated under their own UID.
         username = self._get_authenticated_user()
         if not username:
@@ -7255,6 +7509,12 @@ except Exception as ex:
                 self._send_error(400, "titleTemplate must be a string")
                 return
             updates["titleTemplate"] = tpl[:300]
+        if "pwaName" in req:
+            nm = req.get("pwaName")
+            if not isinstance(nm, str):
+                self._send_error(400, "pwaName must be a string")
+                return
+            updates["pwaName"] = nm[:100]
         if not updates:
             self._send_error(400, "no recognized settings to update")
             return
@@ -7925,7 +8185,49 @@ except Exception as ex:
             self.send_response(200)
             self.send_header("Content-Type", "text/html")
             self.end_headers()
-            self.wfile.write(LOGIN_HTML.encode())
+            self.wfile.write(LOGIN_HTML.replace("__PWA_HEAD__", PWA_HEAD).encode())
+        elif path == "/manifest.webmanifest":
+            # Per-user app name (configurable, like the browser tab title). The
+            # browser sends the session cookie because the <link> uses
+            # crossorigin="use-credentials"; anonymous fetches get the default.
+            name = None
+            username, _mport = verify_token(get_cookie_token(self.headers))
+            if username:
+                try:
+                    val = self._load_user_settings(username).get("pwaName")
+                    if isinstance(val, str):
+                        name = val
+                except Exception:
+                    name = None
+            self.send_response(200)
+            self.send_header("Content-Type", "application/manifest+json")
+            self.end_headers()
+            self.wfile.write(build_pwa_manifest(name).encode())
+        elif path == "/sw.js":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/javascript; charset=utf-8")
+            # Allow root-scope control even though served from /sw.js.
+            self.send_header("Service-Worker-Allowed", "/")
+            self.end_headers()
+            self.wfile.write(SW_JS.replace("__APP_VERSION__", APP_VERSION).encode())
+        elif path == "/offline.html":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(OFFLINE_HTML.encode())
+        elif path == "/icon.svg":
+            self.send_response(200)
+            self.send_header("Content-Type", "image/svg+xml")
+            self.end_headers()
+            self.wfile.write(ICON_SVG.encode())
+        elif path in ("/icon-192.png", "/icon-512.png", "/apple-touch-icon.png"):
+            data = {"/icon-192.png": ICON_PNG_192,
+                    "/icon-512.png": ICON_PNG_512,
+                    "/apple-touch-icon.png": ICON_PNG_180}[path]
+            self.send_response(200)
+            self.send_header("Content-Type", "image/png")
+            self.end_headers()
+            self.wfile.write(data)
         elif path == "/app":
             # Extract username and port from session
             token = get_cookie_token(self.headers)
@@ -7938,6 +8240,7 @@ except Exception as ex:
             # Inject the user's ttyd port into the app HTML
             html = (
                 APP_HTML
+                .replace("__PWA_HEAD__", PWA_HEAD)
                 .replace("__TTYD_PORT__", str(port))
                 .replace("__USERNAME__", username)
                 .replace("__COOKIE_NAME__", COOKIE_NAME)
