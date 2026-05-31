@@ -1,6 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Some NAS/SSH/su login shells start with HOME unset, which trips `set -u` on
+# the first ${HOME} reference (e.g. CF_CONFIG). Derive it from the login name
+# rather than the uid, since on TOS the admin user shares uid 0 with root
+# (looking up by uid would wrongly yield /root). Fall back to /root.
+if [ -z "${HOME:-}" ]; then
+  _login="${USER:-${LOGNAME:-$(logname 2>/dev/null || id -un)}}"
+  HOME="$(getent passwd "$_login" 2>/dev/null | cut -d: -f6)"
+  : "${HOME:=/root}"
+  export HOME
+  unset _login
+fi
+
 # Deploy/redeploy this ttyd-auth project on the local machine.
 # Manages all components: sshd, nginx, auth.py, cloudflared tunnel.
 # Health-checks each component and only starts what's actually down.
@@ -61,10 +73,28 @@ is_linux() {
   [ "$(uname -s)" = "Linux" ]
 }
 
-# Run a command with sudo when on Linux (for nginx/system operations).
-# On macOS, Homebrew services run as the current user so sudo is not needed.
+# TerraMaster TOS NAS detection. This box runs systemd but behaves unlike a
+# normal Debian/Ubuntu host: polkit-mediated `systemctl` auth is broken
+# (polkit-agent-helper-1 is not setuid root), nginx is vendor-managed (not a
+# systemd unit; configured via an http-level include — no sites-available), and
+# the login user is uid 0. So on the NAS we manage the web terminal with
+# system-level systemd units + direct `nginx -s reload`, and never use sudo.
+is_tos_nas() {
+  [ -f /etc/nginx/tnasonline.conf ] || grep -qi 'TNAS' /etc/issue 2>/dev/null
+}
+
+# NAS-specific locations.
+NAS_NGINX_CONF="/etc/nginx/webterminal.conf"   # full server{} block lives here
+NAS_NGINX_MAIN="/etc/nginx/nginx.conf"         # http-level include added here
+NAS_SYSTEMD_DIR="/etc/systemd/system"          # system units (not --user)
+
+# Run a command with elevated privileges. When already root (the NAS login user
+# is uid 0) run directly to avoid sudo→polkit prompts; otherwise sudo on Linux,
+# plain on macOS.
 _priv() {
-  if is_linux; then
+  if [ "$(id -u)" -eq 0 ]; then
+    "$@"
+  elif is_linux; then
     sudo "$@"
   else
     "$@"
@@ -124,6 +154,12 @@ detect_nginx_conf_dest() {
   local hostname
   hostname="$(detect_tunnel_hostname)"
   local conf_dir=""
+
+  # NAS: dedicated http-level-included file (see is_tos_nas notes).
+  if is_tos_nas; then
+    printf '%s\n' "$NAS_NGINX_CONF"
+    return 0
+  fi
 
   if [ -d "/usr/local/etc/nginx/servers" ]; then
     conf_dir="/usr/local/etc/nginx/servers"
@@ -222,6 +258,24 @@ install_nginx_conf() {
     _priv ln -sf "$dest_conf" "/etc/nginx/sites-enabled/${conf_name}"
   fi
 
+  # NAS: nginx.conf has no sites-available/enabled, and its `include conf.d/*`
+  # sits *inside* server{} blocks — so our server{} block must be included at
+  # http level. Add the include exactly once, right after the vendor's
+  # `include tnasonline.conf;` line (which is at http level). A firmware update
+  # can regenerate nginx.conf and drop this; re-running deploy.sh restores it.
+  if is_tos_nas; then
+    if ! grep -qE '^[[:space:]]*include[[:space:]]+webterminal\.conf;' "$NAS_NGINX_MAIN" 2>/dev/null; then
+      say "Adding http-level include for webterminal.conf to ${NAS_NGINX_MAIN}"
+      _priv cp "$NAS_NGINX_MAIN" "${NAS_NGINX_MAIN}.bak.$(date +%Y%m%d_%H%M%S)"
+      if grep -qE '^[[:space:]]*include[[:space:]]+tnasonline\.conf;' "$NAS_NGINX_MAIN"; then
+        _priv sed -i '/^[[:space:]]*include[[:space:]]\+tnasonline\.conf;/a\    include webterminal.conf;' "$NAS_NGINX_MAIN"
+      else
+        err "Could not find an http-level anchor in ${NAS_NGINX_MAIN}; add 'include webterminal.conf;' inside the http{} block manually."
+      fi
+      updated=true
+    fi
+  fi
+
   # Return 0 if config was updated (caller uses this to decide whether to reload).
   $updated
 }
@@ -230,7 +284,10 @@ reload_nginx() {
   say "Testing nginx config..."
   _priv nginx -t
   say "Reloading nginx..."
-  if is_linux && pidof systemd >/dev/null 2>&1; then
+  if is_tos_nas; then
+    # Vendor nginx is not a systemd unit here, and systemctl→polkit is broken.
+    _priv nginx -s reload
+  elif is_linux && pidof systemd >/dev/null 2>&1; then
     sudo systemctl reload nginx
   elif is_linux && command -v service >/dev/null 2>&1; then
     sudo service nginx reload
@@ -241,7 +298,9 @@ reload_nginx() {
 
 start_nginx() {
   say "Starting nginx..."
-  if is_linux && pidof systemd >/dev/null 2>&1; then
+  if is_tos_nas; then
+    _priv nginx
+  elif is_linux && pidof systemd >/dev/null 2>&1; then
     sudo systemctl start nginx
   elif is_linux && command -v service >/dev/null 2>&1; then
     sudo service nginx start
@@ -251,6 +310,15 @@ start_nginx() {
 }
 
 stop_auth_service() {
+  # NAS: managed as a system-level systemd unit. Stop via systemctl ONLY — never
+  # pkill the python process, because a clean SIGTERM is not a failure so
+  # Restart= won't bring it back, leaving the site down (and a stray pkill could
+  # hit unrelated processes). systemctl stop is the safe, complete stop.
+  if is_tos_nas; then
+    _priv systemctl stop ttyd-auth.service 2>/dev/null || true
+    return 0
+  fi
+
   # macOS launchd-managed auth service.
   if is_macos && [ -f "$AUTH_PLIST" ] && command -v launchctl >/dev/null 2>&1; then
     launchctl unload "$AUTH_PLIST" 2>/dev/null || true
@@ -351,13 +419,51 @@ PLISTEOF
 }
 
 write_auth_systemd_unit() {
-  local svc_dir="${HOME}/.config/systemd/user"
-  mkdir -p "$svc_dir"
-
   local pybin sshpass_bin ttyd_bin
   pybin="$(command -v python3)"
   sshpass_bin="$(command -v sshpass)"
   ttyd_bin="$(command -v ttyd)"
+
+  # NAS: system-level unit. --user units don't auto-start at boot without
+  # lingering, and the login user is root anyway. Restart=always so even an
+  # external SIGTERM (e.g. a stray pkill) self-heals.
+  if is_tos_nas; then
+    _priv tee "${NAS_SYSTEMD_DIR}/ttyd-auth.service" >/dev/null <<SVCEOF
+[Unit]
+Description=ttyd web terminal auth service
+After=network.target
+
+[Service]
+Type=simple
+User=root
+Environment=PYTHONUNBUFFERED=1
+Environment=AUTH_PORT=${AUTH_PORT}
+Environment=SSHPASS_BIN=${sshpass_bin}
+Environment=TTYD_BIN=${ttyd_bin}
+# Dedicated ttyd port range so this host deployment never collides with a
+# Dockerized webterminal on the same box (the ubuntu container SSHes to the
+# host and spawns ttyd in the default 7700+ range as the same user). Keep
+# these disjoint. Override with TTYD_START_PORT in the environment if needed.
+Environment=TTYD_START_PORT=${TTYD_START_PORT:-7900}
+# Dedicated tmux session name so this host deployment doesn't share/clobber a
+# co-located webterminal's windows (e.g. the ubuntu container, which uses the
+# default "main"). Override with TMUX_SESSION in the environment if needed.
+Environment=TMUX_SESSION=${TMUX_SESSION:-main-host}
+WorkingDirectory=${PROJECT_DIR}
+ExecStart=${pybin} ${AUTH_PY}
+Restart=always
+RestartSec=5
+StandardOutput=append:${AUTH_LOG}
+StandardError=append:${AUTH_LOG}
+
+[Install]
+WantedBy=multi-user.target
+SVCEOF
+    return 0
+  fi
+
+  local svc_dir="${HOME}/.config/systemd/user"
+  mkdir -p "$svc_dir"
 
   cat > "${svc_dir}/ttyd-auth.service" <<SVCEOF
 [Unit]
@@ -398,6 +504,20 @@ start_auth_service() {
       return 0
     fi
     err "Auth service failed to become ready via launchd. Check log: ${AUTH_LOG}"
+    exit 1
+  fi
+
+  if is_tos_nas; then
+    write_auth_systemd_unit
+    _priv systemctl daemon-reload
+    _priv systemctl enable ttyd-auth.service >/dev/null 2>&1 || true
+    _priv systemctl restart ttyd-auth.service
+    if wait_for_auth_ready; then
+      say "Auth service running via systemd (ttyd-auth.service, system)"
+      rm -f "$AUTH_PID_FILE"
+      return 0
+    fi
+    err "Auth service failed to become ready via systemd. Check log: ${AUTH_LOG}"
     exit 1
   fi
 
@@ -487,6 +607,11 @@ SSHEOF
 }
 
 restart_sshd() {
+  if is_tos_nas; then
+    # systemctl→polkit is broken here; HUP the running master to reload config.
+    _priv kill -HUP "$(pgrep -x sshd | head -1)" 2>/dev/null || true
+    return 0
+  fi
   if pidof systemd >/dev/null 2>&1; then
     local sshd_name="sshd"
     if ! systemctl list-unit-files "${sshd_name}.service" >/dev/null 2>&1; then
@@ -502,6 +627,16 @@ restart_sshd() {
 
 start_sshd() {
   say "Starting sshd..."
+  if is_tos_nas; then
+    # sshd is vendor-managed and normally already running; don't poke systemctl.
+    if check_sshd; then
+      say "  sshd already running (NAS-managed)."
+      return 0
+    fi
+    _priv /usr/sbin/sshd && return 0
+    err "Could not start sshd on NAS."
+    return 1
+  fi
   # Install openssh-server if sshd is missing (Linux only)
   if is_linux && ! command -v sshd >/dev/null 2>&1; then
     say "  sshd not found, installing openssh-server..."
@@ -535,7 +670,10 @@ _port_listening() {
   if command -v lsof >/dev/null 2>&1; then
     _priv lsof -nP -iTCP:"${port}" -sTCP:LISTEN >/dev/null 2>&1 && return 0
   fi
-  if /usr/sbin/ss -tlnp 2>/dev/null | grep -q ":${port} "; then
+  local ss_bin
+  ss_bin="$(command -v ss || true)"
+  [ -n "$ss_bin" ] || { [ -x /usr/sbin/ss ] && ss_bin=/usr/sbin/ss; }
+  if [ -n "$ss_bin" ] && "$ss_bin" -tlnp 2>/dev/null | grep -q ":${port} "; then
     return 0
   fi
   # Last resort: try curl.
@@ -567,7 +705,35 @@ check_auth() {
 }
 
 check_cloudflared() {
-  pgrep -x cloudflared >/dev/null 2>&1
+  # NAS: there may be other, unrelated cloudflared tunnels running, so check our
+  # specific managed service rather than any cloudflared process.
+  if is_tos_nas; then
+    _priv systemctl is-active --quiet cloudflared.service 2>/dev/null
+  else
+    pgrep -x cloudflared >/dev/null 2>&1
+  fi
+}
+
+write_cloudflared_systemd_unit() {
+  local tunnel_name="$1"
+  local cf_bin
+  cf_bin="$(command -v cloudflared)"
+  _priv tee "${NAS_SYSTEMD_DIR}/cloudflared.service" >/dev/null <<SVCEOF
+[Unit]
+Description=cloudflared tunnel (web terminal)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=${cf_bin} tunnel --no-autoupdate --config ${CF_CONFIG} run ${tunnel_name}
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+SVCEOF
 }
 
 # Return 0 (true) if auth.py on disk is newer than the running process.
@@ -592,6 +758,12 @@ auth_py_changed() {
 
 stop_cloudflared() {
   say "Stopping cloudflared..."
+  # NAS: stop ONLY our managed service. Never `pkill -x cloudflared` here — other
+  # unrelated tunnels may be running on this box.
+  if is_tos_nas; then
+    _priv systemctl stop cloudflared.service 2>/dev/null || true
+    return 0
+  fi
   if tmux has-session -t "$CF_TMUX_SESSION" 2>/dev/null; then
     tmux kill-session -t "$CF_TMUX_SESSION" 2>/dev/null || true
   fi
@@ -613,6 +785,22 @@ start_cloudflared() {
 
   if ! command -v cloudflared >/dev/null 2>&1; then
     err "cloudflared not found. Run cf_tunnel_install.sh first."
+    return 1
+  fi
+
+  # NAS: run as a system service (survives reboot, auto-restarts), not tmux.
+  if is_tos_nas; then
+    say "Starting cloudflared tunnel '${tunnel_name}' via systemd (cloudflared.service)..."
+    write_cloudflared_systemd_unit "$tunnel_name"
+    _priv systemctl daemon-reload
+    _priv systemctl enable cloudflared.service >/dev/null 2>&1 || true
+    _priv systemctl restart cloudflared.service
+    sleep 2
+    if _priv systemctl is-active --quiet cloudflared.service; then
+      say "  cloudflared.service active."
+      return 0
+    fi
+    err "cloudflared.service failed to start. Check: journalctl -u cloudflared.service"
     return 1
   fi
 
@@ -732,7 +920,13 @@ status_report() {
     fi
   fi
 
-  if is_linux && pidof systemd >/dev/null 2>&1; then
+  if is_tos_nas; then
+    if _priv systemctl is-active --quiet ttyd-auth.service 2>/dev/null; then
+      say "systemd auth : OK (ttyd-auth.service active, system)"
+    else
+      say "systemd auth : WARN (ttyd-auth.service not active)"
+    fi
+  elif is_linux && pidof systemd >/dev/null 2>&1; then
     if systemctl --user is-active --quiet ttyd-auth.service 2>/dev/null; then
       say "systemd auth : OK (ttyd-auth.service active)"
     else
@@ -789,7 +983,9 @@ status_report() {
   if [ -n "$tunnel_name" ]; then
     if check_cloudflared; then
       say "cloudflared  : OK (running, tunnel: ${tunnel_name})"
-      if tmux has-session -t "$CF_TMUX_SESSION" 2>/dev/null; then
+      if is_tos_nas; then
+        say "cloudflared  : (systemd cloudflared.service)"
+      elif tmux has-session -t "$CF_TMUX_SESSION" 2>/dev/null; then
         say "tmux session : OK (${CF_TMUX_SESSION})"
       else
         say "tmux session : WARN (not in tmux - may be systemd/nohup)"

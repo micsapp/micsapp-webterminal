@@ -38,6 +38,11 @@ Options:
                         Overrides --service to http://localhost:<nginx-port>
   --nginx-port PORT     Nginx listen port (default: 7680, only with --web-terminal)
   --auth-port PORT      Auth service port (default: 7682, only with --web-terminal)
+  --tmux-session NAME   tmux session name for this deployment (default: main).
+                        Auto-set to a unique name if another webterminal (host or
+                        in a Docker container) is detected, to avoid clobbering it.
+  --ttyd-start-port N   First per-user ttyd port (default: 7700). Auto-bumped past
+                        any detected webterminal's ports to avoid collisions.
 
   --yes                 Non-interactive where possible (won't skip required browser auth)
   -h, --help            Show help
@@ -641,6 +646,10 @@ load_dotenv(os.path.join(BASE_DIR, ".env"))
 SECRET_KEY = os.environ.get("TTYD_SECRET", secrets.token_hex(32))
 SESSION_MAX_AGE = int(os.environ.get("SESSION_MAX_AGE", "86400"))  # 24h default
 PORT = int(os.environ.get("AUTH_PORT", "7682"))
+# Base tmux session name. Override per-deployment (TMUX_SESSION) so multiple
+# co-located webterminals on the same host/user (e.g. a Dockerized one that
+# SSHes into this host) don't share and clobber each other's windows.
+TMUX_SESSION = os.environ.get("TMUX_SESSION", "main")
 ACCESS_LOG_ENABLED = env_bool("ACCESS_LOG_ENABLED", False)
 COOKIE_NAME = os.environ.get("SESSION_COOKIE_NAME", "__Host-ttyd_session")
 COOKIE_SECURE = env_bool("COOKIE_SECURE", True)
@@ -3393,7 +3402,7 @@ function killTabWindow(slot) {
   fetch('/api/exec', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ command: 'tmux kill-window -t main:' + slot + ' 2>/dev/null || true' })
+    body: JSON.stringify({ command: 'tmux kill-window -t ' + TMUX_SESSION + ':' + slot + ' 2>/dev/null || true' })
   }).catch(() => {});
 }
 
@@ -3562,8 +3571,8 @@ function sessShq(s) { return "'" + String(s).replace(/'/g, "'\\''") + "'"; }
 // reverting to the running command.
 function syncWindowName(slot, name) {
   if (!Number.isInteger(slot) || !name) return;
-  const cmd = 'tmux setw -t main:' + slot + ' automatic-rename off 2>/dev/null; '
-            + 'tmux rename-window -t main:' + slot + ' ' + sessShq(name) + ' 2>/dev/null || true';
+  const cmd = 'tmux setw -t ' + TMUX_SESSION + ':' + slot + ' automatic-rename off 2>/dev/null; '
+            + 'tmux rename-window -t ' + TMUX_SESSION + ':' + slot + ' ' + sessShq(name) + ' 2>/dev/null || true';
   fetch('/api/exec', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -3587,7 +3596,7 @@ async function fetchSessions() {
   const res = await fetch('/api/exec', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ command: "tmux list-windows -t main -F '" + fmt + "' 2>/dev/null" })
+    body: JSON.stringify({ command: "tmux list-windows -t " + TMUX_SESSION + " -F '" + fmt + "' 2>/dev/null" })
   });
   const data = await res.json().catch(() => ({}));
   const out = [];
@@ -4517,6 +4526,7 @@ document.getElementById('helpModal').addEventListener('click', (e) => {
 const APP_VERSION = '__APP_VERSION__';
 const APP_BUILD = '__APP_BUILD__';
 const APP_USERNAME = '__USERNAME__';
+const TMUX_SESSION = '__TMUX_SESSION__';
 function showAbout() {
   document.getElementById('aboutVersion').textContent = APP_VERSION;
   document.getElementById('aboutBuild').textContent = APP_BUILD;
@@ -6416,20 +6426,23 @@ def spawn_user_ttyd(username, password):
         # Grouped sessions have destroy-unattached so they auto-clean on disconnect,
         # while the base "main" session (and its windows) persist to keep processes alive.
         # On reconnect, tabs reattach to existing windows instead of creating new ones.
+        # Session name is configurable (TMUX_SESSION) so co-located webterminals
+        # don't share/clobber each other's windows. Set it once as shell var $S.
         tmux_cmd = (
-            r'tmux has-session -t main 2>/dev/null || exec tmux new-session -s main \; set -g mouse on \; set -g history-limit 10000 \; set -s set-clipboard on \; setw -g aggressive-resize on;'
+            f'S={shlex.quote(TMUX_SESSION)};'
+            r' tmux has-session -t "$S" 2>/dev/null || exec tmux new-session -s "$S" \; set -g mouse on \; set -g history-limit 10000 \; set -s set-clipboard on \; setw -g aggressive-resize on;'
             r' tmux set -g mouse on 2>/dev/null; tmux set -g history-limit 10000 2>/dev/null; tmux set -s set-clipboard on 2>/dev/null; tmux set -g set-clipboard on 2>/dev/null; tmux setw -g aggressive-resize on 2>/dev/null;'
             # Parse arg format "SLOT:ACTIVE_SLOTS" (e.g. "0:0,2,3") or plain "SLOT"
             r' RAW="$1"; case "$RAW" in *:*) SLOT="${RAW%%:*}"; ACTIVE="${RAW#*:}" ;; *) SLOT="$RAW"; ACTIVE="" ;; esac;'
             r' case "$SLOT" in (""|*[!0-9]*) SLOT=0 ;; esac;'
             # Create window at exact SLOT index (no gap-filling)
-            r' tmux list-windows -t main -F "#{window_index}" | grep -q "^${SLOT}$" || tmux new-window -t main:${SLOT};'
+            r' tmux list-windows -t "$S" -F "#{window_index}" | grep -q "^${SLOT}$" || tmux new-window -t "$S":${SLOT};'
             # NOTE: ACTIVE (a single client's tab list) is intentionally NOT used to kill
             # windows. A second device (phone/laptop) has its own tab layout, so trusting
             # one client's list would destroy another device's running windows. Windows
             # are closed explicitly via /api/exec `tmux kill-window` only when the user
             # closes a tab (see killTabWindow in the SPA).
-            r' exec tmux new-session -t main \; set-option destroy-unattached on \; select-window -t :${SLOT}'
+            r' exec tmux new-session -t "$S" \; set-option destroy-unattached on \; select-window -t :${SLOT}'
         )
         ttyd_cmd = f"{shlex.quote(TTYD_BIN)} -W -a -i 127.0.0.1 -p {port} bash -lc {shlex.quote(tmux_cmd)} ttyd-tab"
         proc = subprocess.Popen(
@@ -8242,6 +8255,7 @@ except Exception as ex:
                 APP_HTML
                 .replace("__PWA_HEAD__", PWA_HEAD)
                 .replace("__TTYD_PORT__", str(port))
+                .replace("__TMUX_SESSION__", TMUX_SESSION)
                 .replace("__USERNAME__", username)
                 .replace("__COOKIE_NAME__", COOKIE_NAME)
                 .replace("__APP_VERSION__", APP_VERSION)
@@ -8443,7 +8457,10 @@ start_auth_service() {
     log_file="$AUTH_DIR/auth.log"
   fi
 
-  AUTH_PORT="$auth_port" python3 "$AUTH_DIR/auth.py" > "$log_file" 2>&1 &
+  env AUTH_PORT="$auth_port" \
+    ${WT_TTYD_START_PORT:+TTYD_START_PORT="$WT_TTYD_START_PORT"} \
+    ${WT_TMUX_SESSION:+TMUX_SESSION="$WT_TMUX_SESSION"} \
+    python3 "$AUTH_DIR/auth.py" > "$log_file" 2>&1 &
   local pid=$!
   sleep 2
 
@@ -8479,7 +8496,11 @@ install_auth_plist() {
     <key>EnvironmentVariables</key>
     <dict>
         <key>AUTH_PORT</key>
-        <string>${auth_port}</string>
+        <string>${auth_port}</string>${WT_TTYD_START_PORT:+
+        <key>TTYD_START_PORT</key>
+        <string>${WT_TTYD_START_PORT}</string>}${WT_TMUX_SESSION:+
+        <key>TMUX_SESSION</key>
+        <string>${WT_TMUX_SESSION}</string>}
     </dict>
     <key>RunAtLoad</key>
     <true/>
@@ -8501,6 +8522,12 @@ PLISTEOF
 install_auth_systemd() {
   local auth_port="$1"
 
+  # Optional isolation env (set when a co-located webterminal was detected or
+  # the user passed --tmux-session / --ttyd-start-port).
+  local extra_env=""
+  [ -n "${WT_TTYD_START_PORT:-}" ] && extra_env="${extra_env}Environment=TTYD_START_PORT=${WT_TTYD_START_PORT}"$'\n'
+  [ -n "${WT_TMUX_SESSION:-}" ] && extra_env="${extra_env}Environment=TMUX_SESSION=${WT_TMUX_SESSION}"$'\n'
+
   if pidof systemd >/dev/null 2>&1; then
     say "Installing auth service as systemd user service..."
     local svc_dir="$HOME/.config/systemd/user"
@@ -8514,7 +8541,7 @@ After=network.target
 [Service]
 Type=simple
 Environment=AUTH_PORT=${auth_port}
-ExecStart=$(command -v python3) $AUTH_DIR/auth.py
+${extra_env}ExecStart=$(command -v python3) $AUTH_DIR/auth.py
 Restart=on-failure
 RestartSec=5
 
@@ -8530,8 +8557,74 @@ SVCEOF
     say "Starting auth service in background (no systemd)..."
     local auth_py="$AUTH_DIR/auth.py"
     local auth_log="$AUTH_DIR/auth.log"
-    AUTH_PORT="$auth_port" nohup python3 "$auth_py" >> "$auth_log" 2>&1 &
+    env AUTH_PORT="$auth_port" \
+      ${WT_TTYD_START_PORT:+TTYD_START_PORT="$WT_TTYD_START_PORT"} \
+      ${WT_TMUX_SESSION:+TMUX_SESSION="$WT_TMUX_SESSION"} \
+      nohup python3 "$auth_py" >> "$auth_log" 2>&1 &
     say "Auth service started (pid: $!), log: $auth_log"
+  fi
+}
+
+# ─── Existing-webterminal detection ─────────────────────────────────────────────
+
+# Chosen isolation settings for this install (empty = use auth.py defaults).
+# Populated from --tmux-session/--ttyd-start-port or auto-picked on detection.
+WT_TMUX_SESSION=""
+WT_TTYD_START_PORT=""
+
+# Detect webterminals already running on this host — INCLUDING ones inside Docker
+# containers. A containerized webterminal SSHes into the host and spawns its ttyd
+# on the host, so both host and container deployments appear as host ttyd
+# processes carrying this project's signature (ttyd ... -i 127.0.0.1 ... tmux).
+# Sets globals: WT_DETECTED, WT_USED_PORTS, WT_USED_SESSIONS, WT_DETECT_REPORT.
+detect_existing_webterminals() {
+  WT_DETECTED=false
+  WT_USED_PORTS=""
+  WT_USED_SESSIONS=""
+  WT_DETECT_REPORT=""
+
+  # 1. Host ttyd processes matching the webterminal signature (covers host AND
+  #    containerized deployments, since the latter spawn ttyd on the host).
+  if command -v pgrep >/dev/null 2>&1; then
+    local line port sess
+    while IFS= read -r line; do
+      [ -n "$line" ] || continue
+      port="$(printf '%s' "$line" | grep -oE -- '-p [0-9]+' | head -1 | awk '{print $2}')"
+      # session name: new code embeds 'S=NAME;'; older code uses '-t NAME'/'-s NAME'
+      sess="$(printf '%s' "$line" | grep -oE 'S=[A-Za-z0-9_.-]+' | head -1 | cut -d= -f2)"
+      [ -n "$sess" ] || sess="$(printf '%s' "$line" | grep -oE -- '-[ts] [A-Za-z0-9_.-]+' | head -1 | awk '{print $2}')"
+      [ -n "$port" ] && WT_USED_PORTS="$WT_USED_PORTS $port"
+      [ -n "$sess" ] && WT_USED_SESSIONS="$WT_USED_SESSIONS $sess"
+      WT_DETECTED=true
+    done < <(pgrep -af 'ttyd' 2>/dev/null | grep -- '-i 127.0.0.1' | grep -F 'tmux')
+    if [ -n "$WT_USED_PORTS" ] || [ -n "$WT_USED_SESSIONS" ]; then
+      local _rports _rsess
+      _rports="$(echo $WT_USED_PORTS | tr ' ' '\n' | sort -un | paste -sd, -)"
+      _rsess="$(echo $WT_USED_SESSIONS | tr ' ' '\n' | sort -u | paste -sd, -)"
+      WT_DETECT_REPORT="${WT_DETECT_REPORT}  - host ttyd processes (ports: ${_rports:-none}; tmux sessions: ${_rsess:-none})\n"
+    fi
+  fi
+
+  # 2. An existing auth systemd unit (system or --user).
+  if command -v systemctl >/dev/null 2>&1; then
+    if systemctl list-unit-files 2>/dev/null | grep -q '^ttyd-auth\.service' \
+       || systemctl --user list-unit-files 2>/dev/null | grep -q '^ttyd-auth\.service'; then
+      WT_DETECTED=true
+      WT_DETECT_REPORT="${WT_DETECT_REPORT}  - existing ttyd-auth.service systemd unit\n"
+    fi
+  fi
+
+  # 3. Webterminals running inside Docker containers. `docker top` reads the
+  #    process list from the host side, so it works without exec'ing inside.
+  if command -v docker >/dev/null 2>&1; then
+    local cid cname
+    for cid in $(docker ps -q 2>/dev/null); do
+      if docker top "$cid" 2>/dev/null | grep -q '[a]uth\.py'; then
+        cname="$(docker inspect -f '{{.Name}}' "$cid" 2>/dev/null | sed 's#^/##')"
+        WT_DETECTED=true
+        WT_DETECT_REPORT="${WT_DETECT_REPORT}  - docker container '${cname:-$cid}' running auth.py (webterminal)\n"
+      fi
+    done
   fi
 }
 
@@ -8558,6 +8651,8 @@ main() {
       --web-terminal) web_terminal=true; shift;;
       --nginx-port) nginx_port="$2"; shift 2;;
       --auth-port) auth_port="$2"; shift 2;;
+      --tmux-session) WT_TMUX_SESSION="$2"; shift 2;;
+      --ttyd-start-port) WT_TTYD_START_PORT="$2"; shift 2;;
       --yes) yes=true; shift;;
       -h|--help) usage; exit 0;;
       *) err "Unknown option: $1"; usage; exit 2;;
@@ -8622,6 +8717,32 @@ main() {
 
   # ── Web Terminal Setup ──
   if [ "$web_terminal" = true ]; then
+    # Detect any existing webterminal (host or in a Docker container) that would
+    # share this host's tmux session / ttyd port range, and auto-pick disjoint
+    # values so the two don't clobber each other's windows or ports.
+    detect_existing_webterminals
+    if [ "$WT_DETECTED" = true ]; then
+      say ""
+      say "[detect] Found existing webterminal(s) on this host:"
+      printf "%b" "$WT_DETECT_REPORT"
+      if [ -z "$WT_TMUX_SESSION" ]; then
+        WT_TMUX_SESSION="main-$(printf '%s' "$name" | tr -c 'A-Za-z0-9_-' '-')"
+      fi
+      if [ -z "$WT_TTYD_START_PORT" ]; then
+        local _maxp=7699 _p
+        for _p in $WT_USED_PORTS; do
+          [ "$_p" -gt "$_maxp" ] 2>/dev/null && _maxp="$_p"
+        done
+        WT_TTYD_START_PORT=$(( (_maxp / 100 + 1) * 100 ))
+        [ "$WT_TTYD_START_PORT" -lt 7900 ] && WT_TTYD_START_PORT=7900
+      fi
+      say "[auto]  Using TMUX_SESSION=${WT_TMUX_SESSION}  TTYD_START_PORT=${WT_TTYD_START_PORT}"
+      say "        (override with --tmux-session / --ttyd-start-port)"
+      say ""
+    elif [ -n "$WT_TMUX_SESSION" ] || [ -n "$WT_TTYD_START_PORT" ]; then
+      say "[config] TMUX_SESSION=${WT_TMUX_SESSION:-main(default)}  TTYD_START_PORT=${WT_TTYD_START_PORT:-7700(default)}"
+    fi
+
     install_web_terminal_deps
     enable_ssh_server
     deploy_auth_service "$auth_port"
@@ -8702,7 +8823,8 @@ Web Terminal Setup
   Auth service:  http://127.0.0.1:${auth_port} (${AUTH_DIR}/auth.py)
   nginx config:  ${conf_dir}/${hostname}.conf
   nginx port:    ${nginx_port}
-  ttyd ports:    7700+ (per-user, dynamic)
+  ttyd ports:    ${WT_TTYD_START_PORT:-7700}+ (per-user, dynamic)
+  tmux session:  ${WT_TMUX_SESSION:-main}
   Login URL:     https://${hostname}
 =======================================
 EOF

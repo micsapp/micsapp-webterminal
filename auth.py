@@ -53,6 +53,10 @@ load_dotenv(os.path.join(BASE_DIR, ".env"))
 SECRET_KEY = os.environ.get("TTYD_SECRET", secrets.token_hex(32))
 SESSION_MAX_AGE = int(os.environ.get("SESSION_MAX_AGE", "86400"))  # 24h default
 PORT = int(os.environ.get("AUTH_PORT", "7682"))
+# Base tmux session name. Override per-deployment (TMUX_SESSION) so multiple
+# co-located webterminals on the same host/user (e.g. a Dockerized one that
+# SSHes into this host) don't share and clobber each other's windows.
+TMUX_SESSION = os.environ.get("TMUX_SESSION", "main")
 ACCESS_LOG_ENABLED = env_bool("ACCESS_LOG_ENABLED", False)
 COOKIE_NAME = os.environ.get("SESSION_COOKIE_NAME", "__Host-ttyd_session")
 COOKIE_SECURE = env_bool("COOKIE_SECURE", True)
@@ -2805,7 +2809,7 @@ function killTabWindow(slot) {
   fetch('/api/exec', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ command: 'tmux kill-window -t main:' + slot + ' 2>/dev/null || true' })
+    body: JSON.stringify({ command: 'tmux kill-window -t ' + TMUX_SESSION + ':' + slot + ' 2>/dev/null || true' })
   }).catch(() => {});
 }
 
@@ -2974,8 +2978,8 @@ function sessShq(s) { return "'" + String(s).replace(/'/g, "'\\''") + "'"; }
 // reverting to the running command.
 function syncWindowName(slot, name) {
   if (!Number.isInteger(slot) || !name) return;
-  const cmd = 'tmux setw -t main:' + slot + ' automatic-rename off 2>/dev/null; '
-            + 'tmux rename-window -t main:' + slot + ' ' + sessShq(name) + ' 2>/dev/null || true';
+  const cmd = 'tmux setw -t ' + TMUX_SESSION + ':' + slot + ' automatic-rename off 2>/dev/null; '
+            + 'tmux rename-window -t ' + TMUX_SESSION + ':' + slot + ' ' + sessShq(name) + ' 2>/dev/null || true';
   fetch('/api/exec', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -2999,7 +3003,7 @@ async function fetchSessions() {
   const res = await fetch('/api/exec', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ command: "tmux list-windows -t main -F '" + fmt + "' 2>/dev/null" })
+    body: JSON.stringify({ command: "tmux list-windows -t " + TMUX_SESSION + " -F '" + fmt + "' 2>/dev/null" })
   });
   const data = await res.json().catch(() => ({}));
   const out = [];
@@ -3929,6 +3933,7 @@ document.getElementById('helpModal').addEventListener('click', (e) => {
 const APP_VERSION = '__APP_VERSION__';
 const APP_BUILD = '__APP_BUILD__';
 const APP_USERNAME = '__USERNAME__';
+const TMUX_SESSION = '__TMUX_SESSION__';
 function showAbout() {
   document.getElementById('aboutVersion').textContent = APP_VERSION;
   document.getElementById('aboutBuild').textContent = APP_BUILD;
@@ -5828,20 +5833,23 @@ def spawn_user_ttyd(username, password):
         # Grouped sessions have destroy-unattached so they auto-clean on disconnect,
         # while the base "main" session (and its windows) persist to keep processes alive.
         # On reconnect, tabs reattach to existing windows instead of creating new ones.
+        # Session name is configurable (TMUX_SESSION) so co-located webterminals
+        # don't share/clobber each other's windows. Set it once as shell var $S.
         tmux_cmd = (
-            r'tmux has-session -t main 2>/dev/null || exec tmux new-session -s main \; set -g mouse on \; set -g history-limit 10000 \; set -s set-clipboard on \; setw -g aggressive-resize on;'
+            f'S={shlex.quote(TMUX_SESSION)};'
+            r' tmux has-session -t "$S" 2>/dev/null || exec tmux new-session -s "$S" \; set -g mouse on \; set -g history-limit 10000 \; set -s set-clipboard on \; setw -g aggressive-resize on;'
             r' tmux set -g mouse on 2>/dev/null; tmux set -g history-limit 10000 2>/dev/null; tmux set -s set-clipboard on 2>/dev/null; tmux set -g set-clipboard on 2>/dev/null; tmux setw -g aggressive-resize on 2>/dev/null;'
             # Parse arg format "SLOT:ACTIVE_SLOTS" (e.g. "0:0,2,3") or plain "SLOT"
             r' RAW="$1"; case "$RAW" in *:*) SLOT="${RAW%%:*}"; ACTIVE="${RAW#*:}" ;; *) SLOT="$RAW"; ACTIVE="" ;; esac;'
             r' case "$SLOT" in (""|*[!0-9]*) SLOT=0 ;; esac;'
             # Create window at exact SLOT index (no gap-filling)
-            r' tmux list-windows -t main -F "#{window_index}" | grep -q "^${SLOT}$" || tmux new-window -t main:${SLOT};'
+            r' tmux list-windows -t "$S" -F "#{window_index}" | grep -q "^${SLOT}$" || tmux new-window -t "$S":${SLOT};'
             # NOTE: ACTIVE (a single client's tab list) is intentionally NOT used to kill
             # windows. A second device (phone/laptop) has its own tab layout, so trusting
             # one client's list would destroy another device's running windows. Windows
             # are closed explicitly via /api/exec `tmux kill-window` only when the user
             # closes a tab (see killTabWindow in the SPA).
-            r' exec tmux new-session -t main \; set-option destroy-unattached on \; select-window -t :${SLOT}'
+            r' exec tmux new-session -t "$S" \; set-option destroy-unattached on \; select-window -t :${SLOT}'
         )
         ttyd_cmd = f"{shlex.quote(TTYD_BIN)} -W -a -i 127.0.0.1 -p {port} bash -lc {shlex.quote(tmux_cmd)} ttyd-tab"
         proc = subprocess.Popen(
@@ -7654,6 +7662,7 @@ except Exception as ex:
                 APP_HTML
                 .replace("__PWA_HEAD__", PWA_HEAD)
                 .replace("__TTYD_PORT__", str(port))
+                .replace("__TMUX_SESSION__", TMUX_SESSION)
                 .replace("__USERNAME__", username)
                 .replace("__COOKIE_NAME__", COOKIE_NAME)
                 .replace("__APP_VERSION__", APP_VERSION)
