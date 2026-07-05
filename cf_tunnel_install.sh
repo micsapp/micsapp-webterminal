@@ -4597,6 +4597,97 @@ document.addEventListener('paste', async (e) => {
 
 // Special keys toolbar
 let modCtrl = false, modAlt = false;
+let _pendingModKeyDetach = null;
+
+// Ctrl/Alt toolbar buttons are sticky one-shot modifiers: after tapping one,
+// the next character typed on the real keyboard is sent as a modified chord.
+// Synthetic KeyboardEvents can't reliably carry modifier state and mobile
+// IMEs don't produce usable keydown events at all, so instead we intercept
+// the next keystroke inside the terminal iframe (keydown for physical
+// keyboards, beforeinput for mobile IMEs) and write the control/escape
+// bytes straight into the terminal's data pipeline via the xterm object
+// that term-hook.js exposes on the iframe window.
+function _sendTermData(win, data) {
+  try {
+    var t = win.term || win.terminal || win.xterm;
+    if (!t) return false;
+    if (typeof t.input === 'function') { t.input(data, true); return true; }
+    if (t._core && t._core.coreService && typeof t._core.coreService.triggerDataEvent === 'function') {
+      t._core.coreService.triggerDataEvent(data, true);
+      return true;
+    }
+    if (typeof t.paste === 'function') { t.paste(data); return true; }
+  } catch (e) {}
+  return false;
+}
+
+function _modChordData(ch, ctrl, alt) {
+  var out = ch;
+  if (ctrl) {
+    var code = ch.toUpperCase().charCodeAt(0);
+    if (ch === ' ' || ch === '@') out = String.fromCharCode(0);
+    else if (ch === '?') out = String.fromCharCode(127);
+    else if (code >= 64 && code <= 95) out = String.fromCharCode(code - 64);
+  }
+  if (alt) out = String.fromCharCode(27) + out;
+  return out;
+}
+
+function _clearPendingModKeyListener() {
+  if (_pendingModKeyDetach) { _pendingModKeyDetach(); _pendingModKeyDetach = null; }
+}
+
+function _resetOneShotMods() {
+  _clearPendingModKeyListener();
+  if (modCtrl) { modCtrl = false; document.getElementById('modCtrl').classList.remove('active'); }
+  if (modAlt) { modAlt = false; document.getElementById('modAlt').classList.remove('active'); }
+}
+
+function _focusActiveTerminal() {
+  try {
+    const frame = document.getElementById('frame-' + activeTabId);
+    const ta = frame.contentDocument.querySelector('.xterm-helper-textarea');
+    if (ta) ta.focus();
+  } catch (e) {}
+}
+
+function _armPendingModKeyListener() {
+  _clearPendingModKeyListener();
+  if (!modCtrl && !modAlt) return;
+  const frame = document.getElementById('frame-' + activeTabId);
+  if (!frame || !frame.contentDocument || !frame.contentWindow) return;
+  const doc = frame.contentDocument;
+  const win = frame.contentWindow;
+
+  const consume = function(e, ch) {
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    const data = _modChordData(ch, modCtrl, modAlt);
+    _resetOneShotMods();
+    if (data) _sendTermData(win, data);
+  };
+  const onKeydown = function(e) {
+    if (!e.key || e.key === 'Unidentified' || e.keyCode === 229) return; // IME key: wait for beforeinput
+    if (e.key === 'Control' || e.key === 'Alt' || e.key === 'Shift' || e.key === 'Meta' || e.key === 'CapsLock') return;
+    if (e.key.length === 1) { consume(e, e.key); return; }
+    // Named keys (Enter, arrows, ...): fake the modifier flags so xterm
+    // emits the proper modified escape sequence itself.
+    if (modCtrl && !e.ctrlKey) Object.defineProperty(e, 'ctrlKey', { get: function () { return true; }, configurable: true });
+    if (modAlt && !e.altKey) Object.defineProperty(e, 'altKey', { get: function () { return true; }, configurable: true });
+    _resetOneShotMods();
+  };
+  const onBeforeInput = function(e) {
+    if (e.inputType && e.inputType.indexOf('insert') !== 0) return;
+    if (!e.data || e.data.length !== 1) return;
+    consume(e, e.data);
+  };
+  doc.addEventListener('keydown', onKeydown, true);
+  doc.addEventListener('beforeinput', onBeforeInput, true);
+  _pendingModKeyDetach = function() {
+    try { doc.removeEventListener('keydown', onKeydown, true); } catch (e) {}
+    try { doc.removeEventListener('beforeinput', onBeforeInput, true); } catch (e) {}
+  };
+}
 
 function sendKeyToTerminal(key, opts) {
   opts = opts || {};
@@ -4618,9 +4709,7 @@ function sendKeyToTerminal(key, opts) {
     });
     textarea.dispatchEvent(ev);
   } catch(e) {}
-  // Reset one-shot modifiers
-  if (modCtrl) { modCtrl = false; document.getElementById('modCtrl').classList.remove('active'); }
-  if (modAlt) { modAlt = false; document.getElementById('modAlt').classList.remove('active'); }
+  _resetOneShotMods();
 }
 
 function getCharKeyOptions(ch) {
@@ -4649,20 +4738,32 @@ document.getElementById('specialKeys').addEventListener('click', function(e) {
   if (btn.dataset.mod === 'ctrl') {
     modCtrl = !modCtrl;
     btn.classList.toggle('active', modCtrl);
+    _armPendingModKeyListener();
+    _focusActiveTerminal();
     return;
   }
   if (btn.dataset.mod === 'alt') {
     modAlt = !modAlt;
     btn.classList.toggle('active', modAlt);
+    _armPendingModKeyListener();
+    _focusActiveTerminal();
     return;
   }
 
-  // Combo keys (e.g. ctrl+c)
+  // Combo keys (e.g. ctrl+c) — inject the control byte directly
   if (btn.dataset.combo) {
     var parts = btn.dataset.combo.split('+');
     var mod = parts[0], k = parts[1];
-    sendKeyToTerminal(k, { ctrlKey: mod === 'ctrl', altKey: mod === 'alt',
-      keyCode: k.charCodeAt(0) - 96 });
+    var comboFrame = document.getElementById('frame-' + activeTabId);
+    if (comboFrame && comboFrame.contentWindow) {
+      var comboData = _modChordData(k, mod === 'ctrl' || modCtrl, mod === 'alt' || modAlt);
+      if (!_sendTermData(comboFrame.contentWindow, comboData)) {
+        sendKeyToTerminal(k, { ctrlKey: mod === 'ctrl', altKey: mod === 'alt',
+          keyCode: k.charCodeAt(0) - 96 });
+      }
+      _focusActiveTerminal();
+    }
+    _resetOneShotMods();
     return;
   }
 
