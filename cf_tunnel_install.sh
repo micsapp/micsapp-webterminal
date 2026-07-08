@@ -161,6 +161,19 @@ EOF
     return 0
   fi
 
+  local existing_tunnel
+  existing_tunnel="$(awk '$1=="tunnel:" {print $2; exit}' "$cfg" 2>/dev/null | tr -d '"'\''')"
+  if [ -n "$existing_tunnel" ] && [ "$existing_tunnel" != "$name" ]; then
+    err "Config $cfg is for tunnel '$existing_tunnel', not '$name'."
+    err "Re-run with --replace-config to switch this config to '$name', or use --name '$existing_tunnel'."
+    return 1
+  fi
+
+  if awk -v h="$hostname" '$1=="-" && $2=="hostname:" && $3==h {found=1} END{exit found ? 0 : 1}' "$cfg"; then
+    say "Config already contains hostname $hostname; leaving ingress unchanged: $cfg"
+    return 0
+  fi
+
   # Merge: insert a new ingress rule before the catch-all rule if present.
   cp -a "$cfg" "${cfg}.bak.$(date +%Y%m%d_%H%M%S)"
 
@@ -197,6 +210,31 @@ EOF
   fi
 
   say "Updated config (merged): $cfg"
+}
+
+ensure_dns_route() {
+  local name="$1" hostname="$2"
+  local output rc
+
+  set +e
+  output="$(cloudflared tunnel route dns "$name" "$hostname" 2>&1)"
+  rc=$?
+  set -e
+
+  if [ "$rc" -eq 0 ]; then
+    [ -n "$output" ] && say "$output"
+    return 0
+  fi
+
+  if printf '%s\n' "$output" | grep -qiE 'already exists|record.*exist'; then
+    err "Cloudflare reported an existing DNS record while creating $hostname:"
+    printf '%s\n' "$output" >&2
+    err "If this DNS record is already correct, re-run with --no-dns."
+    return "$rc"
+  fi
+
+  [ -n "$output" ] && printf '%s\n' "$output" >&2
+  return "$rc"
 }
 
 # ─── Web Terminal helpers ──────────────────────────────────────────────────────
@@ -430,6 +468,12 @@ server {
     # CRITICAL: use relative redirects so Cloudflare's HTTPS is preserved.
     # Without this, nginx redirects to http://<hostname>:<port>/... which breaks.
     absolute_redirect off;
+
+    # Secure session cookies are rejected by browsers on plain HTTP.
+    # Cloudflare Tunnel sends the original visitor scheme in X-Forwarded-Proto.
+    if (\$http_x_forwarded_proto = "http") {
+        return 301 https://\$host\$request_uri;
+    }
 
     # Auth subrequest
     location = /api/auth {
@@ -8715,8 +8759,10 @@ main() {
   write_or_merge_config "$name" "$hostname" "$service" "$cfg" "$creds" "$replace_config"
 
   if [ "$no_dns" = false ]; then
+    local route_tunnel="$name"
+    [ -n "${tid:-}" ] && route_tunnel="$tid"
     say "Creating DNS route (CNAME) in Cloudflare: $hostname -> tunnel $name"
-    cloudflared tunnel route dns "$name" "$hostname"
+    ensure_dns_route "$route_tunnel" "$hostname"
   else
     say "Skipping DNS route (--no-dns)."
   fi
@@ -8733,7 +8779,7 @@ main() {
   if [ "$run_fg" = true ]; then
     say "Running tunnel in foreground for testing. Visit: https://$hostname"
     say "Press Ctrl+C to stop when verified."
-    cloudflared tunnel run "$name"
+    cloudflared tunnel --config "$cfg" run "$name"
   fi
 
   if [ "$install_service" = true ]; then
@@ -8743,7 +8789,7 @@ main() {
     # --- cloudflared service ---
     say "Installing cloudflared as a service..."
     if is_macos; then
-      cloudflared service install
+      cloudflared --config "$cfg" service install
 
       # macOS: fix broken plist missing "tunnel run" arguments
       local plist="$HOME/Library/LaunchAgents/com.cloudflare.cloudflared.plist"
@@ -8763,12 +8809,36 @@ main() {
       fi
     else
       if pidof systemd >/dev/null 2>&1; then
-        sudo cloudflared service install
-        say "Linux: cloudflared service installed (systemd)."
+        local service_cfg="$cfg"
+        if [ "$cfg" != "/etc/cloudflared/config.yml" ]; then
+          sudo mkdir -p /etc/cloudflared
+          if [ -f /etc/cloudflared/config.yml ]; then
+            sudo cp -a /etc/cloudflared/config.yml "/etc/cloudflared/config.yml.bak.$(date +%Y%m%d_%H%M%S)"
+          fi
+          sudo cp "$cfg" /etc/cloudflared/config.yml
+          service_cfg="/etc/cloudflared/config.yml"
+          say "Installed cloudflared service config: $service_cfg"
+        fi
+        set +e
+        local install_output install_rc
+        install_output="$(sudo cloudflared --config "$service_cfg" service install 2>&1)"
+        install_rc=$?
+        set -e
+        if [ "$install_rc" -eq 0 ]; then
+          [ -n "$install_output" ] && say "$install_output"
+          say "Linux: cloudflared service installed (systemd)."
+        elif printf '%s\n' "$install_output" | grep -qi 'service is already installed'; then
+          say "Linux: cloudflared service already installed; restarting with $service_cfg."
+          sudo systemctl restart cloudflared
+        else
+          [ -n "$install_output" ] && printf '%s\n' "$install_output" >&2
+          return "$install_rc"
+        fi
       else
         say "No systemd detected (WSL2?). Starting cloudflared in background..."
-        sudo nohup cloudflared tunnel run >> /var/log/cloudflared.log 2>&1 &
-        say "Linux: cloudflared started (pid: $!), log: /var/log/cloudflared.log"
+        local cf_log="${AUTH_DIR}/cloudflared.log"
+        sudo nohup cloudflared tunnel --config "$cfg" run "$name" >> "$cf_log" 2>&1 &
+        say "Linux: cloudflared started (pid: $!), log: $cf_log"
       fi
     fi
 
@@ -8825,8 +8895,12 @@ EOF
         tmux kill-session -t cloudflared 2>/dev/null || true
         sleep 1
       fi
+      local q_cfg q_name q_log
+      printf -v q_cfg '%q' "$cfg"
+      printf -v q_name '%q' "$name"
+      printf -v q_log '%q' "$cf_log"
       tmux new-session -d -s cloudflared \
-        "cloudflared tunnel run ${name} 2>&1 | tee -a ${cf_log}"
+        "cloudflared tunnel --config ${q_cfg} run ${q_name} 2>&1 | tee -a ${q_log}"
 
       # Wait for tunnel to connect (up to 15s).
       say "Waiting for tunnel to connect..."
