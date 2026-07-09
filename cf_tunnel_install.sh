@@ -577,6 +577,41 @@ server {
         proxy_pass http://127.0.0.1:${auth_port};
     }
 
+    # Desktop API (requires auth)
+    location = /api/desktop {
+        auth_request /api/auth;
+        error_page 401 = @login_redirect;
+        proxy_pass http://127.0.0.1:${auth_port};
+    }
+
+    # noVNC - browser VNC client assets
+    location /noVNC/ {
+        auth_request /api/auth;
+        error_page 401 = @login_redirect;
+
+        proxy_pass http://127.0.0.1:6080/;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
+        proxy_read_timeout 86400s;
+        proxy_send_timeout 86400s;
+    }
+
+    # Per-user noVNC websocket bridge returned by /api/desktop.
+    location ~ ^/vnc-ws/(\d+)/(.*) {
+        auth_request /api/auth;
+        error_page 401 = @login_redirect;
+
+        proxy_pass http://127.0.0.1:\$1/\$2\$is_args\$args;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
+        proxy_read_timeout 86400s;
+        proxy_send_timeout 86400s;
+    }
+
     location @login_redirect {
         return 302 /login;
     }
@@ -3406,11 +3441,37 @@ function addTab(slot, name) {
   saveTabs();
 }
 
+function buildDesktopUrl(wsPort) {
+  return '/noVNC/vnc.html?autoconnect=true&resize=scale&reconnect=true&reconnect_delay=1000&path=vnc-ws/' +
+    encodeURIComponent(String(wsPort)) + '/websockify';
+}
+
+async function loadDesktopIframe(iframe, tab) {
+  try {
+    const resp = await fetch('/api/desktop', { cache: 'no-store' });
+    if (!resp.ok) {
+      const msg = await resp.text().catch(() => '');
+      throw new Error(msg || ('desktop start failed: HTTP ' + resp.status));
+    }
+    const data = await resp.json();
+    if (!data || !data.ok || !data.ws_port) throw new Error('desktop start failed');
+    tab.wsPort = data.ws_port;
+    iframe.src = buildDesktopUrl(data.ws_port);
+    saveTabs();
+    showToast('Desktop ready');
+  } catch (err) {
+    console.error(err);
+    showToast('Desktop failed: ' + (err && err.message ? err.message : err), 'error');
+  }
+}
+
 function addDesktopTab() {
   // If a desktop tab already exists, just switch to it
   const existing = tabs.find(t => t.type === 'desktop');
   if (existing) {
     switchTab(existing.id);
+    const iframe = document.getElementById('frame-' + existing.id);
+    if (iframe) loadDesktopIframe(iframe, existing);
     return;
   }
   tabCounter++;
@@ -3420,12 +3481,12 @@ function addDesktopTab() {
   const iframe = document.createElement('iframe');
   iframe.id = 'frame-' + id;
   iframe.allow = 'clipboard-read; clipboard-write';
-  iframe.src = '/noVNC/vnc.html?autoconnect=true&resize=scale&reconnect=true&reconnect_delay=1000&path=noVNC/websockify';
+  iframe.src = 'about:blank';
   document.getElementById('termContainer').appendChild(iframe);
   switchTab(id);
   renderTabs();
   saveTabs();
-  showToast('Desktop ready');
+  loadDesktopIframe(iframe, tab);
 }
 
 // Explicitly tear down a single tab's tmux window. The server no longer infers
@@ -4894,13 +4955,14 @@ function init() {
         iframe.allow = 'clipboard-read; clipboard-write';
         let url;
         if (t.type === 'desktop') {
-          url = '/noVNC/vnc.html?autoconnect=true&resize=scale&reconnect=true&reconnect_delay=1000&path=noVNC/websockify';
+          url = 'about:blank';
         } else {
           url = buildTermUrl(t, { _activeSlots: activeSlots });
         }
         iframe.src = url;
         if (isActive) iframe.classList.add('active');
         document.getElementById('termContainer').appendChild(iframe);
+        if (t.type === 'desktop') loadDesktopIframe(iframe, t);
       }, isActive ? 0 : i * 300);
     });
     updateSplitButtons();
