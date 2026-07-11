@@ -6043,7 +6043,7 @@ def spawn_user_vnc(username, password):
              "-o", "PasswordAuthentication=yes",
              "-o", "ServerAliveInterval=30",
              f"{username}@127.0.0.1",
-             "bash", "-lc", vnc_cmd],
+             "bash", "-lc", shlex.quote(vnc_cmd)],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
         )
 
