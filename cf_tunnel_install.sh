@@ -36,6 +36,10 @@ Options:
   --web-terminal        Set up full web terminal stack:
                         ttyd + nginx auth proxy + Python auth service + sshpass
                         Overrides --service to http://localhost:<nginx-port>
+  --ssh-tunnel          Also expose local SSH through the same named tunnel.
+                        The hostname is ssh-<name> plus the web hostname's
+                        domain suffix (for example, name minipc2 and hostname
+                        minipc2.example.com produce ssh-minipc2.example.com).
   --nginx-port PORT     Nginx listen port (default: 7680, only with --web-terminal)
   --auth-port PORT      Auth service port (default: 7682, only with --web-terminal)
 
@@ -47,7 +51,11 @@ Examples:
   ./cf_tunnel_install.sh --name myapp --hostname app.example.com --service http://localhost:3000
 
   # Full web terminal
-  ./cf_tunnel_install.sh --name myterminal --hostname term.example.com --web-terminal --install-service
+  ./cf_tunnel_install.sh --name myterminal --hostname term.example.com --web-terminal --install-service --ssh-tunnel --replace-config
+
+  # Full web terminal plus SSH through the same Cloudflare tunnel
+  ./cf_tunnel_install.sh --name myterminal --hostname term.example.com \
+    --web-terminal --ssh-tunnel --install-service
 
 Notes:
   1) You must have your domain managed by Cloudflare.
@@ -141,6 +149,27 @@ validate_hostname() {
   fi
 }
 
+derive_ssh_hostname() {
+  local name="$1" web_hostname="$2"
+
+  if [[ ! "$name" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$ ]]; then
+    err "--name must be a single DNS-safe label when --ssh-tunnel is used: $name"
+    return 1
+  fi
+  if [ "${#name}" -gt 59 ]; then
+    err "--name is too long to prefix with 'ssh-': $name"
+    return 1
+  fi
+  if [[ "$web_hostname" != *.* ]]; then
+    err "--hostname needs a domain suffix to derive the SSH hostname: $web_hostname"
+    return 1
+  fi
+
+  local derived="ssh-${name}.${web_hostname#*.}"
+  validate_hostname "$derived"
+  printf '%s\n' "$derived"
+}
+
 write_or_merge_config() {
   local name="$1" hostname="$2" service="$3" cfg="$4" creds="$5" replace="$6"
 
@@ -169,19 +198,38 @@ EOF
     return 1
   fi
 
-  if awk -v h="$hostname" '$1=="-" && $2=="hostname:" && $3==h {found=1} END{exit found ? 0 : 1}' "$cfg"; then
-    say "Config already contains hostname $hostname; leaving ingress unchanged: $cfg"
+  local existing_service
+  existing_service="$(awk -v h="$hostname" '
+    $1 == "-" && $2 == "hostname:" && $3 == h { found=1; next }
+    found && $1 == "service:" { print $2; exit }
+  ' "$cfg")"
+  if [ -n "$existing_service" ]; then
+    if [ "$existing_service" = "$service" ]; then
+      say "Config already contains ingress $hostname -> $service"
+      return 0
+    fi
+    cp -a "$cfg" "${cfg}.bak.$(date +%Y%m%d_%H%M%S)"
+    awk -v h="$hostname" -v s="$service" '
+      $1 == "-" && $2 == "hostname:" && $3 == h { target=1; print; next }
+      target && $1 == "service:" {
+        print "    service: " s
+        target=0
+        next
+      }
+      { print }
+    ' "$cfg" >"${cfg}.tmp" && mv "${cfg}.tmp" "$cfg"
+    say "Updated config ingress: $hostname -> $service"
     return 0
   fi
 
   # Merge: insert a new ingress rule before the catch-all rule if present.
   cp -a "$cfg" "${cfg}.bak.$(date +%Y%m%d_%H%M%S)"
 
-  if grep -qE '^\s*-\s*service:\s*http_status:404\s*$' "$cfg"; then
+  if grep -qE '^[[:space:]]*-[[:space:]]*service:[[:space:]]*http_status:404[[:space:]]*$' "$cfg"; then
     awk -v h="$hostname" -v s="$service" '
       BEGIN{added=0}
       {line=$0}
-      /^\s*-\s*service:\s*http_status:404\s*$/ && added==0 {
+      /^[[:space:]]*-[[:space:]]*service:[[:space:]]*http_status:404[[:space:]]*$/ && added==0 {
         print "  - hostname: " h
         print "    service: " s
         added=1
@@ -213,11 +261,17 @@ EOF
 }
 
 ensure_dns_route() {
-  local name="$1" hostname="$2"
+  local name="$1" hostname="$2" overwrite="${3:-false}"
   local output rc
+  local -a route_args=(tunnel --config /dev/null route dns)
+
+  if [ "$overwrite" = true ]; then
+    route_args+=(--overwrite-dns)
+  fi
+  route_args+=("$name" "$hostname")
 
   set +e
-  output="$(cloudflared tunnel route dns "$name" "$hostname" 2>&1)"
+  output="$(cloudflared "${route_args[@]}" 2>&1)"
   rc=$?
   set -e
 
@@ -8749,7 +8803,8 @@ main() {
   local cfg="$HOME/.cloudflared/config.yml"
   local creds=""
   local replace_config=false no_dns=false run_fg=false install_service=false yes=false
-  local web_terminal=false nginx_port="7680" auth_port="7682"
+  local web_terminal=false ssh_tunnel=false ssh_hostname=""
+  local nginx_port="7680" auth_port="7682"
 
   while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -8763,6 +8818,7 @@ main() {
       --run-foreground) run_fg=true; shift;;
       --install-service) install_service=true; shift;;
       --web-terminal) web_terminal=true; shift;;
+      --ssh-tunnel) ssh_tunnel=true; shift;;
       --nginx-port) nginx_port="$2"; shift 2;;
       --auth-port) auth_port="$2"; shift 2;;
       --yes) yes=true; shift;;
@@ -8788,6 +8844,11 @@ main() {
   fi
 
   validate_hostname "$hostname"
+
+  if [ "$ssh_tunnel" = true ]; then
+    ssh_hostname="$(derive_ssh_hostname "$name" "$hostname")"
+    say "Derived SSH tunnel hostname: $ssh_hostname"
+  fi
 
   need_cmd curl
   install_cloudflared
@@ -8820,13 +8881,21 @@ main() {
 
   write_or_merge_config "$name" "$hostname" "$service" "$cfg" "$creds" "$replace_config"
 
+  if [ "$ssh_tunnel" = true ]; then
+    write_or_merge_config "$name" "$ssh_hostname" "ssh://localhost:22" "$cfg" "$creds" false
+  fi
+
   if [ "$no_dns" = false ]; then
     local route_tunnel="$name"
     [ -n "${tid:-}" ] && route_tunnel="$tid"
     say "Creating DNS route (CNAME) in Cloudflare: $hostname -> tunnel $name"
     ensure_dns_route "$route_tunnel" "$hostname"
+    if [ "$ssh_tunnel" = true ]; then
+      say "Creating SSH DNS route (CNAME) in Cloudflare: $ssh_hostname -> tunnel $name"
+      ensure_dns_route "$route_tunnel" "$ssh_hostname" true
+    fi
   else
-    say "Skipping DNS route (--no-dns)."
+    say "Skipping DNS routes (--no-dns)."
   fi
 
   # ── Web Terminal Setup ──
@@ -8836,6 +8905,8 @@ main() {
     deploy_auth_service "$auth_port"
     configure_nginx "$hostname" "$nginx_port" "$auth_port"
     start_auth_service "$auth_port"
+  elif [ "$ssh_tunnel" = true ]; then
+    enable_ssh_server
   fi
 
   if [ "$run_fg" = true ]; then
@@ -8926,6 +8997,20 @@ Cloudflare Tunnel Setup Complete
   Credentials:   $creds
 EOF
 
+  if [ "$ssh_tunnel" = true ]; then
+    cat <<EOF
+
+SSH Tunnel Setup
+  SSH hostname:  ${ssh_hostname}
+  SSH origin:    ssh://localhost:22
+  Client alias:  ssh ${hostname}
+  Server-list fields:
+    "hostname": "${hostname}"
+    "web_hostname": "${hostname}"
+    "ssh_hostname": "${ssh_hostname}"
+EOF
+  fi
+
   if [ "$web_terminal" = true ]; then
     local conf_dir
     conf_dir="$(get_nginx_conf_dir)"
@@ -8995,4 +9080,6 @@ EOF
   fi
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

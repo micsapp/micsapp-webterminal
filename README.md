@@ -43,6 +43,14 @@ This will:
 - Set up nginx, the auth service, and ttyd
 - Install everything as a persistent service
 
+To expose SSH through the same named tunnel at installation time, add
+`--ssh-tunnel`:
+
+```bash
+./cf_tunnel_install.sh --name myterminal --hostname term.example.com \
+  --web-terminal --ssh-tunnel --install-service
+```
+
 ### 3. Deploy services
 
 ```bash
@@ -130,10 +138,50 @@ credentials-file: /Users/mli/.cloudflared/<TUNNEL_ID>.json
 ingress:
   - hostname: micsmac-ssh.micstec.com
     service: http://localhost:7680
+  - hostname: ssh-micsmacssh.micstec.com
+    service: ssh://localhost:22
   - service: http_status:404
 ```
 
-**DNS:** A CNAME record `micsmac-ssh.micstec.com` points to `<TUNNEL_ID>.cfargotunnel.com`.
+**DNS:** Both public hostnames point to the same `<TUNNEL_ID>.cfargotunnel.com` target.
+
+### Remote SSH through the web-terminal tunnel
+
+`--ssh-tunnel` derives the SSH hostname from the tunnel name passed with
+`--name`, not from the web hostname's first label:
+
+```text
+--name minipc2 --hostname minipc2.micstec.com
+web: minipc2.micstec.com
+ssh: ssh-minipc2.micstec.com
+```
+
+If SSH was not exposed during initial installation, run
+`./ssh-tunnel-tui.sh server` later. Server mode edits the same default
+`~/.cloudflared/config.yml`, creates or updates the SSH DNS record, and reloads
+the connector.
+
+On the web-terminal server that opens remote tabs, run
+`./ssh-tunnel-tui.sh client`. Client mode creates a friendly alias so the web
+hostname uses the special SSH tunnel hostname:
+
+```sshconfig
+Host minipc2.micstec.com
+    HostName ssh-minipc2.micstec.com
+    User mli
+    ProxyCommand cloudflared access ssh --hostname %h
+```
+
+Server-list entries keep both public names. `ssh_hostname` is optional for
+older or web-only entries:
+
+```json
+{
+  "hostname": "minipc2.micstec.com",
+  "web_hostname": "minipc2.micstec.com",
+  "ssh_hostname": "ssh-minipc2.micstec.com"
+}
+```
 
 **Service:** Runs as a macOS LaunchAgent at `~/Library/LaunchAgents/com.cloudflare.cloudflared.plist`.
 

@@ -5,9 +5,10 @@ set -euo pipefail
 # Two modes: Server (set up tunnel service) / Client (connect & diagnose)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CONFIG_FILE="$SCRIPT_DIR/.cloudflared/config.yml"
-PID_FILE="$SCRIPT_DIR/.cloudflared/tunnel.pid"
-LOG_FILE="$SCRIPT_DIR/.cloudflared/tunnel.log"
+CONFIG_FILE="${CLOUDFLARED_CONFIG:-$HOME/.cloudflared/config.yml}"
+CONFIG_DIR="$(dirname "$CONFIG_FILE")"
+PID_FILE="$CONFIG_DIR/tunnel.pid"
+LOG_FILE="$CONFIG_DIR/tunnel.log"
 
 # ── colours ────────────────────────────────────────────────────────────────────
 R='\033[0;31m'; G='\033[0;32m'; Y='\033[1;33m'; B='\033[0;34m'; C='\033[0;36m'
@@ -39,6 +40,92 @@ detect_os() {
     elif is_wsl; then echo "WSL"
     elif is_linux; then echo "Linux"
     else echo "Unknown"; fi
+}
+
+derive_ssh_hostname() {
+    local tunnel_name="$1" web_hostname="$2"
+    if [[ "$web_hostname" != *.* ]]; then
+        return 1
+    fi
+    printf 'ssh-%s.%s\n' "$tunnel_name" "${web_hostname#*.}"
+}
+
+default_ssh_hostname_for_web() {
+    local web_hostname="$1"
+    if [[ "$web_hostname" != *.* ]]; then
+        return 1
+    fi
+    printf 'ssh-%s\n' "$web_hostname"
+}
+
+configured_tunnel_name() {
+    [ -f "$CONFIG_FILE" ] || return 1
+    awk '$1 == "tunnel:" {print $2; exit}' "$CONFIG_FILE" | tr -d "\"'"
+}
+
+configured_web_hostname() {
+    [ -f "$CONFIG_FILE" ] || return 1
+    awk '
+        $1 == "-" && $2 == "hostname:" { candidate=$3; next }
+        candidate != "" && $1 == "service:" {
+            if ($2 !~ /^ssh:/) {
+                print candidate
+                exit
+            }
+            candidate=""
+        }
+    ' "$CONFIG_FILE"
+}
+
+reload_cloudflared_after_route_change() {
+    local tunnel_name
+    tunnel_name="$(configured_tunnel_name 2>/dev/null || true)"
+    [ -n "$tunnel_name" ] || { warn "Could not determine tunnel name; restart cloudflared manually"; return 0; }
+
+    if is_linux && command -v systemctl >/dev/null 2>&1 \
+        && systemctl list-unit-files cloudflared.service --no-legend 2>/dev/null \
+            | grep -q '^cloudflared.service'; then
+        local system_config="/etc/cloudflared/config.yml"
+        if [ "$CONFIG_FILE" != "$system_config" ]; then
+            sudo mkdir -p /etc/cloudflared
+            if [ -f "$system_config" ]; then
+                sudo cp -a "$system_config" "${system_config}.bak.$(date +%Y%m%d_%H%M%S)"
+            fi
+            sudo cp "$CONFIG_FILE" "$system_config"
+            info "Synced $CONFIG_FILE to $system_config"
+        fi
+        sudo systemctl restart cloudflared
+        info "Restarted cloudflared system service"
+        return 0
+    fi
+
+    if is_mac; then
+        local plist="$HOME/Library/LaunchAgents/com.cloudflare.cloudflared.plist"
+        if [ -f "$plist" ]; then
+            launchctl unload "$plist" 2>/dev/null || true
+            launchctl load "$plist"
+            info "Reloaded cloudflared LaunchAgent"
+            return 0
+        fi
+    fi
+
+    if command -v tmux >/dev/null 2>&1; then
+        local q_cfg q_name q_log
+        mkdir -p "$CONFIG_DIR"
+        if tmux has-session -t cloudflared 2>/dev/null; then
+            tmux kill-session -t cloudflared
+        fi
+        printf -v q_cfg '%q' "$CONFIG_FILE"
+        printf -v q_name '%q' "$tunnel_name"
+        printf -v q_log '%q' "$LOG_FILE"
+        tmux new-session -d -s cloudflared \
+            "cloudflared tunnel --config ${q_cfg} run ${q_name} 2>&1 | tee -a ${q_log}"
+        info "Restarted cloudflared in tmux session 'cloudflared'"
+        return 0
+    fi
+
+    warn "Route was saved, but cloudflared could not be reloaded automatically"
+    warn "Restart the connector using config: $CONFIG_FILE"
 }
 
 # ── check if SSH is listening on port 22 ───────────────────────────────────────
@@ -242,9 +329,17 @@ server_add_ssh_route() {
         return
     fi
 
-    printf "  ${W}SSH hostname${NC} (e.g. cssh.micstec.com): "
+    local tunnel_name web_hostname default_ssh_hostname=""
+    tunnel_name="$(configured_tunnel_name 2>/dev/null || true)"
+    web_hostname="$(configured_web_hostname 2>/dev/null || true)"
+    if [ -n "$tunnel_name" ] && [ -n "$web_hostname" ]; then
+        default_ssh_hostname="$(derive_ssh_hostname "$tunnel_name" "$web_hostname" 2>/dev/null || true)"
+    fi
+
+    printf "  ${W}SSH hostname${NC} [${default_ssh_hostname:-ssh-name.example.com}]: "
     read -r ssh_hostname
-    [ -z "$ssh_hostname" ] && return
+    ssh_hostname="${ssh_hostname:-$default_ssh_hostname}"
+    [ -z "$ssh_hostname" ] && { error "SSH hostname is required"; pause; return; }
 
     printf "  ${W}SSH port${NC} [22]: "
     read -r ssh_port
@@ -255,8 +350,10 @@ server_add_ssh_route() {
     echo ""
 
     if [ -x "$SCRIPT_DIR/add-tunnel-route.sh" ]; then
-        "$SCRIPT_DIR/add-tunnel-route.sh" --hostname "$ssh_hostname" --service "ssh://localhost:${ssh_port}"
+        "$SCRIPT_DIR/add-tunnel-route.sh" --config "$CONFIG_FILE" \
+            --hostname "$ssh_hostname" --service "ssh://localhost:${ssh_port}"
         info "SSH route added successfully"
+        reload_cloudflared_after_route_change
     else
         error "add-tunnel-route.sh not found or not executable"
     fi
@@ -323,7 +420,7 @@ server_list_routes() {
     echo ""
 
     if [ -x "$SCRIPT_DIR/add-tunnel-route.sh" ]; then
-        "$SCRIPT_DIR/add-tunnel-route.sh" --list
+        "$SCRIPT_DIR/add-tunnel-route.sh" --config "$CONFIG_FILE" --list
     elif [ -f "$CONFIG_FILE" ]; then
         grep -E 'hostname:|service:' "$CONFIG_FILE" | sed 's/^/  /'
     else
@@ -433,20 +530,28 @@ https://pkg.cloudflare.com/cloudflared $(. /etc/os-release && echo "$VERSION_COD
     echo ""
     echo -e "  ${BOLD}Step 4/4: SSH Route${NC}"
     hr
-    printf "  ${W}SSH hostname${NC} (e.g. cssh.micstec.com): "
+    local web_hostname default_ssh_hostname=""
+    web_hostname="$(configured_web_hostname 2>/dev/null || true)"
+    if [ -n "${tunnel_name:-}" ] && [ -n "$web_hostname" ]; then
+        default_ssh_hostname="$(derive_ssh_hostname "$tunnel_name" "$web_hostname" 2>/dev/null || true)"
+    fi
+    printf "  ${W}SSH hostname${NC} [${default_ssh_hostname:-ssh-name.example.com}]: "
     read -r ssh_hostname
-    if [ -n "$ssh_hostname" ]; then
-        printf "  ${W}SSH port${NC} [22]: "
-        read -r ssh_port
-        ssh_port="${ssh_port:-22}"
+    ssh_hostname="${ssh_hostname:-$default_ssh_hostname}"
+    [ -n "$ssh_hostname" ] || { error "SSH hostname is required"; pause; return; }
 
-        if grep -q "hostname: ${ssh_hostname}" "$CONFIG_FILE" 2>/dev/null; then
-            info "Route for ${ssh_hostname} already exists"
-        else
-            [ -x "$SCRIPT_DIR/add-tunnel-route.sh" ] && \
-                "$SCRIPT_DIR/add-tunnel-route.sh" --hostname "$ssh_hostname" --service "ssh://localhost:${ssh_port}"
-            info "SSH route added"
-        fi
+    printf "  ${W}SSH port${NC} [22]: "
+    read -r ssh_port
+    ssh_port="${ssh_port:-22}"
+
+    if [ -x "$SCRIPT_DIR/add-tunnel-route.sh" ]; then
+        "$SCRIPT_DIR/add-tunnel-route.sh" --config "$CONFIG_FILE" \
+            --hostname "$ssh_hostname" --service "ssh://localhost:${ssh_port}"
+        info "SSH route configured"
+        reload_cloudflared_after_route_change
+    else
+        error "add-tunnel-route.sh not found or not executable"
+        pause; return
     fi
 
     echo ""
@@ -508,9 +613,16 @@ client_smart_setup() {
     info "Detected OS: ${os_name}"
     echo ""
 
-    printf "  ${W}SSH hostname to connect to${NC} (e.g. cssh.micstec.com): "
+    printf "  ${W}Web-terminal hostname / SSH alias${NC} (e.g. minipc2.micstec.com): "
     read -r target_host
     [ -z "$target_host" ] && return
+
+    local default_ssh_hostname ssh_tunnel_hostname
+    default_ssh_hostname="$(default_ssh_hostname_for_web "$target_host" 2>/dev/null || true)"
+    printf "  ${W}SSH tunnel hostname${NC} [${default_ssh_hostname:-ssh-name.example.com}]: "
+    read -r ssh_tunnel_hostname
+    ssh_tunnel_hostname="${ssh_tunnel_hostname:-$default_ssh_hostname}"
+    [ -z "$ssh_tunnel_hostname" ] && { error "SSH tunnel hostname is required"; return; }
 
     printf "  ${W}SSH username${NC} [$(whoami)]: "
     read -r ssh_user
@@ -577,12 +689,12 @@ https://pkg.cloudflare.com/cloudflared ${codename} main" \
     echo ""
     echo -e "  ${BOLD}Step 2/4: DNS Resolution${NC}"
     hr
-    step "Resolving ${target_host}... "
+    step "Resolving ${ssh_tunnel_hostname}... "
     local dns_ok=false
     if command -v dig &>/dev/null; then
-        if dig +short "$target_host" 2>/dev/null | grep -q '.'; then
+        if dig +short "$ssh_tunnel_hostname" 2>/dev/null | grep -q '.'; then
             printf "${G}OK${NC}\n"
-            local resolved; resolved=$(dig +short "$target_host" 2>/dev/null | head -1)
+            local resolved; resolved=$(dig +short "$ssh_tunnel_hostname" 2>/dev/null | head -1)
             info "Resolves to: ${resolved}"
             dns_ok=true
         else
@@ -591,7 +703,7 @@ https://pkg.cloudflare.com/cloudflared ${codename} main" \
             all_ok=false
         fi
     elif command -v nslookup &>/dev/null; then
-        if nslookup "$target_host" 2>/dev/null | grep -q 'Address'; then
+        if nslookup "$ssh_tunnel_hostname" 2>/dev/null | grep -q 'Address'; then
             printf "${G}OK${NC}\n"
             dns_ok=true
         else
@@ -600,7 +712,7 @@ https://pkg.cloudflare.com/cloudflared ${codename} main" \
             all_ok=false
         fi
     elif command -v host &>/dev/null; then
-        if host "$target_host" &>/dev/null; then
+        if host "$ssh_tunnel_hostname" &>/dev/null; then
             printf "${G}OK${NC}\n"
             dns_ok=true
         else
@@ -620,7 +732,7 @@ https://pkg.cloudflare.com/cloudflared ${codename} main" \
     local config_exists=false
 
     step "Checking ~/.ssh/config for ${target_host}... "
-    if [ -f "$ssh_config" ] && grep -q "Host ${target_host}" "$ssh_config" 2>/dev/null; then
+    if [ -f "$ssh_config" ] && grep -qE "^Host[[:space:]]+${target_host//./\\.}([[:space:]]|$)" "$ssh_config" 2>/dev/null; then
         printf "${G}found${NC}\n"
         config_exists=true
         # Show current entry
@@ -643,7 +755,7 @@ https://pkg.cloudflare.com/cloudflared ${codename} main" \
             entry=$(cat <<EOF
 
 Host ${target_host}
-    HostName ${target_host}
+    HostName ${ssh_tunnel_hostname}
     User ${ssh_user}
     ProxyCommand ${cf_path} access ssh --hostname %h
 EOF
@@ -683,7 +795,8 @@ EOF
             "${target_host}" "echo SSH_CONNECTION_OK" 2>&1) || true
     else
         test_result=$(ssh -o ConnectTimeout=15 -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
-            -o "ProxyCommand=cloudflared access ssh --hostname ${target_host}" \
+            -o "HostName=${ssh_tunnel_hostname}" \
+            -o "ProxyCommand=cloudflared access ssh --hostname %h" \
             "${ssh_user}@${target_host}" "echo SSH_CONNECTION_OK" 2>&1) || true
     fi
 
@@ -710,7 +823,7 @@ EOF
             echo ""
             echo -e "  ${BOLD}Suggestions:${NC}"
             echo "    • Verify the tunnel is running on the server"
-            echo "    • Check DNS resolves: dig ${target_host}"
+            echo "    • Check DNS resolves: dig ${ssh_tunnel_hostname}"
             echo "    • Wait a few minutes if DNS was just created"
         elif echo "$test_result" | grep -qi "Could not resolve\|Name .* not known"; then
             error "DNS resolution failed for ${target_host}"
@@ -737,7 +850,7 @@ EOF
         if $config_exists; then
             echo -e "    ${C}ssh ${target_host}${NC}"
         else
-            echo -e "    ${C}ssh -o ProxyCommand=\"cloudflared access ssh --hostname ${target_host}\" ${ssh_user}@${target_host}${NC}"
+            echo -e "    ${C}ssh -o HostName=${ssh_tunnel_hostname} -o ProxyCommand=\"cloudflared access ssh --hostname %h\" ${ssh_user}@${target_host}${NC}"
         fi
     else
         printf "  ${Y}${BOLD}⚠ Some checks failed — review above for details${NC}\n"
@@ -850,16 +963,23 @@ client_add_ssh_config() {
         pause; return
     fi
 
-    printf "  ${W}SSH hostname${NC} (e.g. cssh.micstec.com): "
+    printf "  ${W}Web-terminal hostname / SSH alias${NC} (e.g. minipc2.micstec.com): "
     read -r target_host
     [ -z "$target_host" ] && return
+
+    local default_ssh_hostname ssh_tunnel_hostname
+    default_ssh_hostname="$(default_ssh_hostname_for_web "$target_host" 2>/dev/null || true)"
+    printf "  ${W}SSH tunnel hostname${NC} [${default_ssh_hostname:-ssh-name.example.com}]: "
+    read -r ssh_tunnel_hostname
+    ssh_tunnel_hostname="${ssh_tunnel_hostname:-$default_ssh_hostname}"
+    [ -z "$ssh_tunnel_hostname" ] && { error "SSH tunnel hostname is required"; pause; return; }
 
     printf "  ${W}SSH username${NC} [$(whoami)]: "
     read -r ssh_user
     ssh_user="${ssh_user:-$(whoami)}"
 
     local ssh_config="$HOME/.ssh/config"
-    if [ -f "$ssh_config" ] && grep -q "Host ${target_host}" "$ssh_config" 2>/dev/null; then
+    if [ -f "$ssh_config" ] && grep -qE "^Host[[:space:]]+${target_host//./\\.}([[:space:]]|$)" "$ssh_config" 2>/dev/null; then
         warn "Entry for ${target_host} already exists in SSH config"
         printf "  ${W}Overwrite? [y/N]:${NC} "
         read -rn1 yn; echo
@@ -884,7 +1004,7 @@ client_add_ssh_config() {
     cat >> "$ssh_config" <<EOF
 
 Host ${target_host}
-    HostName ${target_host}
+    HostName ${ssh_tunnel_hostname}
     User ${ssh_user}
     ProxyCommand ${cf_path} access ssh --hostname %h
 EOF
@@ -1020,7 +1140,8 @@ main_menu() {
 }
 
 # ── CLI passthrough ────────────────────────────────────────────────────────────
-case "${1:-}" in
+run_tui() {
+  case "${1:-}" in
     -h|--help|help)
         cat <<'EOF'
 Usage: ssh-tunnel-tui.sh [server|client]
@@ -1052,4 +1173,9 @@ EOF
         client_menu ;;
     *)
         main_menu ;;
-esac
+  esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    run_tui "$@"
+fi
