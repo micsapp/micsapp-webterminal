@@ -53,6 +53,16 @@ EOF
 assert_contains "$TEST_CONFIG" '  - hostname: ssh-demo.example.com'
 assert_contains "$TEST_CONFIG" '    service: ssh://localhost:22'
 
+(
+  CLOUDFLARED_CONFIG="$TEST_CONFIG"
+  source "$TEST_ROOT_DIR/ssh-tunnel-tui.sh"
+  [ "$(configured_ssh_hostname)" = "ssh-demo.example.com" ] \
+    || fail "TUI did not read the SSH hostname from the shared config"
+  [ "$(normalize_server_repo_url https://files.example.com/s/servers)" = \
+      "https://files.example.com/s/servers/serverlist.json" ] \
+    || fail "TUI did not normalize a Droppy folder share URL"
+)
+
 "$TEST_ROOT_DIR/add-tunnel-route.sh" --config "$TEST_CONFIG" \
   --hostname ssh-demo.example.com --no-dns
 [ "$(grep -c 'hostname: ssh-demo.example.com' "$TEST_CONFIG")" -eq 1 ] \
@@ -67,6 +77,101 @@ assert_contains "$TEST_CONFIG" '    service: ssh://localhost:2222'
 route_line="$(grep -n 'hostname: ssh-demo.example.com' "$TEST_CONFIG" | cut -d: -f1)"
 catchall_line="$(grep -n 'service: http_status:404' "$TEST_CONFIG" | cut -d: -f1)"
 [ "$route_line" -lt "$catchall_line" ] || fail "SSH route was not inserted before catch-all"
+
+# Exercise protected-repository data validation and idempotent registration.
+TEST_REPO="$TEST_TMP_DIR/serverlist.json"
+TEST_REPO_UPDATED="$TEST_TMP_DIR/serverlist-updated.json"
+TEST_REPO_SECOND="$TEST_TMP_DIR/serverlist-second.json"
+TEST_REPO_META="$TEST_TMP_DIR/serverlist-meta"
+cat > "$TEST_REPO" <<'EOF'
+{
+  "kind": "micsapp-webterminal-server-list",
+  "schema_version": 2,
+  "revision": 4,
+  "servers": [
+    {
+      "id": "demo",
+      "name": "Demo Server",
+      "hostname": "demo.example.com",
+      "web_hostname": "demo.example.com",
+      "enabled": true
+    }
+  ]
+}
+EOF
+
+python3 "$TEST_ROOT_DIR/server-repo.py" merge "$TEST_REPO" "$TEST_REPO_UPDATED" \
+  --web-hostname demo.example.com --ssh-hostname ssh-demo.example.com \
+  --name demo > "$TEST_REPO_META"
+[ "$(sed -n '1p' "$TEST_REPO_META")" = "updated" ] \
+  || fail "repository helper did not report an updated entry"
+[ "$(sed -n '2p' "$TEST_REPO_META")" = "5" ] \
+  || fail "repository helper did not increment the revision"
+assert_contains "$TEST_REPO_UPDATED" '"id": "demo"'
+assert_contains "$TEST_REPO_UPDATED" '"ssh_hostname": "ssh-demo.example.com"'
+
+python3 "$TEST_ROOT_DIR/server-repo.py" merge "$TEST_REPO_UPDATED" "$TEST_REPO_SECOND" \
+  --web-hostname demo.example.com --ssh-hostname ssh-demo.example.com \
+  --name demo > "$TEST_REPO_META"
+[ "$(sed -n '1p' "$TEST_REPO_META")" = "unchanged" ] \
+  || fail "repository helper was not idempotent"
+[ "$(sed -n '2p' "$TEST_REPO_META")" = "5" ] \
+  || fail "idempotent registration changed the revision"
+python3 "$TEST_ROOT_DIR/server-repo.py" show "$TEST_REPO_SECOND" \
+  --current demo.example.com > "$TEST_TMP_DIR/serverlist-display"
+assert_contains "$TEST_TMP_DIR/serverlist-display" '* demo.example.com'
+
+# Exercise the TUI's authenticated GET, ETag-safe PUT, and hostname discovery.
+TEST_REPO_UPLOAD="$TEST_TMP_DIR/serverlist-upload.json"
+(
+  CLOUDFLARED_CONFIG="$TEST_CONFIG"
+  WEBTERMINAL_SERVER_REPO_URL="https://files.example.com/s/servers/serverlist.json"
+  WEBTERMINAL_SERVER_REPO_PASSCODE="test-passcode"
+  source "$TEST_ROOT_DIR/ssh-tunnel-tui.sh"
+
+  header() { :; }
+  pause() { :; }
+  curl() {
+    local method="GET" output_file="" headers_file="" data_file="" auth_file=""
+    local if_match="" previous="" argument
+    for argument in "$@"; do
+      case "$previous" in
+        -D) headers_file="$argument" ;;
+        -o) output_file="$argument" ;;
+        -X) method="$argument" ;;
+        -H)
+          case "$argument" in
+            @*) auth_file="${argument#@}" ;;
+            If-Match:*) if_match="$argument" ;;
+          esac
+          ;;
+        --data-binary) data_file="${argument#@}" ;;
+      esac
+      previous="$argument"
+    done
+
+    [ -f "$auth_file" ] || fail "repository request did not use an auth header file"
+    assert_contains "$auth_file" 'X-Droppy-Share-Passcode: test-passcode'
+    [ "$(stat -c '%a' "$auth_file")" = "600" ] \
+      || fail "repository auth header file was not mode 600"
+
+    if [ "$method" = "GET" ]; then
+      cp "$TEST_REPO" "$output_file"
+      printf 'HTTP/2 200\r\nETag: "test-etag"\r\n\r\n' > "$headers_file"
+    else
+      [ "$if_match" = 'If-Match: "test-etag"' ] \
+        || fail "repository upload did not use the downloaded ETag"
+      cp "$data_file" "$TEST_REPO_UPLOAD"
+      : > "$output_file"
+    fi
+    printf '200'
+  }
+
+  server_register_repository
+)
+assert_contains "$TEST_REPO_UPLOAD" '"web_hostname": "demo.example.com"'
+assert_contains "$TEST_REPO_UPLOAD" '"ssh_hostname": "ssh-demo.example.com"'
+assert_contains "$TEST_REPO_UPLOAD" '"revision": 5'
 
 # Verify DNS invocation ignores the caller's default config and overwrites only
 # the explicitly requested SSH hostname.

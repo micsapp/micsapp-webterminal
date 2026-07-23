@@ -9,6 +9,10 @@ CONFIG_FILE="${CLOUDFLARED_CONFIG:-$HOME/.cloudflared/config.yml}"
 CONFIG_DIR="$(dirname "$CONFIG_FILE")"
 PID_FILE="$CONFIG_DIR/tunnel.pid"
 LOG_FILE="$CONFIG_DIR/tunnel.log"
+SERVER_REPO_CONFIG="${WEBTERMINAL_SERVER_REPO_CONFIG:-$HOME/.config/micsapp-webterminal/server-repo.conf}"
+SERVER_REPO_URL="${WEBTERMINAL_SERVER_REPO_URL:-}"
+SERVER_REPO_PASSCODE="${WEBTERMINAL_SERVER_REPO_PASSCODE:-}"
+SERVER_REPO_HELPER="$SCRIPT_DIR/server-repo.py"
 
 # ── colours ────────────────────────────────────────────────────────────────────
 R='\033[0;31m'; G='\033[0;32m'; Y='\033[1;33m'; B='\033[0;34m'; C='\033[0;36m'
@@ -75,6 +79,112 @@ configured_web_hostname() {
             candidate=""
         }
     ' "$CONFIG_FILE"
+}
+
+configured_ssh_hostname() {
+    [ -f "$CONFIG_FILE" ] || return 1
+    awk '
+        $1 == "-" && $2 == "hostname:" { candidate=$3; next }
+        candidate != "" && $1 == "service:" {
+            if ($2 ~ /^ssh:/) {
+                print candidate
+                exit
+            }
+            candidate=""
+        }
+    ' "$CONFIG_FILE"
+}
+
+normalize_server_repo_url() {
+    local repo_url="${1%/}"
+    case "$repo_url" in
+        http://*|https://*) ;;
+        *) return 1 ;;
+    esac
+    if [[ "$repo_url" != *.json ]]; then
+        repo_url="${repo_url}/serverlist.json"
+    fi
+    printf '%s\n' "$repo_url"
+}
+
+load_server_repo_settings() {
+    if [ -f "$SERVER_REPO_CONFIG" ]; then
+        local saved_url="" saved_passcode=""
+        IFS= read -r saved_url < "$SERVER_REPO_CONFIG" || true
+        saved_passcode="$(sed -n '2p' "$SERVER_REPO_CONFIG")"
+        SERVER_REPO_URL="${SERVER_REPO_URL:-$saved_url}"
+        SERVER_REPO_PASSCODE="${SERVER_REPO_PASSCODE:-$saved_passcode}"
+    fi
+
+    if [ -n "$SERVER_REPO_URL" ]; then
+        SERVER_REPO_URL="$(normalize_server_repo_url "$SERVER_REPO_URL" 2>/dev/null || true)"
+    fi
+}
+
+save_server_repo_settings() {
+    local settings_dir settings_tmp
+    settings_dir="$(dirname "$SERVER_REPO_CONFIG")"
+    mkdir -p "$settings_dir"
+    chmod 700 "$settings_dir"
+    settings_tmp="$(mktemp "$settings_dir/.server-repo.XXXXXX")"
+    chmod 600 "$settings_tmp"
+    printf '%s\n%s\n' "$SERVER_REPO_URL" "$SERVER_REPO_PASSCODE" > "$settings_tmp"
+    mv "$settings_tmp" "$SERVER_REPO_CONFIG"
+    info "Saved repository credentials to $SERVER_REPO_CONFIG (mode 600)"
+}
+
+configure_server_repo() {
+    load_server_repo_settings
+
+    local entered_url entered_passcode save_choice
+    printf "  ${W}Droppy share/repository URL${NC}"
+    [ -n "$SERVER_REPO_URL" ] && printf " [%s]" "$SERVER_REPO_URL"
+    printf ": "
+    read -r entered_url
+    entered_url="${entered_url:-$SERVER_REPO_URL}"
+    if ! SERVER_REPO_URL="$(normalize_server_repo_url "$entered_url")"; then
+        error "Repository URL must start with http:// or https://"
+        return 1
+    fi
+
+    if [ -n "$SERVER_REPO_PASSCODE" ]; then
+        printf "  ${W}Droppy share passcode${NC} [Enter keeps saved value]: "
+    else
+        printf "  ${W}Droppy share passcode${NC}: "
+    fi
+    read -rs entered_passcode
+    echo
+    SERVER_REPO_PASSCODE="${entered_passcode:-$SERVER_REPO_PASSCODE}"
+    if [ -z "$SERVER_REPO_PASSCODE" ]; then
+        error "Repository passcode is required"
+        return 1
+    fi
+
+    printf "  ${W}Save for this user? [Y/n]:${NC} "
+    read -rn1 save_choice; echo
+    if [[ "${save_choice:-y}" != "n" && "${save_choice:-y}" != "N" ]]; then
+        save_server_repo_settings
+    fi
+}
+
+ensure_server_repo_settings() {
+    load_server_repo_settings
+    if [ -z "$SERVER_REPO_URL" ] || [ -z "$SERVER_REPO_PASSCODE" ]; then
+        warn "Server repository is not configured yet"
+        configure_server_repo
+    fi
+}
+
+server_repo_get() {
+    local body_file="$1" headers_file="$2" auth_header_file
+    auth_header_file="${body_file}.auth-header"
+    (umask 077
+        printf 'X-Droppy-Share-Passcode: %s\n' "$SERVER_REPO_PASSCODE" > "$auth_header_file"
+    )
+    curl -sS --connect-timeout 10 --max-time 30 \
+        -D "$headers_file" -o "$body_file" -w '%{http_code}' \
+        -H "@$auth_header_file" \
+        "$SERVER_REPO_URL"
 }
 
 reload_cloudflared_after_route_change() {
@@ -429,6 +539,193 @@ server_list_routes() {
     pause
 }
 
+# ── list Cloudflare tunnels ──────────────────────────────────────────────────
+server_list_tunnels() {
+    header "Server: Cloudflare Tunnels"
+    echo ""
+
+    if ! command -v cloudflared >/dev/null 2>&1; then
+        error "cloudflared is not installed"
+        pause
+        return
+    fi
+
+    local current_tunnel
+    current_tunnel="$(configured_tunnel_name 2>/dev/null || true)"
+    [ -n "$current_tunnel" ] && info "Configured tunnel: $current_tunnel"
+    echo ""
+    if ! cloudflared tunnel list; then
+        error "Could not list tunnels; run 'cloudflared tunnel login' first"
+    fi
+    pause
+}
+
+# ── shared Droppy server repository ──────────────────────────────────────────
+server_show_repository() (
+    header "Server: Shared Repository"
+    echo ""
+
+    if ! command -v curl >/dev/null 2>&1 || ! command -v python3 >/dev/null 2>&1; then
+        error "This action requires curl and python3"
+        pause
+        return
+    fi
+    if [ ! -f "$SERVER_REPO_HELPER" ]; then
+        error "Missing repository helper: $SERVER_REPO_HELPER"
+        pause
+        return
+    fi
+    if ! ensure_server_repo_settings; then
+        pause
+        return
+    fi
+
+    local temp_dir body_file headers_file http_code current_web
+    temp_dir="$(mktemp -d)"
+    trap 'rm -rf "$temp_dir"' EXIT
+    body_file="$temp_dir/serverlist.json"
+    headers_file="$temp_dir/headers"
+
+    step "Downloading $SERVER_REPO_URL... "
+    if ! http_code="$(server_repo_get "$body_file" "$headers_file")"; then
+        printf "\n"
+        error "Could not reach the server repository"
+        pause
+        return
+    fi
+    if [ "$http_code" != "200" ]; then
+        printf "${R}HTTP %s${NC}\n" "$http_code"
+        error "Repository download failed; check the URL and passcode"
+        pause
+        return
+    fi
+    printf "${G}done${NC}\n\n"
+
+    current_web="$(configured_web_hostname 2>/dev/null || true)"
+    if ! python3 "$SERVER_REPO_HELPER" show "$body_file" --current "$current_web"; then
+        error "The downloaded file is not a valid web-terminal server repository"
+    fi
+    pause
+)
+
+server_register_repository() (
+    header "Server: Register in Repository"
+    echo ""
+
+    if ! command -v curl >/dev/null 2>&1 || ! command -v python3 >/dev/null 2>&1; then
+        error "This action requires curl and python3"
+        pause
+        return
+    fi
+    if [ ! -f "$SERVER_REPO_HELPER" ]; then
+        error "Missing repository helper: $SERVER_REPO_HELPER"
+        pause
+        return
+    fi
+    if ! ensure_server_repo_settings; then
+        pause
+        return
+    fi
+
+    local web_hostname ssh_hostname tunnel_name temp_dir body_file headers_file
+    local updated_file merge_meta http_code etag status revision put_code attempt
+    web_hostname="$(configured_web_hostname 2>/dev/null || true)"
+    ssh_hostname="$(configured_ssh_hostname 2>/dev/null || true)"
+    tunnel_name="$(configured_tunnel_name 2>/dev/null || true)"
+    if [ -z "$web_hostname" ]; then
+        error "No web hostname found in $CONFIG_FILE"
+        pause
+        return
+    fi
+
+    info "Web hostname: $web_hostname"
+    if [ -n "$ssh_hostname" ]; then
+        info "SSH hostname: $ssh_hostname"
+    else
+        warn "No SSH route found; registering this as a web-only server"
+    fi
+
+    temp_dir="$(mktemp -d)"
+    trap 'rm -rf "$temp_dir"' EXIT
+    body_file="$temp_dir/serverlist.json"
+    headers_file="$temp_dir/headers"
+    updated_file="$temp_dir/serverlist.updated.json"
+    merge_meta="$temp_dir/merge-meta"
+
+    for attempt in 1 2; do
+        step "Downloading current repository... "
+        if ! http_code="$(server_repo_get "$body_file" "$headers_file")"; then
+            printf "\n"
+            error "Could not reach the server repository"
+            pause
+            return
+        fi
+        if [ "$http_code" != "200" ]; then
+            printf "${R}HTTP %s${NC}\n" "$http_code"
+            error "Repository download failed; check the URL and passcode"
+            pause
+            return
+        fi
+        printf "${G}done${NC}\n"
+
+        etag="$(awk 'tolower($1) == "etag:" {gsub("\r", "", $2); print $2; exit}' "$headers_file")"
+        if [ -z "$etag" ]; then
+            error "Repository response did not include an ETag; refusing an unsafe overwrite"
+            pause
+            return
+        fi
+
+        if ! python3 "$SERVER_REPO_HELPER" merge "$body_file" "$updated_file" \
+            --web-hostname "$web_hostname" --ssh-hostname "$ssh_hostname" \
+            --name "$tunnel_name" > "$merge_meta"; then
+            error "Could not update the downloaded server repository"
+            pause
+            return
+        fi
+        status="$(sed -n '1p' "$merge_meta")"
+        revision="$(sed -n '2p' "$merge_meta")"
+        if [ "$status" = "unchanged" ]; then
+            info "Repository already has the current server information (revision $revision)"
+            pause
+            return
+        fi
+
+        step "Uploading ${status} server entry... "
+        if ! put_code="$(curl -sS --connect-timeout 10 --max-time 30 \
+            -o "$temp_dir/put-response" -w '%{http_code}' -X PUT \
+            -H "@${body_file}.auth-header" \
+            -H "If-Match: $etag" -H "Content-Type: application/json" \
+            --data-binary "@$updated_file" "$SERVER_REPO_URL")"; then
+            printf "\n"
+            error "Repository upload failed"
+            pause
+            return
+        fi
+        case "$put_code" in
+            200|201|204)
+                printf "${G}done${NC}\n"
+                info "Registered $web_hostname at repository revision $revision"
+                pause
+                return
+                ;;
+            412)
+                printf "${Y}changed remotely${NC}\n"
+                if [ "$attempt" -eq 1 ]; then
+                    warn "Refreshing and retrying once"
+                    continue
+                fi
+                error "Repository changed twice; retry the registration action"
+                ;;
+            *)
+                printf "${R}HTTP %s${NC}\n" "$put_code"
+                error "Repository rejected the upload"
+                ;;
+        esac
+        pause
+        return
+    done
+)
+
 # ── full server setup wizard ──────────────────────────────────────────────────
 server_full_setup() {
     header "Server: Full SSH Setup"
@@ -579,11 +876,15 @@ server_menu() {
         menu_item 7 "Start tunnel"
         menu_item 8 "Stop tunnel"
         menu_item 9 "View tunnel logs"
+        menu_item 10 "List Cloudflare tunnels"
+        hr
+        menu_item 11 "Display shared server repository"
+        menu_item 12 "Register/update this server in repository"
         hr
         menu_item b "Back to main menu"
         menu_item q "Quit"
         printf "\n  ${W}Choose: ${NC}"
-        read -rn1 choice; echo
+        read -r choice
         case "${choice}" in
             1) server_full_setup ;;
             2) server_check_ssh ;;
@@ -594,6 +895,9 @@ server_menu() {
             7) server_start_tunnel ;;
             8) server_stop_tunnel ;;
             9) server_view_logs ;;
+            10) server_list_tunnels ;;
+            11) server_show_repository ;;
+            12) server_register_repository ;;
             b|B) return ;;
             q|Q) echo ""; info "Bye!"; exit 0 ;;
         esac
