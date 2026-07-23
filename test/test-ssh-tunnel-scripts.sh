@@ -39,6 +39,7 @@ EOF
 
 (
   CLOUDFLARED_CONFIG="$TEST_CONFIG"
+  WEBTERMINAL_SERVER_REPO_CONFIG="$TEST_TMP_DIR/no-server-repo.conf"
   source "$TEST_ROOT_DIR/ssh-tunnel-tui.sh"
   [ "$(configured_tunnel_name)" = "demo" ] \
     || fail "TUI did not read tunnel name from the shared config"
@@ -46,6 +47,11 @@ EOF
     || fail "TUI did not read the web hostname from the shared config"
   [ "$(derive_ssh_hostname demo demo.example.com)" = "ssh-demo.example.com" ] \
     || fail "TUI derived the wrong SSH hostname"
+  load_server_repo_settings
+  [ "$SERVER_REPO_URL" = "$DEFAULT_SERVER_REPO_URL" ] \
+    || fail "TUI did not load the TNAS repository default"
+  [ "$DEFAULT_SERVER_REPO_URL" = "https://tnas_d.micsapp.com/s/web-terminal-servers/serverlist.json" ] \
+    || fail "TUI does not default to the TNAS server repository"
 )
 
 "$TEST_ROOT_DIR/add-tunnel-route.sh" --config "$TEST_CONFIG" \
@@ -102,21 +108,36 @@ EOF
 
 python3 "$TEST_ROOT_DIR/server-repo.py" merge "$TEST_REPO" "$TEST_REPO_UPDATED" \
   --web-hostname demo.example.com --ssh-hostname ssh-demo.example.com \
-  --name demo > "$TEST_REPO_META"
+  --ssh-mode tunnel --name demo > "$TEST_REPO_META"
 [ "$(sed -n '1p' "$TEST_REPO_META")" = "updated" ] \
   || fail "repository helper did not report an updated entry"
 [ "$(sed -n '2p' "$TEST_REPO_META")" = "5" ] \
   || fail "repository helper did not increment the revision"
 assert_contains "$TEST_REPO_UPDATED" '"id": "demo"'
 assert_contains "$TEST_REPO_UPDATED" '"ssh_hostname": "ssh-demo.example.com"'
+assert_contains "$TEST_REPO_UPDATED" '"ssh_mode": "tunnel"'
 
 python3 "$TEST_ROOT_DIR/server-repo.py" merge "$TEST_REPO_UPDATED" "$TEST_REPO_SECOND" \
   --web-hostname demo.example.com --ssh-hostname ssh-demo.example.com \
-  --name demo > "$TEST_REPO_META"
+  --ssh-mode tunnel --name demo > "$TEST_REPO_META"
 [ "$(sed -n '1p' "$TEST_REPO_META")" = "unchanged" ] \
   || fail "repository helper was not idempotent"
 [ "$(sed -n '2p' "$TEST_REPO_META")" = "5" ] \
   || fail "idempotent registration changed the revision"
+
+TEST_REPO_NONE="$TEST_TMP_DIR/serverlist-none.json"
+python3 "$TEST_ROOT_DIR/server-repo.py" merge "$TEST_REPO_SECOND" "$TEST_REPO_NONE" \
+  --web-hostname demo.example.com --ssh-mode none --name demo > "$TEST_REPO_META"
+assert_contains "$TEST_REPO_NONE" '"ssh_mode": "none"'
+if grep -Fq '"ssh_hostname"' "$TEST_REPO_NONE"; then
+  fail "web-only registration retained a stale SSH hostname"
+fi
+
+if python3 "$TEST_ROOT_DIR/server-repo.py" merge "$TEST_REPO_SECOND" \
+  "$TEST_TMP_DIR/serverlist-invalid.json" --web-hostname demo.example.com \
+  --ssh-mode direct >/dev/null 2>&1; then
+  fail "direct SSH registration accepted an empty server name/DNS"
+fi
 python3 "$TEST_ROOT_DIR/server-repo.py" show "$TEST_REPO_SECOND" \
   --current demo.example.com > "$TEST_TMP_DIR/serverlist-display"
 assert_contains "$TEST_TMP_DIR/serverlist-display" '* demo.example.com'
@@ -167,10 +188,11 @@ TEST_REPO_UPLOAD="$TEST_TMP_DIR/serverlist-upload.json"
     printf '200'
   }
 
-  server_register_repository
+  server_register_repository <<< $'2\ndirect-ssh.demo.example.com\n'
 )
 assert_contains "$TEST_REPO_UPLOAD" '"web_hostname": "demo.example.com"'
-assert_contains "$TEST_REPO_UPLOAD" '"ssh_hostname": "ssh-demo.example.com"'
+assert_contains "$TEST_REPO_UPLOAD" '"ssh_hostname": "direct-ssh.demo.example.com"'
+assert_contains "$TEST_REPO_UPLOAD" '"ssh_mode": "direct"'
 assert_contains "$TEST_REPO_UPLOAD" '"revision": 5'
 
 # Verify DNS invocation ignores the caller's default config and overwrites only

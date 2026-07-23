@@ -172,14 +172,25 @@ Host minipc2.micstec.com
     ProxyCommand cloudflared access ssh --hostname %h
 ```
 
-Server-list entries keep both public names. `ssh_hostname` is optional for
-older or web-only entries:
+Server-list entries keep both public names. `ssh_mode` tells clients whether
+to use the Cloudflare proxy or regular direct SSH:
 
 ```json
 {
   "hostname": "minipc2.micstec.com",
   "web_hostname": "minipc2.micstec.com",
-  "ssh_hostname": "ssh-minipc2.micstec.com"
+  "ssh_hostname": "ssh-minipc2.micstec.com",
+  "ssh_mode": "tunnel"
+}
+```
+
+A directly exposed SSH server uses its reachable server name or DNS:
+
+```json
+{
+  "web_hostname": "terminal.example.com",
+  "ssh_hostname": "ssh-server.example.com",
+  "ssh_mode": "direct"
 }
 ```
 
@@ -191,16 +202,20 @@ Server mode can read and update a passcode-protected Droppy share directly;
 - **List Cloudflare tunnels** to run the authenticated tunnel inventory.
 - **Display shared server repository** to download and display all registered
   web/SSH hostnames, with the current server marked by `*`.
-- **Register/update this server in repository** to read the current web and SSH
-  hostnames from `~/.cloudflared/config.yml` and upload the entry.
+- **Register/update this server in repository** to choose tunnel SSH, direct
+  SSH, or web-only access and upload the entry. Tunnel mode detects its hostname
+  from `~/.cloudflared/config.yml`; direct mode requires the reachable SSH
+  server name or DNS.
 
-On first use, enter the Droppy folder-share URL (or the full
-`serverlist.json` URL) and its passcode. The TUI can save them for the current
-user at `~/.config/micsapp-webterminal/server-repo.conf` with mode `600`. You
-can instead provide both values through the environment:
+The repository URL defaults to
+`https://tnas_d.micsapp.com/s/web-terminal-servers/serverlist.json`. On first
+use, accept that URL or enter another Droppy folder/full JSON URL, then enter its
+passcode. The TUI can save both for the current user at
+`~/.config/micsapp-webterminal/server-repo.conf` with mode `600`. You can
+instead provide both values through the environment:
 
 ```bash
-export WEBTERMINAL_SERVER_REPO_URL='https://droppy.example.com/s/web-terminal-servers'
+export WEBTERMINAL_SERVER_REPO_URL='https://tnas_d.micsapp.com/s/web-terminal-servers'
 export WEBTERMINAL_SERVER_REPO_PASSCODE='your-share-passcode'
 ./ssh-tunnel-tui.sh server
 ```

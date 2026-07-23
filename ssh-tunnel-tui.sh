@@ -10,6 +10,7 @@ CONFIG_DIR="$(dirname "$CONFIG_FILE")"
 PID_FILE="$CONFIG_DIR/tunnel.pid"
 LOG_FILE="$CONFIG_DIR/tunnel.log"
 SERVER_REPO_CONFIG="${WEBTERMINAL_SERVER_REPO_CONFIG:-$HOME/.config/micsapp-webterminal/server-repo.conf}"
+DEFAULT_SERVER_REPO_URL="https://tnas_d.micsapp.com/s/web-terminal-servers/serverlist.json"
 SERVER_REPO_URL="${WEBTERMINAL_SERVER_REPO_URL:-}"
 SERVER_REPO_PASSCODE="${WEBTERMINAL_SERVER_REPO_PASSCODE:-}"
 SERVER_REPO_HELPER="$SCRIPT_DIR/server-repo.py"
@@ -115,6 +116,8 @@ load_server_repo_settings() {
         SERVER_REPO_URL="${SERVER_REPO_URL:-$saved_url}"
         SERVER_REPO_PASSCODE="${SERVER_REPO_PASSCODE:-$saved_passcode}"
     fi
+
+    SERVER_REPO_URL="${SERVER_REPO_URL:-$DEFAULT_SERVER_REPO_URL}"
 
     if [ -n "$SERVER_REPO_URL" ]; then
         SERVER_REPO_URL="$(normalize_server_repo_url "$SERVER_REPO_URL" 2>/dev/null || true)"
@@ -627,10 +630,11 @@ server_register_repository() (
         return
     fi
 
-    local web_hostname ssh_hostname tunnel_name temp_dir body_file headers_file
+    local web_hostname ssh_hostname configured_ssh tunnel_name ssh_mode ssh_choice
+    local default_ssh_choice temp_dir body_file headers_file
     local updated_file merge_meta http_code etag status revision put_code attempt
     web_hostname="$(configured_web_hostname 2>/dev/null || true)"
-    ssh_hostname="$(configured_ssh_hostname 2>/dev/null || true)"
+    configured_ssh="$(configured_ssh_hostname 2>/dev/null || true)"
     tunnel_name="$(configured_tunnel_name 2>/dev/null || true)"
     if [ -z "$web_hostname" ]; then
         error "No web hostname found in $CONFIG_FILE"
@@ -639,11 +643,56 @@ server_register_repository() (
     fi
 
     info "Web hostname: $web_hostname"
-    if [ -n "$ssh_hostname" ]; then
-        info "SSH hostname: $ssh_hostname"
-    else
-        warn "No SSH route found; registering this as a web-only server"
-    fi
+    echo ""
+    echo -e "  ${BOLD}How should clients connect with SSH?${NC}"
+    menu_item 1 "Cloudflare tunnel SSH"
+    [ -n "$configured_ssh" ] && printf "     ${DIM}Detected: %s${NC}\n" "$configured_ssh"
+    menu_item 2 "Direct/public SSH"
+    printf "     ${DIM}Requires the directly reachable SSH server name or DNS${NC}\n"
+    menu_item 3 "No SSH (web terminal only)"
+    default_ssh_choice=2
+    [ -n "$configured_ssh" ] && default_ssh_choice=1
+    printf "\n  ${W}Choose${NC} [%s]: " "$default_ssh_choice"
+    read -r ssh_choice
+    ssh_choice="${ssh_choice:-$default_ssh_choice}"
+
+    case "$ssh_choice" in
+        1)
+            ssh_mode="tunnel"
+            printf "  ${W}SSH tunnel hostname / DNS${NC}"
+            [ -n "$configured_ssh" ] && printf " [%s]" "$configured_ssh"
+            printf ": "
+            read -r ssh_hostname
+            ssh_hostname="${ssh_hostname:-$configured_ssh}"
+            if [ -z "$ssh_hostname" ]; then
+                error "SSH tunnel hostname is required"
+                pause
+                return
+            fi
+            ;;
+        2)
+            ssh_mode="direct"
+            printf "  ${W}Direct SSH server name / DNS${NC}: "
+            read -r ssh_hostname
+            if [ -z "$ssh_hostname" ]; then
+                error "Direct SSH server name / DNS is required"
+                pause
+                return
+            fi
+            ;;
+        3)
+            ssh_mode="none"
+            ssh_hostname=""
+            ;;
+        *)
+            error "Choose 1, 2, or 3"
+            pause
+            return
+            ;;
+    esac
+
+    info "SSH mode: $ssh_mode"
+    [ -n "$ssh_hostname" ] && info "SSH hostname: $ssh_hostname"
 
     temp_dir="$(mktemp -d)"
     trap 'rm -rf "$temp_dir"' EXIT
@@ -677,7 +726,8 @@ server_register_repository() (
 
         if ! python3 "$SERVER_REPO_HELPER" merge "$body_file" "$updated_file" \
             --web-hostname "$web_hostname" --ssh-hostname "$ssh_hostname" \
-            --name "$tunnel_name" > "$merge_meta"; then
+            --ssh-mode "$ssh_mode" --name "$tunnel_name" \
+            > "$merge_meta"; then
             error "Could not update the downloaded server repository"
             pause
             return

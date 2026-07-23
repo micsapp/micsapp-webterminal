@@ -52,17 +52,20 @@ def command_show(args: argparse.Namespace) -> None:
     print(f"Revision:  {document.get('revision', 0)}")
     print(f"Servers:   {len(servers)}")
     print()
-    print(f"  {'WEB HOSTNAME':<34} {'SSH HOSTNAME':<38} {'STATE':<8} NAME")
-    print(f"  {'-' * 34} {'-' * 38} {'-' * 8} {'-' * 20}")
+    print(f"  {'WEB HOSTNAME':<32} {'SSH HOSTNAME / DNS':<34} {'SSH MODE':<8} {'STATE':<8} NAME")
+    print(f"  {'-' * 32} {'-' * 34} {'-' * 8} {'-' * 8} {'-' * 20}")
     for raw_server in servers:
         if not isinstance(raw_server, dict):
             continue
         web = server_web_hostname(raw_server) or "-"
         ssh = raw_server.get("ssh_hostname") or "-"
+        ssh_mode = raw_server.get("ssh_mode")
+        if ssh_mode not in {"direct", "tunnel", "none"}:
+            ssh_mode = "tunnel" if ssh != "-" else "none"
         state = "enabled" if raw_server.get("enabled", True) else "disabled"
         name = raw_server.get("name") or raw_server.get("id") or "-"
         marker = "*" if args.current and web == args.current else " "
-        print(f"{marker} {web:<34} {str(ssh):<38} {state:<8} {name}")
+        print(f"{marker} {web:<32} {str(ssh):<34} {ssh_mode:<8} {state:<8} {name}")
 
     if args.current:
         print()
@@ -96,8 +99,13 @@ def command_merge(args: argparse.Namespace) -> None:
     match["hostname"] = args.web_hostname
     match["web_hostname"] = args.web_hostname
     match["enabled"] = True
-    if args.ssh_hostname:
+    match["ssh_mode"] = args.ssh_mode
+    if args.ssh_mode in {"direct", "tunnel"}:
+        if not args.ssh_hostname:
+            fail(f"--ssh-hostname is required for SSH mode '{args.ssh_mode}'")
         match["ssh_hostname"] = args.ssh_hostname
+    else:
+        match.pop("ssh_hostname", None)
 
     after = json.dumps(match, sort_keys=True, separators=(",", ":"))
     changed = created or before != after
@@ -135,6 +143,9 @@ def build_parser() -> argparse.ArgumentParser:
     merge_parser.add_argument("output", type=Path)
     merge_parser.add_argument("--web-hostname", required=True)
     merge_parser.add_argument("--ssh-hostname", default="")
+    merge_parser.add_argument(
+        "--ssh-mode", required=True, choices=("tunnel", "direct", "none")
+    )
     merge_parser.add_argument("--name", default="")
     merge_parser.set_defaults(handler=command_merge)
     return parser
