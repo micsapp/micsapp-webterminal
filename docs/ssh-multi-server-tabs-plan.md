@@ -1,5 +1,12 @@
 # Multi-Server Terminal Tabs — SSH-Backed Plan
 
+## Status
+
+Implemented in web-terminal 1.2.0. The protected Droppy repository is the
+catalog source; `ssh_mode` selects direct or Cloudflare-tunneled SSH. The
+browser stores only the approved server ID and tmux slot, and the backend
+revalidates that ID before creating or restoring a remote window.
+
 ## Decision
 
 Add remote systems to the existing **+ New Tab** workflow by opening an SSH connection inside a new ttyd/tmux window.

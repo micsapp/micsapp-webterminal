@@ -8,6 +8,7 @@ import http.server
 import json
 import mimetypes
 import os
+import re
 import secrets
 import shlex
 import shutil
@@ -71,9 +72,22 @@ TTYD_BIN = (
     or shutil.which("ttyd")
     or ("/usr/bin/ttyd" if _IS_LINUX else "/usr/local/bin/ttyd")
 )
+CLOUDFLARED_BIN = (
+    os.environ.get("CLOUDFLARED_BIN")
+    or shutil.which("cloudflared")
+    or "cloudflared"
+)
+
+CURL_BIN = os.environ.get("CURL_BIN") or shutil.which("curl") or "curl"
+DEFAULT_SERVER_REPO_URL = "https://tnas_d.micsapp.com/s/web-terminal-servers/serverlist.json"
+SERVER_REPO_CONFIG = os.environ.get(
+    "WEBTERMINAL_SERVER_REPO_CONFIG",
+    os.path.expanduser("~/.config/micsapp-webterminal/server-repo.conf"),
+)
+SERVER_REPO_CACHE_TTL = max(10, int(os.environ.get("WEBTERMINAL_SERVER_REPO_CACHE_TTL", "60")))
 
 # --- App version / build info (shown in the SPA's About dialog) ---
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 
 def _git_build_info():
     """Return (short_sha, commit_date, dirty) for the running checkout, or
@@ -193,6 +207,164 @@ def authenticate(username, password):
     except Exception as e:
         print(f"authenticate error: {e}", flush=True)
         return False
+
+
+# --- Shared remote-server catalog -------------------------------------------
+
+SERVER_REPO_KIND = "micsapp-webterminal-server-list"
+SERVER_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+SSH_HOST_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,251}[A-Za-z0-9])?$")
+SERVER_REPO_LOCK = threading.RLock()
+SERVER_REPO_CACHE = {"expires": 0.0, "servers": [], "error": ""}
+
+
+def _normalize_server_repo_url(value):
+    value = str(value or "").strip().rstrip("/")
+    if not value.startswith(("https://", "http://")):
+        return ""
+    if not value.endswith(".json"):
+        value += "/serverlist.json"
+    return value
+
+
+def server_repo_settings():
+    """Return repository URL/passcode, preferring environment over the TUI file."""
+    url = os.environ.get("WEBTERMINAL_SERVER_REPO_URL", "").strip()
+    passcode = os.environ.get("WEBTERMINAL_SERVER_REPO_PASSCODE", "").strip()
+    try:
+        with open(SERVER_REPO_CONFIG, "r", encoding="utf-8") as fh:
+            saved = fh.read().splitlines()
+        if not url and saved:
+            url = saved[0].strip()
+        if not passcode and len(saved) > 1:
+            passcode = saved[1].strip()
+    except (FileNotFoundError, OSError):
+        pass
+    return _normalize_server_repo_url(url or DEFAULT_SERVER_REPO_URL), passcode
+
+
+def validate_server_repository(document):
+    """Return enabled, connectable SSH targets from a server-list document."""
+    if not isinstance(document, dict) or document.get("kind") != SERVER_REPO_KIND:
+        raise ValueError("unexpected server repository kind")
+    raw_servers = document.get("servers")
+    if not isinstance(raw_servers, list):
+        raise ValueError("server repository 'servers' must be an array")
+
+    servers = []
+    seen = set()
+    for raw in raw_servers:
+        if not isinstance(raw, dict) or not raw.get("enabled", True):
+            continue
+        server_id = str(raw.get("id") or "").strip()
+        if not SERVER_ID_RE.fullmatch(server_id) or server_id in seen:
+            continue
+        ssh_hostname = str(raw.get("ssh_hostname") or "").strip()
+        ssh_mode = str(raw.get("ssh_mode") or "").strip().lower()
+        if not ssh_mode:
+            ssh_mode = "tunnel" if ssh_hostname else "none"
+        if ssh_mode not in ("direct", "tunnel"):
+            continue
+        if not SSH_HOST_RE.fullmatch(ssh_hostname):
+            continue
+        name = str(raw.get("name") or server_id).strip()
+        name = "".join(ch for ch in name if ch >= " " and ch != "\x7f")[:80]
+        web_hostname = str(raw.get("web_hostname") or raw.get("hostname") or "").strip()
+        servers.append({
+            "id": server_id,
+            "name": name or server_id,
+            "web_hostname": web_hostname,
+            "ssh_mode": ssh_mode,
+            "ssh_hostname": ssh_hostname,
+        })
+        seen.add(server_id)
+    return servers
+
+
+def fetch_server_repository(url, passcode):
+    """Fetch JSON with curl so wildcard TLS works for the TNAS underscore host."""
+    if "\r" in passcode or "\n" in passcode:
+        raise ValueError("invalid repository passcode")
+    result = subprocess.run(
+        [
+            CURL_BIN,
+            "--silent",
+            "--show-error",
+            "--fail",
+            "--connect-timeout", "5",
+            "--max-time", "8",
+            "-H", "@-",
+            url,
+        ],
+        input=f"X-Droppy-Share-Passcode: {passcode}\n".encode("utf-8"),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=10,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.decode(errors="replace").strip()[:500]
+        raise OSError(detail or f"curl exited with status {result.returncode}")
+    return result.stdout
+
+
+def load_server_catalog(force=False):
+    """Fetch/cache the protected list; return (servers, error, configured)."""
+    now = time.monotonic()
+    with SERVER_REPO_LOCK:
+        if not force and now < SERVER_REPO_CACHE["expires"]:
+            return (
+                list(SERVER_REPO_CACHE["servers"]),
+                SERVER_REPO_CACHE["error"],
+                True,
+            )
+
+    url, passcode = server_repo_settings()
+    if not passcode:
+        return [], "server repository passcode is not configured", False
+
+    try:
+        payload = fetch_server_repository(url, passcode)
+        if len(payload) > 2 * 1024 * 1024:
+            raise ValueError("server repository is too large")
+        document = json.loads(payload.decode("utf-8"))
+        servers = validate_server_repository(document)
+        with SERVER_REPO_LOCK:
+            SERVER_REPO_CACHE.update({
+                "expires": time.monotonic() + SERVER_REPO_CACHE_TTL,
+                "servers": servers,
+                "error": "",
+            })
+        return list(servers), "", True
+    except (OSError, ValueError, json.JSONDecodeError, subprocess.TimeoutExpired) as exc:
+        error = f"server repository unavailable: {exc}"
+        with SERVER_REPO_LOCK:
+            stale = list(SERVER_REPO_CACHE["servers"])
+            SERVER_REPO_CACHE.update({
+                "expires": time.monotonic() + 10,
+                "error": error,
+            })
+        return stale, error, True
+
+
+def public_server_catalog(servers):
+    """Return browser-safe metadata; SSH targets remain server-side."""
+    return [
+        {
+            "id": server["id"],
+            "name": server["name"],
+            "web_hostname": server["web_hostname"],
+            "ssh_mode": server["ssh_mode"],
+        }
+        for server in servers
+    ]
+
+
+def find_server_target(server_id, force=False):
+    if not isinstance(server_id, str) or not SERVER_ID_RE.fullmatch(server_id):
+        return None
+    servers, _error, _configured = load_server_catalog(force=force)
+    return next((server for server in servers if server["id"] == server_id), None)
+
 
 # ---------------------------------------------------------------------------
 # PWA assets — web manifest, service worker, icons. All generated/served
@@ -727,6 +899,50 @@ __PWA_HEAD__
     pointer-events: none;
   }
   .nav-btn.active { background: #0f3460; border-color: #1a4a7a; color: #e2e2e2; }
+  .new-tab-launcher {
+    position: relative;
+    display: flex;
+    align-items: center;
+    flex-shrink: 0;
+  }
+  .new-tab-launcher > .nav-btn:first-child {
+    border-radius: 6px 0 0 6px;
+    padding-right: 8px;
+  }
+  .new-tab-caret {
+    border-radius: 0 6px 6px 0;
+    border-left-color: #1a4a7a;
+    padding: 4px 6px;
+  }
+  .remote-tab-menu {
+    display: none;
+    position: absolute;
+    top: calc(100% + 8px);
+    left: 0;
+    min-width: 250px;
+    max-width: min(360px, 90vw);
+    padding: 6px;
+    background: #16213e;
+    border: 1px solid #0f3460;
+    border-radius: 8px;
+    box-shadow: 0 10px 28px rgba(0,0,0,0.5);
+    z-index: 130;
+  }
+  .remote-tab-menu.open { display: block; }
+  .remote-tab-item {
+    width: 100%;
+    border: 0;
+    background: transparent;
+    color: #d4d4ea;
+    padding: 8px 10px;
+    border-radius: 5px;
+    cursor: pointer;
+    text-align: left;
+    font-size: 13px;
+  }
+  .remote-tab-item:hover { background: #0f3460; }
+  .remote-tab-item small { display: block; color: #7a7a9e; margin-top: 2px; }
+  .remote-tab-empty { color: #7a7a9e; font-size: 12px; padding: 10px; }
   .nav-right { margin-left: auto; display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
 
   /* Tab bar */
@@ -1860,7 +2076,14 @@ __PWA_HEAD__
 <div class="navbar">
   <div class="title"><span>&#9611;</span> __USERNAME__</div>
   <div class="nav-sep"></div>
-  <button class="nav-btn" onclick="addTab()">&#43; New Tab</button>
+  <div class="new-tab-launcher">
+    <button class="nav-btn" onclick="addTab()">&#43; New Tab</button>
+    <button class="nav-btn new-tab-caret" id="remoteTabBtn" onclick="toggleRemoteTabMenu(event)"
+      title="Open a remote SSH tab" aria-label="Remote server menu">&#9662;</button>
+    <div class="remote-tab-menu" id="remoteTabMenu">
+      <div class="remote-tab-empty">Loading remote servers…</div>
+    </div>
+  </div>
   <button class="nav-btn" id="sessionsBtn" onclick="openSessions()" title="Session list — bring a session to this device">&#9776; Sessions</button>
   <button class="nav-btn nav-hide-mobile" id="splitRightBtn" onclick="splitRight()" title="Split Right (Ctrl+Shift+\\)">&#9707; Split Right</button>
   <button class="nav-btn nav-hide-mobile" id="splitDownBtn" onclick="splitDown()" title="Split Down (Ctrl+Shift+-)">&#9707; Split Down</button>
@@ -2209,6 +2432,8 @@ let tabs = [];
 let activeTabId = null;
 let tabCounter = 0;
 let nextWindowSlot = 0;
+let remoteServers = [];
+let remoteCatalogError = '';
 
 // --- Split Screen System ---
 // splitRoot: null (no split, single pane) or a tree node:
@@ -2711,6 +2936,129 @@ function getAllIframes() {
   return document.querySelectorAll('#termContainer iframe');
 }
 
+function renderRemoteTabMenu() {
+  const menu = document.getElementById('remoteTabMenu');
+  if (!menu) return;
+  menu.innerHTML = '';
+  if (!remoteServers.length) {
+    const empty = document.createElement('div');
+    empty.className = 'remote-tab-empty';
+    empty.textContent = remoteCatalogError || 'No remote SSH servers are configured.';
+    menu.appendChild(empty);
+  } else {
+    remoteServers.forEach(server => {
+      const item = document.createElement('button');
+      item.type = 'button';
+      item.className = 'remote-tab-item';
+      const title = document.createElement('span');
+      title.textContent = server.name;
+      const detail = document.createElement('small');
+      detail.textContent = (server.ssh_mode === 'tunnel' ? 'Cloudflare tunnel' : 'Direct SSH')
+        + (server.web_hostname ? ' · ' + server.web_hostname : '');
+      item.appendChild(title);
+      item.appendChild(detail);
+      item.addEventListener('click', () => addRemoteTab(server.id));
+      menu.appendChild(item);
+    });
+  }
+  const refresh = document.createElement('button');
+  refresh.type = 'button';
+  refresh.className = 'remote-tab-item';
+  refresh.style.borderTop = '1px solid #0f3460';
+  refresh.style.marginTop = '4px';
+  refresh.textContent = '↻ Refresh server list';
+  refresh.addEventListener('click', async () => {
+    remoteCatalogError = 'Refreshing…';
+    renderRemoteTabMenu();
+    await loadRemoteServers(true);
+  });
+  menu.appendChild(refresh);
+}
+
+async function loadRemoteServers(force) {
+  try {
+    const response = await fetch('/api/servers' + (force ? '?refresh=1' : ''), {
+      cache: 'no-store'
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.error || ('HTTP ' + response.status));
+    remoteServers = Array.isArray(data.servers) ? data.servers : [];
+    remoteCatalogError = data.error || '';
+  } catch (error) {
+    remoteServers = [];
+    remoteCatalogError = 'Remote servers unavailable: ' + (error.message || error);
+  }
+  renderRemoteTabMenu();
+  return remoteServers;
+}
+
+function toggleRemoteTabMenu(event) {
+  if (event) event.stopPropagation();
+  const menu = document.getElementById('remoteTabMenu');
+  if (menu) menu.classList.toggle('open');
+}
+
+function closeRemoteTabMenu() {
+  const menu = document.getElementById('remoteTabMenu');
+  if (menu) menu.classList.remove('open');
+}
+
+async function ensureRemoteWindow(tab) {
+  if (!tab || tab.type !== 'ssh' || !tab.serverId) return true;
+  const response = await fetch('/api/remote-tab', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ server_id: tab.serverId, slot: tab.windowSlot })
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data.error || ('HTTP ' + response.status));
+  return true;
+}
+
+async function addRemoteTab(serverId) {
+  closeRemoteTabMenu();
+  const server = remoteServers.find(item => item.id === serverId);
+  if (!server) {
+    showToast('Remote server is no longer available', true);
+    return;
+  }
+  const slot = nextTabWindowSlot();
+  const candidate = {
+    type: 'ssh',
+    serverId: server.id,
+    sshMode: server.ssh_mode,
+    windowSlot: slot
+  };
+  try {
+    showToast('Starting SSH session for ' + server.name + '…');
+    await ensureRemoteWindow(candidate);
+  } catch (error) {
+    showToast('Remote tab failed: ' + (error.message || error), true);
+    return;
+  }
+
+  tabCounter++;
+  const remoteNumber = tabs.filter(tab => tab.type === 'ssh' && tab.serverId === server.id).length + 1;
+  const tab = {
+    id: 'tab-' + tabCounter,
+    name: server.name + ' · Shell ' + remoteNumber,
+    type: 'ssh',
+    serverId: server.id,
+    sshMode: server.ssh_mode,
+    windowSlot: slot
+  };
+  tabs.push(tab);
+  const iframe = document.createElement('iframe');
+  iframe.id = 'frame-' + tab.id;
+  iframe.allow = 'clipboard-read; clipboard-write';
+  iframe.src = buildTermUrl(tab);
+  document.getElementById('termContainer').appendChild(iframe);
+  if (!isSplitActive()) switchTab(tab.id);
+  renderTabs();
+  saveTabs();
+  showToast('Connected tab ready: ' + server.name);
+}
+
 // --- End Split Screen System ---
 
 function buildTermUrl(tab, overrides) {
@@ -2743,7 +3091,16 @@ function buildTermUrl(tab, overrides) {
 }
 
 function saveTabs() {
-  try { localStorage.setItem('ttyd_tabs', JSON.stringify(tabs.map(t => ({ name: t.name, windowSlot: t.windowSlot, type: t.type || 'shell', wsPort: t.wsPort })))); } catch(e) {}
+  try {
+    localStorage.setItem('ttyd_tabs', JSON.stringify(tabs.map(t => ({
+      name: t.name,
+      windowSlot: t.windowSlot,
+      type: t.type || 'shell',
+      wsPort: t.wsPort,
+      serverId: t.serverId,
+      sshMode: t.sshMode
+    }))));
+  } catch(e) {}
 }
 
 function nextTabWindowSlot() {
@@ -4014,6 +4371,10 @@ document.addEventListener('click', (e) => {
   if (dd.classList.contains('open') && !e.target.closest('.hamburger') && !e.target.closest('.nav-dropdown')) {
     dd.classList.remove('open');
   }
+  const remoteMenu = document.getElementById('remoteTabMenu');
+  if (remoteMenu && remoteMenu.classList.contains('open') && !e.target.closest('.new-tab-launcher')) {
+    remoteMenu.classList.remove('open');
+  }
 });
 
 // Clipboard image paste handler
@@ -4222,7 +4583,8 @@ document.getElementById('specialKeys').addEventListener('click', function(e) {
 });
 
 // Load settings and create first tab
-function init() {
+async function init() {
+  await loadRemoteServers(false);
   try {
     const s = JSON.parse(localStorage.getItem('ttyd_settings') || '{}');
     if (s.fontSize) document.getElementById('fontSize').value = s.fontSize;
@@ -4260,6 +4622,9 @@ function init() {
   // Restore tabs from localStorage, or create one new tab
   let saved = [];
   try { saved = JSON.parse(localStorage.getItem('ttyd_tabs') || '[]'); } catch(e) {}
+  saved = saved.filter(t => t && (
+    t.type !== 'ssh' || remoteServers.some(server => server.id === t.serverId)
+  ));
   if (saved.length > 0) {
     saved.forEach((t, idx) => {
       tabCounter++;
@@ -4267,6 +4632,12 @@ function init() {
       nextWindowSlot = Math.max(nextWindowSlot, slot + 1);
       const tabObj = { id: 'tab-' + tabCounter, name: t.name || ('Shell ' + tabCounter), windowSlot: slot };
       if (t.type === 'desktop') { tabObj.type = 'desktop'; }
+      if (t.type === 'ssh') {
+        const server = remoteServers.find(item => item.id === t.serverId);
+        tabObj.type = 'ssh';
+        tabObj.serverId = server.id;
+        tabObj.sshMode = server.ssh_mode;
+      }
       tabs.push(tabObj);
     });
     renderTabs();
@@ -4282,7 +4653,15 @@ function init() {
     const activeSlots = tabs.filter(t => t.type !== 'desktop').map(t => t.windowSlot).join(',');
     tabs.forEach((t, i) => {
       const isActive = (t.id === activeTabId);
-      setTimeout(() => {
+      setTimeout(async () => {
+        if (t.type === 'ssh') {
+          try {
+            await ensureRemoteWindow(t);
+          } catch (error) {
+            showToast('Could not restore ' + t.name + ': ' + (error.message || error), true);
+            return;
+          }
+        }
         const iframe = document.createElement('iframe');
         iframe.id = 'frame-' + t.id;
         iframe.allow = 'clipboard-read; clipboard-write';
@@ -6275,6 +6654,96 @@ def run_as_user(username, python_script, timeout=10):
         return (1, b"", str(e).encode())
 
 
+def build_remote_window_script(server, slot):
+    """Build a fixed tmux operation for one already-validated catalog entry."""
+    ssh_args = [
+        SSH_BIN,
+        "-o", "ServerAliveInterval=30",
+        "-o", "ServerAliveCountMax=3",
+    ]
+    if server["ssh_mode"] == "tunnel":
+        proxy = f"{shlex.quote(CLOUDFLARED_BIN)} access ssh --hostname %h"
+        ssh_args.extend(["-o", f"ProxyCommand={proxy}"])
+    ssh_args.append(server["ssh_hostname"])
+    config = {
+        "slot": int(slot),
+        "server_id": server["id"],
+        "name": server["name"],
+        "ssh_mode": server["ssh_mode"],
+        "ssh_args": ssh_args,
+    }
+    config_json = json.dumps(config)
+    return f"""\
+import json
+import shlex
+import subprocess
+import sys
+
+cfg = json.loads({config_json!r})
+slot = cfg["slot"]
+target = "main:" + str(slot)
+
+def run(args, **kwargs):
+    return subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **kwargs)
+
+has_main = run(["tmux", "has-session", "-t", "main"]).returncode == 0
+if has_main:
+    exists = run(["tmux", "list-windows", "-t", "main", "-F", "#{{window_index}}"])
+    live_slots = exists.stdout.decode(errors="replace").splitlines()
+    if str(slot) in live_slots:
+        marker = run([
+            "tmux", "show-window-options", "-v", "-t", target,
+            "@webterminal_server_id",
+        ])
+        current = marker.stdout.decode(errors="replace").strip()
+        if current == cfg["server_id"]:
+            print(json.dumps({{"ok": True, "existing": True, "slot": slot}}))
+            raise SystemExit(0)
+        print("tmux slot is already used by another tab", file=sys.stderr)
+        raise SystemExit(17)
+
+session_shell = (
+    '"$@"; rc=$?; printf "\\n[Remote SSH exited with status %s]\\n" "$rc"; '
+    'printf "Press Enter to close this session..."; read -r _; exit "$rc"'
+)
+wrapped = ["bash", "-lc", session_shell, "remote-tab"] + cfg["ssh_args"]
+window_command = shlex.join(wrapped)
+
+if has_main:
+    created = run([
+        "tmux", "new-window", "-d", "-t", target,
+        "-n", cfg["name"], window_command,
+    ])
+else:
+    created = run([
+        "tmux", "new-session", "-d", "-s", "main",
+        "-n", cfg["name"], window_command,
+    ])
+    if created.returncode == 0 and slot != 0:
+        created = run(["tmux", "move-window", "-s", "main:0", "-t", target])
+
+if created.returncode != 0:
+    sys.stderr.buffer.write(created.stderr)
+    raise SystemExit(created.returncode or 1)
+
+for option, value in (
+    ("@webterminal_server_id", cfg["server_id"]),
+    ("@webterminal_ssh_mode", cfg["ssh_mode"]),
+):
+    result = run(["tmux", "set-window-option", "-t", target, option, value])
+    if result.returncode != 0:
+        sys.stderr.buffer.write(result.stderr)
+        raise SystemExit(result.returncode or 1)
+run(["tmux", "set-window-option", "-t", target, "automatic-rename", "off"])
+run(["tmux", "rename-window", "-t", target, cfg["name"]])
+print(json.dumps({{"ok": True, "existing": False, "slot": slot}}))
+"""
+
+
+def create_remote_window(username, server, slot):
+    return run_as_user(username, build_remote_window_script(server, slot), timeout=15)
+
+
 # --- Minimal WebSocket helpers (RFC 6455, server-side only) -----------------
 # We implement the small subset needed for /api/shell so the project keeps
 # its "stdlib only, no pip deps" rule. Frame size cap prevents a malicious
@@ -7483,6 +7952,70 @@ except Exception as ex:
         _save_api_tokens(username, new_tokens)
         self._send_json(200, {"ok": True})
 
+    # --- Remote server catalog / tabs ---
+
+    def _handle_servers(self, params=None):
+        username = self._get_authenticated_user()
+        if not username:
+            self._send_error(401, "not authenticated")
+            return
+        force = bool(params and params.get("refresh", [""])[0] == "1")
+        servers, error, configured = load_server_catalog(force=force)
+        self._send_json(200, {
+            "servers": public_server_catalog(servers),
+            "configured": configured,
+            "stale": bool(error and servers),
+            "error": error,
+        })
+
+    def _handle_remote_tab(self):
+        username = self._get_authenticated_user()
+        if not username:
+            self._send_error(401, "not authenticated")
+            return
+        length = int(self.headers.get("Content-Length", 0))
+        if length <= 0 or length > 16 * 1024:
+            self._send_error(400 if length <= 0 else 413, "invalid request body")
+            return
+        try:
+            req = json.loads(self.rfile.read(length))
+        except (ValueError, json.JSONDecodeError):
+            self._send_error(400, "invalid json")
+            return
+
+        server_id = req.get("server_id")
+        slot = req.get("slot")
+        if not isinstance(server_id, str) or not SERVER_ID_RE.fullmatch(server_id):
+            self._send_error(400, "invalid server id")
+            return
+        if isinstance(slot, bool) or not isinstance(slot, int) or not 0 <= slot <= 4095:
+            self._send_error(400, "invalid terminal window slot")
+            return
+
+        server = find_server_target(server_id)
+        if not server:
+            self._send_error(404, "server is not enabled in the remote catalog")
+            return
+
+        returncode, stdout, stderr = create_remote_window(username, server, slot)
+        if returncode == 17:
+            self._send_error(409, "terminal window slot is already in use")
+            return
+        if returncode != 0:
+            detail = stderr.decode(errors="replace")[:1000]
+            print(
+                f"remote tab error user={username} server={server_id} slot={slot}: {detail}",
+                flush=True,
+            )
+            self._send_error(500, "failed to create remote SSH session")
+            return
+        try:
+            result = json.loads(stdout.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
+            result = {"ok": True, "slot": slot}
+        result["server"] = public_server_catalog([server])[0]
+        self._send_json(200, result)
+
     # --- Exec handler ---
 
     def _handle_exec(self):
@@ -7862,6 +8395,8 @@ except Exception as ex:
             self._handle_tokens_list()
         elif path == "/api/shell":
             self._handle_shell_ws(params)
+        elif path == "/api/servers":
+            self._handle_servers(params)
         else:
             self.send_response(404)
             self.end_headers()
@@ -7933,6 +8468,8 @@ except Exception as ex:
             self._handle_tokens_revoke()
         elif path == "/api/exec":
             self._handle_exec()
+        elif path == "/api/remote-tab":
+            self._handle_remote_tab()
         else:
             self.send_response(404)
             self.end_headers()

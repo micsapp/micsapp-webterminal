@@ -225,6 +225,25 @@ the repository kind/schema, preserves existing entry metadata, increments the
 repository revision only when values change, and uses Droppy's `ETag` with
 `If-Match` so a concurrent edit is not silently overwritten.
 
+### Remote SSH tabs
+
+The arrow beside **+ New Tab** loads enabled SSH targets from the protected
+server repository. Selecting one creates a tmux-backed tab on the current
+web-terminal server and starts SSH as the authenticated web-terminal user:
+
+- `ssh_mode: "direct"` runs regular SSH to `ssh_hostname`.
+- `ssh_mode: "tunnel"` uses `cloudflared access ssh` as SSH's `ProxyCommand`.
+- `ssh_mode: "none"` and disabled entries are not shown.
+
+The browser receives only the server ID, display name, web hostname, and SSH
+mode. The SSH target and Droppy passcode stay on the server. Remote passwords
+are never collected by the web app; configure SSH keys or type a password in
+the terminal. Normal SSH host-key verification remains enabled.
+
+Saved remote tabs retain only their approved server ID and tmux window slot.
+On refresh, the backend revalidates the ID against the current repository
+before reconnecting to the existing tmux window.
+
 **Service:** Runs as a macOS LaunchAgent at `~/Library/LaunchAgents/com.cloudflare.cloudflared.plist`.
 
 **Tunnel ID:** `d95faf61-a32a-4ef5-ac20-b75f415802b5`

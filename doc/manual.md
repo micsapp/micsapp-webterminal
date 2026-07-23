@@ -26,7 +26,8 @@ The toolbar provides quick access to all features:
 
 | Button | Description |
 |--------|-------------|
-| **+ New Tab** | Open a new terminal tab |
+| **+ New Tab** | Open a local terminal tab |
+| **New Tab ▾** | Choose a configured remote SSH server |
 | **Split Right / Split Down** | Split the view into side-by-side or stacked panes |
 | **A- / A+** | Decrease / increase font size (current size shown between them) |
 | **Commands** | Open the quick commands library |
@@ -48,10 +49,18 @@ Each tab is an independent terminal session backed by a tmux window. Your tabs p
 
 ![Multiple Tabs](images/multi-tabs.png)
 
-- **New Tab** -- click **+ New Tab** or press `Ctrl+Shift+T`
+- **Local tab** -- click **+ New Tab** or press `Ctrl+Shift+T`
+- **Remote tab** -- click the arrow beside **+ New Tab**, then choose a server
 - **Switch Tab** -- click a tab name
 - **Rename Tab** -- double-click the tab name and type a new name
 - **Close Tab** -- click the **x** button or press `Ctrl+Shift+W`
+
+
+Remote tabs run SSH inside the same tmux-backed terminal environment. A direct
+server uses regular SSH; a tunnel server connects through Cloudflare. The first
+connection may ask you to verify the remote host fingerprint, and SSH may ask
+for a password if you have not configured a key. The web application does not
+save that password.
 
 Tabs are backed by tmux grouped sessions. Closing a tab detaches the tmux client but the underlying tmux window and its processes keep running. Reopening or reconnecting reattaches to the same window.
 
