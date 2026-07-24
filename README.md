@@ -183,8 +183,34 @@ ssh: ssh-minipc2.micstec.com
 
 If SSH was not exposed during initial installation, run
 `./ssh-tunnel-tui.sh server` later. Server mode edits the same default
-`~/.cloudflared/config.yml`, creates or updates the SSH DNS record, and reloads
-the connector.
+`~/.cloudflared/config.yml`, creates or overwrites the SSH DNS record so it
+points at the configured tunnel, and reloads the connector. The setup is not
+reported as complete until a public SSH handshake reaches the origin through
+`cloudflared access ssh`.
+
+The server TUI manages the connector directly; it does not depend on separate
+`tunnel-start.sh` or `tunnel-stop.sh` helpers. **Tunnel status** recognizes a
+matching `cloudflared` process whether it was started from a PID file, systemd,
+tmux, or launchd, and then tests every configured public SSH route. This avoids
+reporting a tmux-managed connector as stopped and catches stale or incorrect
+Cloudflare DNS routes even when the local ingress YAML looks correct.
+
+Useful server-mode actions are:
+
+- **Full SSH setup wizard** — checks SSH and `cloudflared`, starts or reloads
+  the connector, configures DNS/ingress, and verifies the public SSH route.
+- **Tunnel status** — shows the detected runtime and performs a public SSH
+  protocol check for every `ssh://` ingress.
+- **Add SSH route** — updates ingress and DNS, reloads the connector, and
+  requires the new route to pass the same public check.
+- **Start tunnel / Stop tunnel** — manages the detected systemd, tmux,
+  launchd, PID-file, or matching process runtime.
+
+If a public route check fails with Cloudflare error `1033`, the public DNS
+record is not reaching an active connector for the configured tunnel. A
+`websocket: bad handshake` or SSH key-exchange failure means the Cloudflare
+route still did not reach the SSH origin. Correct the DNS/tunnel mapping and
+rerun **Tunnel status** before registering the server.
 
 On the web-terminal server that opens remote tabs, run
 `./ssh-tunnel-tui.sh client`. Client mode creates a friendly alias so the web
@@ -229,8 +255,8 @@ Server mode can read and update a passcode-protected Droppy share directly;
   web/SSH hostnames, with the current server marked by `*`.
 - **Register/update this server in repository** to choose tunnel SSH, direct
   SSH, or web-only access and upload the entry. Tunnel mode detects its hostname
-  from `~/.cloudflared/config.yml`; direct mode requires the reachable SSH
-  server name or DNS.
+  from `~/.cloudflared/config.yml` and requires its public SSH handshake to pass
+  before upload; direct mode requires the reachable SSH server name or DNS.
 
 The repository URL defaults to
 `https://tnas_d.micsapp.com/s/web-terminal-servers/serverlist.json`. On first

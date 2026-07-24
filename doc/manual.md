@@ -27,7 +27,7 @@ The toolbar provides quick access to all features:
 | Button | Description |
 |--------|-------------|
 | **+ New Tab** | Open a local terminal tab |
-| **New Tab ▾** | Choose a configured remote SSH server |
+| **New Tab ▾** | Choose **Web Terminal** or **SSH Session** for a configured remote server |
 | **Split Right / Split Down** | Split the view into side-by-side or stacked panes |
 | **A- / A+** | Decrease / increase font size (current size shown between them) |
 | **Commands** | Open the quick commands library |
@@ -50,17 +50,21 @@ Each tab is an independent terminal session backed by a tmux window. Your tabs p
 ![Multiple Tabs](images/multi-tabs.png)
 
 - **Local tab** -- click **+ New Tab** or press `Ctrl+Shift+T`
-- **Remote tab** -- click the arrow beside **+ New Tab**, then choose a server
+- **Remote Web Terminal** -- click the arrow beside **+ New Tab**, then choose
+  a server's **Web Terminal** item to open it inside an application tab
+- **Remote SSH session** -- choose the same server's **SSH Session** item to
+  run SSH in a tmux-backed terminal tab
 - **Switch Tab** -- click a tab name
 - **Rename Tab** -- double-click the tab name and type a new name
 - **Close Tab** -- click the **x** button or press `Ctrl+Shift+W`
 
-
-Remote tabs run SSH inside the same tmux-backed terminal environment. A direct
-server uses regular SSH; a tunnel server connects through Cloudflare. The first
-connection may ask you to verify the remote host fingerprint, and SSH may ask
-for a password if you have not configured a key. The web application does not
-save that password.
+Each registered server can provide two separate items. **Web Terminal** opens
+the server's HTTPS terminal inside the current application; **SSH Session**
+runs SSH inside the current server's tmux-backed terminal environment. A direct
+SSH server uses regular SSH, while a tunnel server connects through Cloudflare.
+The first SSH connection may ask you to verify the remote host fingerprint,
+and SSH may ask for a password if you have not configured a key. The web
+application does not save that password.
 
 ### Enabling remote servers
 
@@ -79,6 +83,35 @@ the remote-server menu remains empty, even if environment variables are set.
 
 Each destination must still be registered with direct or tunnel SSH and the
 web-terminal user must have a matching remote account and SSH credentials.
+
+### Registering and checking a tunnel server
+
+Run the server-side tunnel utility on each destination that will provide SSH
+through Cloudflare:
+
+```bash
+./ssh-tunnel-tui.sh server
+```
+
+Use **Full SSH setup wizard** for a new destination. It checks the local SSH
+service, installs or verifies `cloudflared`, adds the `ssh://localhost:22`
+ingress, updates the public DNS route to the configured tunnel, reloads the
+connector, and performs a public SSH protocol handshake. The wizard stops and
+reports setup as incomplete if that public check cannot reach the SSH origin.
+
+Use **Tunnel status** at any time to see how the connector is actually running
+(PID file, matching process, systemd, tmux, or launchd) and to test every public
+SSH hostname in `~/.cloudflared/config.yml`. **Start tunnel** and **Stop tunnel**
+use the same built-in runtime detection; no separate start/stop helper scripts
+are required.
+
+Before **Register/update this server in repository** uploads a tunnel-mode
+entry, the TUI repeats the public SSH check. This prevents a locally correct
+ingress file with stale Cloudflare DNS from being published as a working
+server. Cloudflare error `1033` usually means DNS points at a tunnel without an
+active connector; `websocket: bad handshake` or an SSH key-exchange failure
+means the public route still did not reach the SSH origin. Fix the tunnel/DNS
+mapping, restart or reload the connector, and rerun **Tunnel status**.
 
 Tabs are backed by tmux grouped sessions. Closing a tab detaches the tmux client but the underlying tmux window and its processes keep running. Reopening or reconnecting reattaches to the same window.
 
