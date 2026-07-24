@@ -837,9 +837,16 @@ _port_listening() {
   if command -v lsof >/dev/null 2>&1; then
     _priv lsof -nP -iTCP:"${port}" -sTCP:LISTEN >/dev/null 2>&1 && return 0
   fi
-  local ss_bin
-  ss_bin="$(command -v ss || true)"
-  [ -n "$ss_bin" ] || { [ -x /usr/sbin/ss ] && ss_bin=/usr/sbin/ss; }
+  # Resolve `ss` from the system paths FIRST, and only then fall back to PATH.
+  # A user-local shim earlier in PATH (e.g. ~/bin/ss) can be broken and would
+  # silently report nothing listening — which makes deploy.sh restart healthy
+  # services. Some NAS builds only ship /usr/bin/ss, hence both candidates.
+  local ss_bin=""
+  local _c
+  for _c in /usr/sbin/ss /usr/bin/ss; do
+    [ -x "$_c" ] && { ss_bin="$_c"; break; }
+  done
+  [ -n "$ss_bin" ] || ss_bin="$(command -v ss || true)"
   if [ -n "$ss_bin" ] && "$ss_bin" -tlnp 2>/dev/null | grep -q ":${port} "; then
     return 0
   fi

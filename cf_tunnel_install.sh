@@ -9559,17 +9559,79 @@ WT_TTYD_START_PORT=""
 # containers. A containerized webterminal SSHes into the host and spawns its ttyd
 # on the host, so both host and container deployments appear as host ttyd
 # processes carrying this project's signature (ttyd ... -i 127.0.0.1 ... tmux).
-# Sets globals: WT_DETECTED, WT_USED_PORTS, WT_USED_SESSIONS, WT_DETECT_REPORT.
+# Crucially it distinguishes a FOREIGN deployment (another directory, or a
+# container) from a previous install of THIS directory: re-running the installer
+# to upgrade in place must not auto-isolate, or the user's tabs would move to a
+# fresh tmux session and their running windows would appear to vanish.
+# Sets globals: WT_DETECTED, WT_FOREIGN, WT_USED_PORTS, WT_USED_SESSIONS,
+# WT_DETECT_REPORT, WT_OWN_TMUX_SESSION, WT_OWN_TTYD_START_PORT.
 detect_existing_webterminals() {
   WT_DETECTED=false
+  WT_FOREIGN=false
   WT_USED_PORTS=""
   WT_USED_SESSIONS=""
   WT_DETECT_REPORT=""
+  WT_OWN_TMUX_SESSION=""
+  WT_OWN_TTYD_START_PORT=""
 
-  # 1. Host ttyd processes matching the webterminal signature (covers host AND
+  local own_dir own_found=false
+  own_dir="$(readlink -f "$AUTH_DIR" 2>/dev/null || printf '%s' "$AUTH_DIR")"
+
+  # 1. Running auth.py processes on the host. One whose script lives outside this
+  #    install dir is a genuinely different deployment; one inside it is just the
+  #    copy we are about to replace.
+  if command -v pgrep >/dev/null 2>&1; then
+    local apid acmd apath
+    while read -r apid acmd; do
+      [ -n "$acmd" ] || continue
+      apath="$(printf '%s' "$acmd" | grep -oE '[^ ]*auth\.py' | head -1)"
+      [ -n "$apath" ] || continue
+      case "$apath" in
+        /*) ;;
+        *) apath="$(readlink -f "/proc/${apid}/cwd" 2>/dev/null)/${apath}" ;;
+      esac
+      apath="$(readlink -f "$apath" 2>/dev/null || printf '%s' "$apath")"
+      WT_DETECTED=true
+      case "$apath" in
+        "$own_dir"/*)
+          own_found=true
+          WT_DETECT_REPORT="${WT_DETECT_REPORT}  - a previous install of THIS deployment (${apath})\n" ;;
+        *)
+          WT_FOREIGN=true
+          WT_DETECT_REPORT="${WT_DETECT_REPORT}  - a different auth.py deployment (${apath})\n" ;;
+      esac
+    done < <(pgrep -af 'auth\.py' 2>/dev/null)
+  fi
+
+  # 2. An existing auth systemd unit (system or --user). If it points at this same
+  #    directory it is ours — inherit its isolation settings rather than resetting
+  #    them to the defaults on reinstall.
+  local unit_file
+  for unit_file in "/etc/systemd/system/ttyd-auth.service" "${HOME}/.config/systemd/user/ttyd-auth.service"; do
+    [ -f "$unit_file" ] || continue
+    WT_DETECTED=true
+    if grep -qF "${own_dir}/auth.py" "$unit_file" 2>/dev/null; then
+      own_found=true
+      WT_DETECT_REPORT="${WT_DETECT_REPORT}  - previous unit for THIS deployment (${unit_file})\n"
+      [ -n "$WT_OWN_TMUX_SESSION" ] || WT_OWN_TMUX_SESSION="$(sed -n 's/^Environment=TMUX_SESSION=//p' "$unit_file" | head -1)"
+      [ -n "$WT_OWN_TTYD_START_PORT" ] || WT_OWN_TTYD_START_PORT="$(sed -n 's/^Environment=TTYD_START_PORT=//p' "$unit_file" | head -1)"
+    else
+      WT_FOREIGN=true
+      WT_DETECT_REPORT="${WT_DETECT_REPORT}  - ttyd-auth.service from a different deployment (${unit_file})\n"
+    fi
+  done
+
+  # Our own tmux session name, now that the unit (if any) has been read. Any ttyd
+  # on a DIFFERENT session belongs to someone else — even if that deployment's
+  # auth.py is currently stopped, its ttyd processes and ports are still live and
+  # would collide with ours.
+  local own_sess="$WT_OWN_TMUX_SESSION"
+  [ -n "$own_sess" ] || { [ "$own_found" = true ] && own_sess="main"; }
+
+  # 3. Host ttyd processes matching the webterminal signature (covers host AND
   #    containerized deployments, since the latter spawn ttyd on the host).
   if command -v pgrep >/dev/null 2>&1; then
-    local line port sess
+    local line port sess foreign_sess=""
     while IFS= read -r line; do
       [ -n "$line" ] || continue
       port="$(printf '%s' "$line" | grep -oE -- '-p [0-9]+' | head -1 | awk '{print $2}')"
@@ -9578,6 +9640,10 @@ detect_existing_webterminals() {
       [ -n "$sess" ] || sess="$(printf '%s' "$line" | grep -oE -- '-[ts] [A-Za-z0-9_.-]+' | head -1 | awk '{print $2}')"
       [ -n "$port" ] && WT_USED_PORTS="$WT_USED_PORTS $port"
       [ -n "$sess" ] && WT_USED_SESSIONS="$WT_USED_SESSIONS $sess"
+      if [ -n "$sess" ] && [ "$sess" != "$own_sess" ]; then
+        WT_FOREIGN=true
+        foreign_sess="$foreign_sess $sess"
+      fi
       WT_DETECTED=true
     done < <(pgrep -af 'ttyd' 2>/dev/null | grep -- '-i 127.0.0.1' | grep -F 'tmux')
     if [ -n "$WT_USED_PORTS" ] || [ -n "$WT_USED_SESSIONS" ]; then
@@ -9586,25 +9652,21 @@ detect_existing_webterminals() {
       _rsess="$(echo $WT_USED_SESSIONS | tr ' ' '\n' | sort -u | paste -sd, -)"
       WT_DETECT_REPORT="${WT_DETECT_REPORT}  - host ttyd processes (ports: ${_rports:-none}; tmux sessions: ${_rsess:-none})\n"
     fi
-  fi
-
-  # 2. An existing auth systemd unit (system or --user).
-  if command -v systemctl >/dev/null 2>&1; then
-    if systemctl list-unit-files 2>/dev/null | grep -q '^ttyd-auth\.service' \
-       || systemctl --user list-unit-files 2>/dev/null | grep -q '^ttyd-auth\.service'; then
-      WT_DETECTED=true
-      WT_DETECT_REPORT="${WT_DETECT_REPORT}  - existing ttyd-auth.service systemd unit\n"
+    if [ -n "$foreign_sess" ]; then
+      WT_DETECT_REPORT="${WT_DETECT_REPORT}    -> not ours: tmux session(s)$(echo $foreign_sess | tr ' ' '\n' | sort -u | paste -sd, - | sed 's/^/ /')\n"
     fi
   fi
 
-  # 3. Webterminals running inside Docker containers. `docker top` reads the
+  # 4. Webterminals running inside Docker containers. `docker top` reads the
   #    process list from the host side, so it works without exec'ing inside.
+  #    A container is always a separate deployment, so this is always foreign.
   if command -v docker >/dev/null 2>&1; then
     local cid cname
     for cid in $(docker ps -q 2>/dev/null); do
       if docker top "$cid" 2>/dev/null | grep -q '[a]uth\.py'; then
         cname="$(docker inspect -f '{{.Name}}' "$cid" 2>/dev/null | sed 's#^/##')"
         WT_DETECTED=true
+        WT_FOREIGN=true
         WT_DETECT_REPORT="${WT_DETECT_REPORT}  - docker container '${cname:-$cid}' running auth.py (webterminal)\n"
       fi
     done
@@ -9725,6 +9787,21 @@ main() {
       say ""
       say "[detect] Found existing webterminal(s) on this host:"
       printf "%b" "$WT_DETECT_REPORT"
+    fi
+    if [ "$WT_DETECTED" = true ] && [ "$WT_FOREIGN" = false ]; then
+      # Only a previous install of THIS deployment — an in-place upgrade. Do NOT
+      # auto-isolate: moving the tmux session would orphan the user's windows.
+      # Carry forward whatever isolation the existing unit already had.
+      [ -n "$WT_TMUX_SESSION" ] || WT_TMUX_SESSION="$WT_OWN_TMUX_SESSION"
+      [ -n "$WT_TTYD_START_PORT" ] || WT_TTYD_START_PORT="$WT_OWN_TTYD_START_PORT"
+      say "[keep]  In-place upgrade of this deployment — keeping TMUX_SESSION=${WT_TMUX_SESSION:-main(default)}  TTYD_START_PORT=${WT_TTYD_START_PORT:-7700(default)}"
+      say ""
+    elif [ "$WT_FOREIGN" = true ]; then
+      # A different deployment shares this host. Isolate — but if THIS deployment
+      # already had isolation settings, keep them: they are already disjoint, and
+      # changing them would orphan the user's existing tmux windows.
+      [ -n "$WT_TMUX_SESSION" ] || WT_TMUX_SESSION="$WT_OWN_TMUX_SESSION"
+      [ -n "$WT_TTYD_START_PORT" ] || WT_TTYD_START_PORT="$WT_OWN_TTYD_START_PORT"
       if [ -z "$WT_TMUX_SESSION" ]; then
         WT_TMUX_SESSION="main-$(printf '%s' "$name" | tr -c 'A-Za-z0-9_-' '-')"
       fi
