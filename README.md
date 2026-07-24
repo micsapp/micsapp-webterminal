@@ -236,8 +236,10 @@ The repository URL defaults to
 `https://tnas_d.micsapp.com/s/web-terminal-servers/serverlist.json`. On first
 use, accept that URL or enter another Droppy folder/full JSON URL, then enter its
 passcode. The TUI can save both for the current user at
-`~/.config/micsapp-webterminal/server-repo.conf` with mode `600`. You can
-instead provide both values through the environment:
+`~/.config/micsapp-webterminal/server-repo.conf` with mode `600`. This file
+is required as the enable marker; if it is absent, web-terminal shows no remote
+servers. Environment variables may override the saved values after the file
+exists:
 
 ```bash
 export WEBTERMINAL_SERVER_REPO_URL='https://tnas_d.micsapp.com/s/web-terminal-servers'

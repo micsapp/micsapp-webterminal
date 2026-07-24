@@ -1043,6 +1043,16 @@ def fetch_server_repository(url, passcode):
 
 def load_server_catalog(force=False):
     """Fetch/cache the protected list; return (servers, error, configured)."""
+    if not os.path.isfile(SERVER_REPO_CONFIG):
+        error = "remote setup has not been completed"
+        with SERVER_REPO_LOCK:
+            SERVER_REPO_CACHE.update({
+                "expires": 0.0,
+                "servers": [],
+                "error": error,
+            })
+        return [], error, False
+
     now = time.monotonic()
     with SERVER_REPO_LOCK:
         if not force and now < SERVER_REPO_CACHE["expires"]:

@@ -92,7 +92,7 @@ class RemoteTabTests(unittest.TestCase):
             auth,
             "server_repo_settings",
             return_value=(auth.DEFAULT_SERVER_REPO_URL, "test-passcode"),
-        ), mock.patch.object(auth.subprocess, "run", fake_run):
+        ), mock.patch.object(auth, "SERVER_REPO_CONFIG", __file__), mock.patch.object(auth.subprocess, "run", fake_run):
             first, error, configured = auth.load_server_catalog()
             second, second_error, _configured = auth.load_server_catalog()
 
@@ -108,6 +108,24 @@ class RemoteTabTests(unittest.TestCase):
             fake_run.call_args.kwargs["input"],
             b"X-Droppy-Share-Passcode: test-passcode\n",
         )
+
+    def test_missing_config_hides_servers_even_with_environment(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            missing = os.path.join(temp_dir, "missing.conf")
+            with mock.patch.object(auth, "SERVER_REPO_CONFIG", missing), mock.patch.object(
+                auth,
+                "server_repo_settings",
+                return_value=(auth.DEFAULT_SERVER_REPO_URL, "test-passcode"),
+            ), mock.patch.dict(
+                os.environ,
+                {"WEBTERMINAL_SERVER_REPO_PASSCODE": "test-passcode"},
+            ):
+                with auth.SERVER_REPO_LOCK:
+                    auth.SERVER_REPO_CACHE.update({"expires": 9999999999, "servers": [{"id": "cached"}], "error": ""})
+                servers, error, configured = auth.load_server_catalog()
+        self.assertEqual(servers, [])
+        self.assertIn("remote setup", error)
+        self.assertFalse(configured)
 
     def test_settings_file_supplies_passcode_without_hardcoding(self):
         with tempfile.TemporaryDirectory() as temp_dir:
