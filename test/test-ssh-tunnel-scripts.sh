@@ -76,10 +76,46 @@ assert_contains "$TEST_CONFIG" '    service: ssh://localhost:22'
   source "$TEST_ROOT_DIR/ssh-tunnel-tui.sh"
   [ "$(configured_ssh_hostname)" = "ssh-demo.example.com" ] \
     || fail "TUI did not read the SSH hostname from the shared config"
+  [ "$(configured_ssh_routes)" = $'ssh-demo.example.com\tssh://localhost:22' ] \
+    || fail "TUI did not enumerate configured SSH routes"
   [ "$(normalize_server_repo_url https://files.example.com/s/servers)" = \
       "https://files.example.com/s/servers/serverlist.json" ] \
     || fail "TUI did not normalize a Droppy folder share URL"
+
+  ps() {
+    printf ' 4983 cloudflared cloudflared tunnel run demo\n'
+  }
+  systemctl() { return 1; }
+  tmux() { return 1; }
+  is_mac() { return 1; }
+  [ "$(tunnel_runtime_status)" = "process PID 4983" ] \
+    || fail "TUI did not detect a matching cloudflared process"
+
+  cloudflared() { :; }
+  ssh() {
+    printf 'debug1: Remote protocol version 2.0, remote software version OpenSSH_test\n' >&2
+    return 255
+  }
+  check_public_ssh_route ssh-demo.example.com \
+    || fail "TUI rejected a successful SSH protocol handshake"
+
+  ssh() {
+    printf 'websocket: bad handshake\n' >&2
+    return 255
+  }
+  if check_public_ssh_route ssh-broken.example.com; then
+    fail "TUI accepted a Cloudflare WebSocket failure"
+  fi
+  [ "$PUBLIC_SSH_ROUTE_ERROR" = "websocket: bad handshake" ] \
+    || fail "TUI did not preserve the useful public-route failure"
 )
+
+if grep -Fq 'tunnel-start.sh' "$TEST_ROOT_DIR/ssh-tunnel-tui.sh" \
+    || grep -Fq 'tunnel-stop.sh' "$TEST_ROOT_DIR/ssh-tunnel-tui.sh"; then
+  fail "TUI still depends on missing tunnel start/stop helper scripts"
+fi
+assert_contains "$TEST_ROOT_DIR/ssh-tunnel-tui.sh" \
+  'Verifying public SSH route before registration'
 
 "$TEST_ROOT_DIR/add-tunnel-route.sh" --config "$TEST_CONFIG" \
   --hostname ssh-demo.example.com --no-dns

@@ -258,12 +258,125 @@ ensure_webterminal_embedding() {
     info "Embedded Web Terminal policy: ready"
 }
 
-reload_cloudflared_after_route_change() {
-    local tunnel_name
-    tunnel_name="$(configured_tunnel_name 2>/dev/null || true)"
-    [ -n "$tunnel_name" ] || { warn "Could not determine tunnel name; restart cloudflared manually"; return 0; }
+configured_ssh_routes() {
+    [ -f "$CONFIG_FILE" ] || return 1
+    awk '
+        $1 == "-" && $2 == "hostname:" { hostname=$3; next }
+        hostname != "" && $1 == "service:" {
+            if ($2 ~ /^ssh:/) {
+                printf "%s\t%s\n", hostname, $2
+            }
+            hostname=""
+        }
+    ' "$CONFIG_FILE"
+}
 
-    if is_linux && command -v systemctl >/dev/null 2>&1 \
+matching_cloudflared_pids() {
+    local tunnel_name="${1:-}"
+    [ -n "$tunnel_name" ] || tunnel_name="$(configured_tunnel_name 2>/dev/null || true)"
+    [ -n "$tunnel_name" ] || return 1
+    ps -ax -o pid= -o comm= -o args= 2>/dev/null | awk -v tunnel="$tunnel_name" '
+        $2 ~ /cloudflared$/ && $0 ~ /tunnel/ && $0 ~ /run/ && index($0, tunnel) {
+            print $1
+        }
+    '
+}
+
+tunnel_runtime_status() {
+    local tunnel_name pid pids
+    tunnel_name="$(configured_tunnel_name 2>/dev/null || true)"
+    [ -n "$tunnel_name" ] || return 1
+
+    if [ -f "$PID_FILE" ]; then
+        pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            printf 'PID %s' "$pid"
+            return 0
+        fi
+    fi
+
+    pids="$(matching_cloudflared_pids "$tunnel_name" | paste -sd, -)"
+    if [ -n "$pids" ]; then
+        printf 'process PID %s' "$pids"
+        return 0
+    fi
+
+    if command -v systemctl >/dev/null 2>&1 \
+        && systemctl is-active --quiet cloudflared 2>/dev/null; then
+        printf 'systemd service'
+        return 0
+    fi
+    if command -v tmux >/dev/null 2>&1 \
+        && tmux has-session -t cloudflared 2>/dev/null; then
+        printf "tmux session 'cloudflared'"
+        return 0
+    fi
+    if is_mac && command -v launchctl >/dev/null 2>&1 \
+        && launchctl list 2>/dev/null | grep -q 'com.cloudflare.cloudflared'; then
+        printf 'launchd service'
+        return 0
+    fi
+    return 1
+}
+
+wait_for_tunnel_runtime() {
+    local attempt status
+    for attempt in 1 2 3 4 5 6 7 8 9 10; do
+        if status="$(tunnel_runtime_status)"; then
+            printf '%s' "$status"
+            return 0
+        fi
+        sleep 0.5
+    done
+    return 1
+}
+
+PUBLIC_SSH_ROUTE_ERROR=""
+check_public_ssh_route() {
+    local ssh_hostname="$1" cloudflared_bin output rc
+    PUBLIC_SSH_ROUTE_ERROR=""
+    command -v ssh >/dev/null 2>&1 || {
+        PUBLIC_SSH_ROUTE_ERROR="ssh client is not installed"
+        return 1
+    }
+    cloudflared_bin="$(command -v cloudflared 2>/dev/null || true)"
+    [ -n "$cloudflared_bin" ] || {
+        PUBLIC_SSH_ROUTE_ERROR="cloudflared is not installed"
+        return 1
+    }
+
+    set +e
+    output="$(ssh -v -F /dev/null -o BatchMode=yes -o ConnectTimeout=12 \
+        -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+        -o GlobalKnownHostsFile=/dev/null -o PreferredAuthentications=none \
+        -o PubkeyAuthentication=no -o PasswordAuthentication=no \
+        -o KbdInteractiveAuthentication=no -o NumberOfPasswordPrompts=0 \
+        -o "ProxyCommand=${cloudflared_bin} access ssh --hostname %h" \
+        "webterminal-probe@${ssh_hostname}" true 2>&1)"
+    rc=$?
+    set -e
+
+    if printf '%s\n' "$output" | grep -q 'Remote protocol version'; then
+        return 0
+    fi
+    PUBLIC_SSH_ROUTE_ERROR="$(printf '%s\n' "$output" \
+        | grep -E 'error code:|websocket:|kex_exchange|Connection (closed|timed out|refused)|Could not resolve' \
+        | tail -1 | tr -d '\r' || true)"
+    PUBLIC_SSH_ROUTE_ERROR="${PUBLIC_SSH_ROUTE_ERROR:-SSH handshake did not reach the origin (exit $rc)}"
+    return 1
+}
+
+reload_cloudflared_after_route_change() {
+    local tunnel_name status
+    tunnel_name="$(configured_tunnel_name 2>/dev/null || true)"
+    if [ -z "$tunnel_name" ]; then
+        error "Could not determine tunnel name from $CONFIG_FILE"
+        return 1
+    fi
+
+    # WSL can run systemd too, so detect the service directly instead of
+    # excluding WSL through is_linux.
+    if command -v systemctl >/dev/null 2>&1 \
         && systemctl list-unit-files cloudflared.service --no-legend 2>/dev/null \
             | grep -q '^cloudflared.service'; then
         local system_config="/etc/cloudflared/config.yml"
@@ -276,8 +389,12 @@ reload_cloudflared_after_route_change() {
             info "Synced $CONFIG_FILE to $system_config"
         fi
         sudo systemctl restart cloudflared
-        info "Restarted cloudflared system service"
-        return 0
+        if status="$(wait_for_tunnel_runtime)"; then
+            info "Cloudflared running via $status"
+            return 0
+        fi
+        error "Cloudflared system service did not become ready"
+        return 1
     fi
 
     if is_mac; then
@@ -285,8 +402,12 @@ reload_cloudflared_after_route_change() {
         if [ -f "$plist" ]; then
             launchctl unload "$plist" 2>/dev/null || true
             launchctl load "$plist"
-            info "Reloaded cloudflared LaunchAgent"
-            return 0
+            if status="$(wait_for_tunnel_runtime)"; then
+                info "Cloudflared running via $status"
+                return 0
+            fi
+            error "Cloudflared LaunchAgent did not become ready"
+            return 1
         fi
     fi
 
@@ -301,12 +422,68 @@ reload_cloudflared_after_route_change() {
         printf -v q_log '%q' "$LOG_FILE"
         tmux new-session -d -s cloudflared \
             "cloudflared tunnel --config ${q_cfg} run ${q_name} 2>&1 | tee -a ${q_log}"
-        info "Restarted cloudflared in tmux session 'cloudflared'"
-        return 0
+        if status="$(wait_for_tunnel_runtime)"; then
+            info "Cloudflared running via $status"
+            return 0
+        fi
+        error "Cloudflared tmux connector did not become ready; check $LOG_FILE"
+        return 1
     fi
 
-    warn "Route was saved, but cloudflared could not be reloaded automatically"
-    warn "Restart the connector using config: $CONFIG_FILE"
+    error "No supported cloudflared service manager or tmux was found"
+    return 1
+}
+
+stop_cloudflared_connector() {
+    local tunnel_name pid pids stopped=false
+    tunnel_name="$(configured_tunnel_name 2>/dev/null || true)"
+
+    if command -v systemctl >/dev/null 2>&1 \
+        && systemctl is-active --quiet cloudflared 2>/dev/null; then
+        sudo systemctl stop cloudflared
+        stopped=true
+    fi
+    if is_mac && command -v launchctl >/dev/null 2>&1; then
+        local plist="$HOME/Library/LaunchAgents/com.cloudflare.cloudflared.plist"
+        if [ -f "$plist" ] && launchctl list 2>/dev/null \
+            | grep -q 'com.cloudflare.cloudflared'; then
+            launchctl unload "$plist"
+            stopped=true
+        fi
+    fi
+    if command -v tmux >/dev/null 2>&1 \
+        && tmux has-session -t cloudflared 2>/dev/null; then
+        tmux kill-session -t cloudflared
+        stopped=true
+    fi
+
+    if [ -f "$PID_FILE" ]; then
+        pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            kill "$pid"
+            stopped=true
+        fi
+        rm -f "$PID_FILE"
+    fi
+
+    pids="$(matching_cloudflared_pids "$tunnel_name" 2>/dev/null || true)"
+    for pid in $pids; do
+        if kill -0 "$pid" 2>/dev/null; then
+            kill "$pid"
+            stopped=true
+        fi
+    done
+    sleep 0.5
+
+    if tunnel_runtime_status >/dev/null 2>&1; then
+        error "The $tunnel_name connector is still running"
+        return 1
+    fi
+    if $stopped; then
+        info "Stopped cloudflared connector for $tunnel_name"
+    else
+        info "Cloudflared connector was already stopped"
+    fi
 }
 
 # ── check if SSH is listening on port 22 ───────────────────────────────────────
@@ -451,16 +628,15 @@ https://pkg.cloudflare.com/cloudflared $(. /etc/os-release && echo "$VERSION_COD
 
 # ── check tunnel status ───────────────────────────────────────────────────────
 server_tunnel_status() {
+    local tunnel_name runtime host service route_count=0
     header "Server: Tunnel Status"
     echo ""
 
-    # Config file
     step "Config file... "
     if [ -f "$CONFIG_FILE" ]; then
         printf "${G}found${NC}\n"
-        local tunnel_name
-        tunnel_name=$(grep '^tunnel:' "$CONFIG_FILE" 2>/dev/null | awk '{print $2}' || echo "unknown")
-        info "Tunnel name: ${tunnel_name}"
+        tunnel_name="$(configured_tunnel_name 2>/dev/null || true)"
+        info "Tunnel name: ${tunnel_name:-unknown}"
     else
         printf "${Y}not found${NC}\n"
         warn "No tunnel configured. Run create_tunnel.sh first."
@@ -468,33 +644,39 @@ server_tunnel_status() {
         return
     fi
 
-    # Tunnel process
     echo ""
     step "Tunnel process... "
-    if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE" 2>/dev/null)" 2>/dev/null; then
-        printf "${G}running (PID $(cat "$PID_FILE"))${NC}\n"
+    if runtime="$(tunnel_runtime_status)"; then
+        printf "${G}running (%s)${NC}\n" "$runtime"
     else
         printf "${R}not running${NC}\n"
     fi
 
-    # SSH route
     echo ""
-    step "SSH routes in config:\n"
-    if grep -q 'ssh://' "$CONFIG_FILE" 2>/dev/null; then
-        grep -B1 'ssh://' "$CONFIG_FILE" | while read -r line; do
-            if echo "$line" | grep -q 'hostname:'; then
-                local host; host=$(echo "$line" | awk '{print $NF}')
-                local svc; read -r svc_line
-                svc=$(echo "$svc_line" | awk '{print $NF}')
-                printf "    ${G}%s${NC} → ${C}%s${NC}\n" "$host" "$svc"
-            fi
-        done 2>/dev/null || true
-        # Fallback: just show matching lines
-        grep -E 'hostname:.*|service:.*ssh' "$CONFIG_FILE" 2>/dev/null | \
-            sed 's/^/    /' || true
-    else
+    step "SSH routes in config:"
+    echo ""
+    while IFS=$'\t' read -r host service; do
+        [ -n "$host" ] || continue
+        route_count=$((route_count + 1))
+        printf "    ${G}%s${NC} → ${C}%s${NC}\n" "$host" "$service"
+    done < <(configured_ssh_routes 2>/dev/null || true)
+    if [ "$route_count" -eq 0 ]; then
         warn "  No SSH routes found in tunnel config"
+        pause
+        return
     fi
+
+    echo ""
+    step "Public SSH route checks:"
+    echo ""
+    while IFS=$'\t' read -r host service; do
+        [ -n "$host" ] || continue
+        if check_public_ssh_route "$host"; then
+            printf "    ${G}%s${NC} → SSH origin reachable\n" "$host"
+        else
+            printf "    ${R}%s${NC} → %s\n" "$host" "$PUBLIC_SSH_ROUTE_ERROR"
+        fi
+    done < <(configured_ssh_routes 2>/dev/null || true)
 
     pause
 }
@@ -527,16 +709,32 @@ server_add_ssh_route() {
     ssh_port="${ssh_port:-22}"
 
     echo ""
-    step "Adding route: ${ssh_hostname} → ssh://localhost:${ssh_port}\n"
-    echo ""
+    step "Adding route: ${ssh_hostname} → ssh://localhost:${ssh_port}"
+    printf '\n'
 
     if [ -x "$SCRIPT_DIR/add-tunnel-route.sh" ]; then
         "$SCRIPT_DIR/add-tunnel-route.sh" --config "$CONFIG_FILE" \
             --hostname "$ssh_hostname" --service "ssh://localhost:${ssh_port}"
         info "SSH route added successfully"
-        reload_cloudflared_after_route_change
+        if ! reload_cloudflared_after_route_change; then
+            error "Route was saved, but the connector could not be reloaded"
+            pause
+            return
+        fi
+        step "Verifying public SSH handshake... "
+        if check_public_ssh_route "$ssh_hostname"; then
+            printf "${G}ready${NC}\n"
+        else
+            printf "${R}failed${NC}\n"
+            error "$PUBLIC_SSH_ROUTE_ERROR"
+            error "The route was not verified; setup is incomplete"
+            pause
+            return
+        fi
     else
         error "add-tunnel-route.sh not found or not executable"
+        pause
+        return
     fi
 
     pause
@@ -544,25 +742,21 @@ server_add_ssh_route() {
 
 # ── start/stop tunnel ─────────────────────────────────────────────────────────
 server_start_tunnel() {
+    local runtime
     header "Server: Start Tunnel"
     echo ""
 
-    if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE" 2>/dev/null)" 2>/dev/null; then
-        info "Tunnel already running (PID $(cat "$PID_FILE"))"
+    if runtime="$(tunnel_runtime_status)"; then
+        info "Tunnel already running via $runtime"
         pause
         return
     fi
 
-    if [ -x "$SCRIPT_DIR/tunnel-start.sh" ]; then
-        "$SCRIPT_DIR/tunnel-start.sh"
-        sleep 1
-        if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE" 2>/dev/null)" 2>/dev/null; then
-            info "Tunnel started (PID $(cat "$PID_FILE"))"
-        else
-            error "Tunnel may not have started. Check logs: $LOG_FILE"
-        fi
+    if reload_cloudflared_after_route_change; then
+        runtime="$(tunnel_runtime_status 2>/dev/null || true)"
+        info "Tunnel started via ${runtime:-configured service}"
     else
-        error "tunnel-start.sh not found"
+        error "Tunnel failed to start; check $LOG_FILE"
     fi
     pause
 }
@@ -571,12 +765,7 @@ server_stop_tunnel() {
     header "Server: Stop Tunnel"
     echo ""
 
-    if [ -x "$SCRIPT_DIR/tunnel-stop.sh" ]; then
-        "$SCRIPT_DIR/tunnel-stop.sh"
-        info "Done"
-    else
-        error "tunnel-stop.sh not found"
-    fi
+    stop_cloudflared_connector || true
     pause
 }
 
@@ -766,6 +955,19 @@ server_register_repository() (
     info "SSH mode: $ssh_mode"
     [ -n "$ssh_hostname" ] && info "SSH hostname: $ssh_hostname"
 
+    if [ "$ssh_mode" = "tunnel" ]; then
+        step "Verifying public SSH route before registration... "
+        if check_public_ssh_route "$ssh_hostname"; then
+            printf "${G}ready${NC}\n"
+        else
+            printf "${R}failed${NC}\n"
+            error "$PUBLIC_SSH_ROUTE_ERROR"
+            error "Fix the tunnel/DNS route before publishing this server"
+            pause
+            return
+        fi
+    fi
+
     temp_dir="$(mktemp -d)"
     trap 'rm -rf "$temp_dir"' EXIT
     body_file="$temp_dir/serverlist.json"
@@ -923,21 +1125,19 @@ https://pkg.cloudflare.com/cloudflared $(. /etc/os-release && echo "$VERSION_COD
     echo -e "  ${BOLD}Step 3/4: Tunnel${NC}"
     hr
     if [ -f "$CONFIG_FILE" ]; then
-        local tunnel_name
-        tunnel_name=$(grep '^tunnel:' "$CONFIG_FILE" | awk '{print $2}')
-        info "Tunnel config found: ${tunnel_name}"
+        local tunnel_name runtime
+        tunnel_name="$(configured_tunnel_name 2>/dev/null || true)"
+        info "Tunnel config found: ${tunnel_name:-unknown}"
 
         step "Checking tunnel process... "
-        if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE" 2>/dev/null)" 2>/dev/null; then
-            printf "${G}running${NC}\n"
+        if runtime="$(tunnel_runtime_status)"; then
+            printf "${G}running (%s)${NC}\n" "$runtime"
         else
             printf "${Y}starting...${NC}\n"
-            [ -x "$SCRIPT_DIR/tunnel-start.sh" ] && "$SCRIPT_DIR/tunnel-start.sh"
-            sleep 1
-            if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE" 2>/dev/null)" 2>/dev/null; then
-                info "Tunnel started"
-            else
-                warn "Could not start tunnel. Check logs."
+            if ! reload_cloudflared_after_route_change; then
+                error "Could not start tunnel; check $LOG_FILE"
+                pause
+                return
             fi
         fi
     else
@@ -967,10 +1167,25 @@ https://pkg.cloudflare.com/cloudflared $(. /etc/os-release && echo "$VERSION_COD
         "$SCRIPT_DIR/add-tunnel-route.sh" --config "$CONFIG_FILE" \
             --hostname "$ssh_hostname" --service "ssh://localhost:${ssh_port}"
         info "SSH route configured"
-        reload_cloudflared_after_route_change
+        if ! reload_cloudflared_after_route_change; then
+            error "Route was saved, but the connector could not be reloaded"
+            pause
+            return
+        fi
     else
         error "add-tunnel-route.sh not found or not executable"
         pause; return
+    fi
+
+    step "Verifying public SSH handshake... "
+    if check_public_ssh_route "$ssh_hostname"; then
+        printf "${G}ready${NC}\n"
+    else
+        printf "${R}failed${NC}\n"
+        error "$PUBLIC_SSH_ROUTE_ERROR"
+        error "Server setup is incomplete and was not reported as successful"
+        pause
+        return
     fi
 
     echo ""
