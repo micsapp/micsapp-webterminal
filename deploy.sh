@@ -45,6 +45,7 @@ usage() {
 Usage:
   ./deploy.sh              Deploy/start services (only starts what's down)
   ./deploy.sh --restart    Force restart all components
+  ./deploy.sh --refresh-web  Redeploy/restart only nginx and the auth web app
   ./deploy.sh --status     Show current health/status only
   ./deploy.sh --remote-setup  Configure/test remote SSH tabs, then deploy
   ./deploy.sh --status --public-url https://example.com
@@ -1020,6 +1021,51 @@ status_report() {
   return "$rc"
 }
 
+# Refresh only the components that serve the browser application. This is used
+# by server registration to make an existing installation embeddable without
+# interrupting sshd or restarting a healthy Cloudflare connector.
+refresh_web_services() {
+  local public_url="${1:-}"
+  local dest_conf nginx_conf_changed=false had_failure=false
+
+  need_cmd python3
+  need_cmd nginx
+  dest_conf="$(detect_nginx_conf_dest)"
+
+  say ""
+  say "=== Refreshing Web Terminal services ==="
+  install_nginx_conf "$dest_conf" && nginx_conf_changed=true
+
+  if ! check_nginx; then
+    start_nginx || had_failure=true
+    reload_nginx 2>/dev/null || true
+  elif $nginx_conf_changed; then
+    reload_nginx || had_failure=true
+  else
+    say "[OK]  nginx (:${NGINX_PORT})"
+  fi
+
+  stop_auth_service
+  start_auth_service || had_failure=true
+
+  if ! check_nginx; then
+    err "nginx is not healthy after the Web Terminal refresh"
+    had_failure=true
+  fi
+  if ! check_auth; then
+    err "auth service is not healthy after the Web Terminal refresh"
+    had_failure=true
+  fi
+
+  say ""
+  say "=== Web Terminal refresh complete ==="
+  [ -n "$public_url" ] && say "Public URL: ${public_url%/}/login"
+  if $had_failure; then
+    return 1
+  fi
+  return 0
+}
+
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 main() {
@@ -1027,6 +1073,7 @@ main() {
   local public_url=""
   local force_restart=false
   local remote_setup=false
+  local refresh_web=false
 
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -1040,6 +1087,10 @@ main() {
         ;;
       --restart)
         force_restart=true
+        shift
+        ;;
+      --refresh-web)
+        refresh_web=true
         shift
         ;;
       --remote-setup)
@@ -1077,6 +1128,11 @@ main() {
       return 1
       ;;
   esac
+
+  if $refresh_web; then
+    refresh_web_services "$public_url"
+    return $?
+  fi
 
   ensure_linux_deps
   need_cmd python3

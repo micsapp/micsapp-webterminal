@@ -252,6 +252,13 @@ the repository kind/schema, preserves existing entry metadata, increments the
 repository revision only when values change, and uses Droppy's `ETag` with
 `If-Match` so a concurrent edit is not silently overwritten.
 
+Every register/update action now verifies the server's live framing headers
+before uploading its catalog entry. If it detects the old `SAMEORIGIN`
+policy, it automatically runs `./deploy.sh --refresh-web` to refresh
+only nginx and the auth web app; it does not restart sshd or a healthy
+Cloudflare connector. Registration stops if the public server still cannot be
+embedded, so future catalog entries cannot silently reintroduce this problem.
+
 When the catalog is refreshed, web-terminal checks enabled `ssh_mode: "tunnel"`
 entries and appends a Cloudflare `ProxyCommand` stanza only when the exact
 `ssh_hostname` has no existing `Host` entry in `~/.ssh/config`. The sync is

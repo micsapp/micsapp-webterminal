@@ -13,6 +13,29 @@ fail() {
 unset WEBTERMINAL_SERVER_REPO_URL WEBTERMINAL_SERVER_REPO_PASSCODE
 source "$TEST_ROOT_DIR/deploy.sh"
 
+# Registration uses this narrow refresh path so it cannot disturb a healthy SSH
+# daemon or Cloudflare connector.
+(
+  refresh_log="$TEST_TMP_DIR/refresh.log"
+  detect_nginx_conf_dest() { printf '%s\n' "$TEST_TMP_DIR/nginx.conf"; }
+  need_cmd() { :; }
+  install_nginx_conf() { printf 'nginx-install\n' >> "$refresh_log"; return 0; }
+  check_nginx() { return 0; }
+  reload_nginx() { printf 'nginx-reload\n' >> "$refresh_log"; }
+  stop_auth_service() { printf 'auth-stop\n' >> "$refresh_log"; }
+  start_auth_service() { printf 'auth-start\n' >> "$refresh_log"; }
+  check_auth() { return 0; }
+  refresh_web_services 'https://demo.example.com' >/dev/null
+  grep -Fxq 'nginx-install' "$refresh_log" \
+    || fail "web refresh did not install the nginx config"
+  grep -Fxq 'nginx-reload' "$refresh_log" \
+    || fail "web refresh did not reload nginx"
+  grep -Fxq 'auth-stop' "$refresh_log" \
+    || fail "web refresh did not stop the stale auth app"
+  grep -Fxq 'auth-start' "$refresh_log" \
+    || fail "web refresh did not start the current auth app"
+)
+
 SERVER_REPO_CONFIG="$TEST_TMP_DIR/config/server-repo.conf"
 SERVER_REPO_HELPER="$TEST_ROOT_DIR/server-repo.py"
 REMOTE_SSH_CONFIG="$TEST_TMP_DIR/ssh/config"

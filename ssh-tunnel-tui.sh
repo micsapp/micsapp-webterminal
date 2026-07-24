@@ -14,6 +14,7 @@ DEFAULT_SERVER_REPO_URL="https://tnas_d.micsapp.com/s/web-terminal-servers/serve
 SERVER_REPO_URL="${WEBTERMINAL_SERVER_REPO_URL:-}"
 SERVER_REPO_PASSCODE="${WEBTERMINAL_SERVER_REPO_PASSCODE:-}"
 SERVER_REPO_HELPER="$SCRIPT_DIR/server-repo.py"
+WEBTERMINAL_EMBED_ORIGINS="${WEBTERMINAL_FRAME_ORIGINS:-https://*.micstec.com https://*.wetigu.com}"
 
 # ── colours ────────────────────────────────────────────────────────────────────
 R='\033[0;31m'; G='\033[0;32m'; Y='\033[1;33m'; B='\033[0;34m'; C='\033[0;36m'
@@ -188,6 +189,73 @@ server_repo_get() {
         -D "$headers_file" -o "$body_file" -w '%{http_code}' \
         -H "@$auth_header_file" \
         "$SERVER_REPO_URL"
+}
+
+webterminal_headers_allow_embedding() {
+    local headers="$1" csp origin directive directive_value
+    headers="$(printf '%s\n' "$headers" | tr -d '\r')"
+
+    if printf '%s\n' "$headers" | grep -qi '^x-frame-options:'; then
+        return 1
+    fi
+    csp="$(printf '%s\n' "$headers" | awk '
+        tolower($1) == "content-security-policy:" {
+            sub(/^[^:]*:[[:space:]]*/, "")
+            print
+            exit
+        }
+    ')"
+    [ -n "$csp" ] || return 1
+
+    for directive in frame-src frame-ancestors; do
+        directive_value="$(printf '%s\n' "$csp" | tr ';' '\n' | awk -v name="$directive" '
+            $1 == name {
+                $1 = ""
+                sub(/^[[:space:]]*/, "")
+                print
+                exit
+            }
+        ')"
+        [ -n "$directive_value" ] || return 1
+        printf ' %s ' "$directive_value" | grep -Fq " 'self' " || return 1
+        for origin in $WEBTERMINAL_EMBED_ORIGINS; do
+            printf ' %s ' "$directive_value" | grep -Fq " $origin " || return 1
+        done
+    done
+}
+
+webterminal_embedding_ready() {
+    local web_hostname="$1" check_url headers
+    check_url="${WEBTERMINAL_EMBED_CHECK_URL:-https://${web_hostname}/login}"
+    if ! headers="$(curl -sS --connect-timeout 10 --max-time 30 \
+        -D - -o /dev/null "$check_url")"; then
+        return 1
+    fi
+    webterminal_headers_allow_embedding "$headers"
+}
+
+ensure_webterminal_embedding() {
+    local web_hostname="$1"
+    if webterminal_embedding_ready "$web_hostname"; then
+        info "Embedded Web Terminal policy: ready"
+        return 0
+    fi
+
+    warn "Web Terminal still blocks trusted embedded tabs; refreshing it now"
+    if [ ! -x "$SCRIPT_DIR/deploy.sh" ]; then
+        error "Cannot refresh automatically: $SCRIPT_DIR/deploy.sh is missing or not executable"
+        return 1
+    fi
+    if ! "$SCRIPT_DIR/deploy.sh" --refresh-web \
+        --public-url "https://${web_hostname}"; then
+        error "Web Terminal refresh failed; this server was not registered"
+        return 1
+    fi
+    if ! webterminal_embedding_ready "$web_hostname"; then
+        error "Public Web Terminal still rejects trusted embedding; this server was not registered"
+        return 1
+    fi
+    info "Embedded Web Terminal policy: ready"
 }
 
 reload_cloudflared_after_route_change() {
@@ -643,6 +711,10 @@ server_register_repository() (
     fi
 
     info "Web hostname: $web_hostname"
+    if ! ensure_webterminal_embedding "$web_hostname"; then
+        pause
+        return
+    fi
     echo ""
     echo -e "  ${BOLD}How should clients connect with SSH?${NC}"
     menu_item 1 "Cloudflare tunnel SSH"

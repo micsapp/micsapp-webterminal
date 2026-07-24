@@ -74,6 +74,12 @@ iframe tab. Framing remains limited to the trusted HTTPS origins configured by
 `wetigu.com` subdomains. Remote login sessions remain independent, use Secure
 `SameSite=None` cookies, and are never converted into local tmux sessions.
 
+Registration checks the destination's live CSP and rejects
+`X-Frame-Options`. If an older deployment is detected,
+`deploy.sh --refresh-web` refreshes only nginx and the auth web app
+before the catalog update is uploaded. This makes the framing requirement part
+of every future register/update operation.
+
 The SSH-backed option remains separate and continues to provide the locally
 managed tmux session, reconnect, session-list, and shell settings behavior.
 

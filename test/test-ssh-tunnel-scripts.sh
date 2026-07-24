@@ -52,6 +52,18 @@ EOF
     || fail "TUI did not load the TNAS repository default"
   [ "$DEFAULT_SERVER_REPO_URL" = "https://tnas_d.micsapp.com/s/web-terminal-servers/serverlist.json" ] \
     || fail "TUI does not default to the TNAS server repository"
+
+  GOOD_EMBED_HEADERS="HTTP/2 200
+Content-Security-Policy: default-src 'self'; frame-src 'self' https://*.micstec.com https://*.wetigu.com; frame-ancestors 'self' https://*.micstec.com https://*.wetigu.com
+"
+  webterminal_headers_allow_embedding "$GOOD_EMBED_HEADERS" \
+    || fail "valid Web Terminal embedding headers were rejected"
+  if webterminal_headers_allow_embedding "$GOOD_EMBED_HEADERS"$'X-Frame-Options: SAMEORIGIN\n'; then
+    fail "X-Frame-Options was accepted for an embedded Web Terminal"
+  fi
+  if webterminal_headers_allow_embedding "Content-Security-Policy: frame-src 'self'; frame-ancestors 'self'"; then
+    fail "a CSP without the trusted fleet origins was accepted"
+  fi
 )
 
 "$TEST_ROOT_DIR/add-tunnel-route.sh" --config "$TEST_CONFIG" \
@@ -152,6 +164,7 @@ TEST_REPO_UPLOAD="$TEST_TMP_DIR/serverlist-upload.json"
 
   header() { :; }
   pause() { :; }
+  ensure_webterminal_embedding() { :; }
   curl() {
     local method="GET" output_file="" headers_file="" data_file="" auth_file=""
     local if_match="" previous="" argument
