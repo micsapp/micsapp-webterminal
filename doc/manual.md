@@ -62,6 +62,24 @@ connection may ask you to verify the remote host fingerprint, and SSH may ask
 for a password if you have not configured a key. The web application does not
 save that password.
 
+### Enabling remote servers
+
+Remote servers are disabled until the deployment has a valid protected
+repository configuration. Run this on the web-terminal server:
+
+```bash
+./deploy.sh --remote-setup
+```
+
+Enter the TNAS/Droppy URL and passcode when prompted. The command validates the
+server list, saves it in
+`~/.config/micsapp-webterminal/server-repo.conf`, installs the local SSH tools,
+deploys the API routes, and restarts the auth service. If that file is absent,
+the remote-server menu remains empty, even if environment variables are set.
+
+Each destination must still be registered with direct or tunnel SSH and the
+web-terminal user must have a matching remote account and SSH credentials.
+
 Tabs are backed by tmux grouped sessions. Closing a tab detaches the tmux client but the underlying tmux window and its processes keep running. Reopening or reconnecting reattaches to the same window.
 
 ---

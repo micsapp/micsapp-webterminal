@@ -2,10 +2,19 @@
 
 ## Status
 
-Implemented in web-terminal 1.2.0. The protected Droppy repository is the
+Implemented in web-terminal 1.2.0+. The protected Droppy repository is the
 catalog source; `ssh_mode` selects direct or Cloudflare-tunneled SSH. The
 browser stores only the approved server ID and tmux slot, and the backend
 revalidates that ID before creating or restoring a remote window.
+
+
+Remote setup is opt-in per deployment. `./deploy.sh --remote-setup` prompts for
+the repository URL and passcode, validates the list, saves the protected
+per-user config, installs the local tunnel client if needed, deploys the Nginx
+API routes, and restarts the auth service. If
+`~/.config/micsapp-webterminal/server-repo.conf` is absent, the API returns an
+empty catalog and the UI shows no remote servers, regardless of cached data or
+environment variables.
 
 ## Decision
 
@@ -21,7 +30,7 @@ The **+ New Tab** control becomes a split button or menu:
 - Production
 - Staging
 - NAS
-- Manage Servers…
+- Configured remote servers
 
 Selecting a remote system creates a normal terminal tab, for example:
 
@@ -70,6 +79,30 @@ Directly loading another web-terminal inside an iframe conflicts with the curren
 A full federation design would require secure WebSocket relaying, target-server tokens, session mapping, reconnect synchronization, and server-aware file and desktop APIs. SSH-backed tabs avoid that complexity while delivering the main capability: terminals on multiple systems in one browser window.
 
 ## Server configuration
+
+Each destination is registered in the shared `micsapp-webterminal-server-list`
+JSON document. Tunnel mode expects a Cloudflare SSH hostname; direct mode
+expects a publicly reachable SSH hostname:
+
+```json
+{
+  "id": "minipc2.micstec.com",
+  "name": "minipc2",
+  "web_hostname": "minipc2.micstec.com",
+  "ssh_mode": "tunnel",
+  "ssh_hostname": "ssh-minipc2.micstec.com",
+  "enabled": true
+}
+```
+
+Register or update a destination with `ssh-tunnel-tui.sh` server mode. The
+destination still needs a working `sshd` and either a Cloudflare SSH ingress or
+direct network reachability. Each web-terminal user also needs a matching
+remote account and SSH key, SSH config, or interactive password.
+
+The legacy alias examples below describe the equivalent per-user SSH settings;
+the catalog itself stores `ssh_hostname` and `ssh_mode`, not shell commands.
+
 
 Remote targets should be defined as SSH host aliases. Each web-terminal user can configure aliases in `~/.ssh/config`:
 
