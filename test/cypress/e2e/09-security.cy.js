@@ -121,14 +121,15 @@ describe('Security', () => {
       });
     });
 
-    it('should set X-Frame-Options', () => {
+    it('should restrict framing to trusted web-terminal origins', () => {
       cy.request({
         url: '/login',
       }).then((resp) => {
-        const header = resp.headers['x-frame-options'];
-        if (header) {
-          expect(header).to.match(/DENY|SAMEORIGIN/i);
-        }
+        expect(resp.headers['x-frame-options']).to.be.undefined;
+        const csp = resp.headers['content-security-policy'];
+        expect(csp).to.include("frame-ancestors 'self'");
+        expect(csp).to.include('https://*.micstec.com');
+        expect(csp).to.include('https://*.wetigu.com');
       });
     });
 
@@ -178,7 +179,7 @@ describe('Security', () => {
       });
     });
 
-    it('should set SameSite=Strict', () => {
+    it('should set SameSite=None for embedded remote terminals', () => {
       cy.request({
         method: 'POST',
         url: '/api/login',
@@ -191,7 +192,7 @@ describe('Security', () => {
 
       cy.getCookie(Cypress.env('COOKIE_NAME')).then((cookie) => {
         expect(cookie).to.not.be.null;
-        expect(cookie.sameSite).to.eq('strict');
+        expect(cookie.sameSite).to.eq('no_restriction');
       });
     });
 

@@ -252,15 +252,34 @@ the repository kind/schema, preserves existing entry metadata, increments the
 repository revision only when values change, and uses Droppy's `ETag` with
 `If-Match` so a concurrent edit is not silently overwritten.
 
-### Remote SSH tabs
+When the catalog is refreshed, web-terminal checks enabled `ssh_mode: "tunnel"`
+entries and appends a Cloudflare `ProxyCommand` stanza only when the exact
+`ssh_hostname` has no existing `Host` entry in `~/.ssh/config`. The sync is
+strictly additive: it does not add web-host aliases or direct SSH entries, and
+it never rewrites, reorders, updates, or removes existing SSH configuration.
+`./deploy.sh --remote-setup` performs the same check immediately.
 
-The arrow beside **+ New Tab** loads enabled SSH targets from the protected
-server repository. Selecting one creates a tmux-backed tab on the current
-web-terminal server and starts SSH as the authenticated web-terminal user:
+### Remote server connections
+
+The arrow beside **+ New Tab** groups two connection choices beneath every
+enabled server from the protected repository:
+
+- **Web Terminal** opens `https://<web_hostname>/` inside an internal app tab.
+- **SSH Session** creates a tmux-backed tab on the current web-terminal server
+  and starts SSH as the authenticated web-terminal user.
+
+The SSH action automatically follows the registered connection mode:
 
 - `ssh_mode: "direct"` runs regular SSH to `ssh_hostname`.
 - `ssh_mode: "tunnel"` uses `cloudflared access ssh` as SSH's `ProxyCommand`.
 - `ssh_mode: "none"` and disabled entries are not shown.
+
+Embedded Web Terminal tabs are restored by server ID, so arbitrary URLs are
+never persisted in browser tab state. HTML framing is restricted by default to
+HTTPS subdomains of `micstec.com` and `wetigu.com`; override the space-separated
+allowlist with `WEBTERMINAL_FRAME_ORIGINS`. Participating remote installations
+must run this framing policy, and Secure login cookies use `SameSite=None` so
+their authenticated session can operate inside a cross-site iframe.
 
 The browser receives only the server ID, display name, web hostname, and SSH
 mode. The SSH target and Droppy passcode stay on the server. Remote passwords
@@ -318,7 +337,7 @@ before reconnecting to the existing tmux window.
 **Session cookie format:** `username:timestamp:hmac_signature`
 - Signed with a random secret key (regenerated on restart)
 - Expires after 24 hours
-- `HttpOnly` + `SameSite=Strict` flags for security
+- `HttpOnly` + `Secure` + `SameSite=None` flags for authenticated embedded tabs
 
 **Location:** `/Users/mli/ttyd-auth/auth.py`
 **Port:** 7682 (localhost only)
@@ -459,7 +478,8 @@ tail -f ~/Library/Logs/ttyd-auth.log                        # auth
 - **All services bind to localhost:** nginx, ttyd instances, and the auth service only listen on 127.0.0.1.
 - **Per-user isolation:** Each user's terminal runs under their own system UID via SSH. Users cannot access each other's shells.
 - **HTTPS enforced:** Cloudflare terminates TLS. Browser ↔ Cloudflare is HTTPS. Cloudflare ↔ tunnel is encrypted via QUIC.
-- **Session cookies:** HMAC-SHA256 signed, HttpOnly, SameSite=Strict. 24-hour expiry.
+- **Session cookies:** HMAC-SHA256 signed, HttpOnly, Secure, SameSite=None. 24-hour expiry.
+- **Restricted embedding:** CSP permits framing only among configured trusted web-terminal origins.
 - **Auth on every request:** nginx `auth_request` checks the session cookie on every protected route, including WebSocket upgrades.
 - **No client-side software required:** Only a web browser is needed to access the terminal.
 

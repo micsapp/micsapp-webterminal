@@ -15,6 +15,16 @@ source "$TEST_ROOT_DIR/deploy.sh"
 
 SERVER_REPO_CONFIG="$TEST_TMP_DIR/config/server-repo.conf"
 SERVER_REPO_HELPER="$TEST_ROOT_DIR/server-repo.py"
+REMOTE_SSH_CONFIG="$TEST_TMP_DIR/ssh/config"
+mkdir -p "$(dirname "$REMOTE_SSH_CONFIG")"
+printf '%s\n' \
+  'Host ssh-existing.example.com' \
+  '    HostName ssh-existing.example.com' \
+  '    User original-user' \
+  '    ProxyCommand /original/cloudflared access ssh --hostname %h' \
+  '' \
+  'Host web-terminal.example.com' \
+  '    User web-user' > "$REMOTE_SSH_CONFIG"
 
 fetch_remote_repository() {
   local repo_url="$1" passcode="$2" output_file="$3"
@@ -26,7 +36,11 @@ fetch_remote_repository() {
     '{"kind":"micsapp-webterminal-server-list","schema_version":2,"revision":9,' \
     '"servers":[{"id":"remote.example.com","name":"remote","web_hostname":' \
     '"remote.example.com","ssh_mode":"direct","ssh_hostname":"remote.example.com",' \
-    '"enabled":true}]}' > "$output_file"
+    '"enabled":true},{"id":"existing.example.com","ssh_mode":"tunnel",' \
+    '"ssh_hostname":"ssh-existing.example.com","enabled":true},' \
+    '{"id":"new.example.com","web_hostname":"web-terminal.example.com",' \
+    '"ssh_mode":"tunnel","ssh_hostname":"ssh-new.example.com","enabled":true}]}' \
+    > "$output_file"
 }
 
 ensure_remote_client_tools() {
@@ -51,6 +65,17 @@ printf '%s' "$setup_output" | grep -Fq 'Saved repository configuration:' \
   || fail "setup did not report the saved configuration"
 printf '%s' "$setup_output" | grep -Fq 'remote.example.com' \
   || fail "setup did not display the validated repository"
+grep -Fq 'Host ssh-new.example.com' "$REMOTE_SSH_CONFIG" \
+  || fail "new tunnel SSH hostname was not appended"
+[ "$(grep -Fc 'Host ssh-existing.example.com' "$REMOTE_SSH_CONFIG")" = "1" ] \
+  || fail "existing tunnel SSH hostname was duplicated"
+if grep -Fq 'Host remote.example.com' "$REMOTE_SSH_CONFIG"; then
+  fail "direct SSH hostname must not be added by proxy sync"
+fi
+[ "$(grep -Fc 'Host web-terminal.example.com' "$REMOTE_SSH_CONFIG")" = "1" ] \
+  || fail "web hostname was added as a tunnel alias"
+[ "$(sed -n '3p' "$REMOTE_SSH_CONFIG")" = '    User original-user' ] \
+  || fail "existing SSH config content was changed"
 if printf '%s' "$setup_output" | grep -Fq 'test-passcode'; then
   fail "setup printed the protected passcode"
 fi
@@ -63,5 +88,7 @@ EOF
 )"
 printf '%s' "$second_output" | grep -Fq 'remote.example.com' \
   || fail "saved URL/passcode were not reused"
+[ "$(grep -Fc 'Host ssh-new.example.com' "$REMOTE_SSH_CONFIG")" = "1" ] \
+  || fail "repeated sync duplicated the new tunnel SSH hostname"
 
 printf 'PASS: deploy --remote-setup configuration\n'

@@ -35,6 +35,7 @@ CF_TMUX_SESSION="cloudflared"
 DEFAULT_SERVER_REPO_URL="https://tnas_d.micsapp.com/s/web-terminal-servers/serverlist.json"
 SERVER_REPO_CONFIG="${WEBTERMINAL_SERVER_REPO_CONFIG:-$HOME/.config/micsapp-webterminal/server-repo.conf}"
 SERVER_REPO_HELPER="${PROJECT_DIR}/server-repo.py"
+REMOTE_SSH_CONFIG="${WEBTERMINAL_SSH_CONFIG:-$HOME/.ssh/config}"
 
 say() { printf '%s\n' "$*"; }
 err() { printf 'ERROR: %s\n' "$*" >&2; }
@@ -140,6 +141,17 @@ save_remote_repo_settings() {
   mv "$settings_tmp" "$SERVER_REPO_CONFIG"
 }
 
+append_new_tunnel_ssh_hosts() {
+  local repo_file="$1"
+  local cloudflared_bin ssh_user sync_result
+  cloudflared_bin="${CLOUDFLARED_BIN:-$(command -v cloudflared 2>/dev/null || printf '%s' cloudflared)}"
+  ssh_user="${WEBTERMINAL_REMOTE_SSH_USER:-$(id -un)}"
+  sync_result="$(python3 "$SERVER_REPO_HELPER" sync-ssh-config "$repo_file" \
+    --config "$REMOTE_SSH_CONFIG" --user "$ssh_user" \
+    --cloudflared "$cloudflared_bin")" || return 1
+  say "SSH proxy config: ${sync_result}"
+}
+
 configure_remote_repository() {
   load_remote_repo_settings
 
@@ -198,11 +210,12 @@ configure_remote_repository() {
   say "Saved repository configuration: $SERVER_REPO_CONFIG (mode 600)"
   say ""
   sed -n '1,40p' "$display_file"
-  rm -f "$repo_file" "$display_file"
-  rmdir "$work_dir" 2>/dev/null || true
 
   say ""
   ensure_remote_client_tools
+  append_new_tunnel_ssh_hosts "$repo_file"
+  rm -f "$repo_file" "$display_file"
+  rmdir "$work_dir" 2>/dev/null || true
   say "Remote repository and local SSH client are ready."
 }
 

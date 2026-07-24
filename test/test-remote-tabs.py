@@ -39,6 +39,7 @@ def repository_document():
             },
             {
                 "id": "legacy.example.com",
+                "web_hostname": "legacy.example.com/path",
                 "ssh_hostname": "ssh-legacy.example.com",
                 "enabled": True,
             },
@@ -65,6 +66,7 @@ def repository_document():
 
 class RemoteTabTests(unittest.TestCase):
     def setUp(self):
+        auth.SSH_CONFIG_SYNC_SIGNATURE = ""
         with auth.SERVER_REPO_LOCK:
             auth.SERVER_REPO_CACHE.update({"expires": 0.0, "servers": [], "error": ""})
 
@@ -75,6 +77,7 @@ class RemoteTabTests(unittest.TestCase):
             ["minipc2.micstec.com", "dev-ssh.wetigu.com", "legacy.example.com"],
         )
         self.assertEqual(servers[2]["ssh_mode"], "tunnel")
+        self.assertEqual(servers[2]["web_hostname"], "")
         public = auth.public_server_catalog(servers)
         self.assertNotIn("ssh_hostname", public[0])
         self.assertEqual(public[1]["ssh_mode"], "direct")
@@ -154,6 +157,30 @@ class RemoteTabTests(unittest.TestCase):
         self.assertNotIn("StrictHostKeyChecking=no", tunnel_script)
         self.assertNotIn("StrictHostKeyChecking=no", direct_script)
 
+    def test_catalog_sync_passes_only_tunnel_hosts_once(self):
+        servers = auth.validate_server_repository(repository_document())
+        fake_run = mock.Mock(
+            return_value=types.SimpleNamespace(
+                returncode=0,
+                stdout=b"added 1: ssh-new.example.com\n",
+                stderr=b"",
+            )
+        )
+        with mock.patch.object(auth, "SERVER_REPO_HELPER", __file__), mock.patch.object(
+            auth, "SSH_CONFIG_FILE", "/tmp/test-ssh-config"
+        ), mock.patch.object(auth, "REMOTE_SSH_USER", "mli"), mock.patch.object(
+            auth.subprocess, "run", fake_run
+        ):
+            self.assertEqual(auth.append_new_tunnel_ssh_hosts(servers), "")
+            self.assertEqual(auth.append_new_tunnel_ssh_hosts(servers), "")
+
+        fake_run.assert_called_once()
+        payload = json.loads(fake_run.call_args.kwargs["input"])
+        self.assertEqual(
+            [server["ssh_hostname"] for server in payload["servers"]],
+            ["ssh-minipc2.micstec.com", "ssh-legacy.example.com"],
+        )
+
     def test_nginx_exposes_remote_tab_api(self):
         root = pathlib.Path(__file__).resolve().parents[1]
         for relative_path in ("nginx/ttyd.conf", "cf_tunnel_install.sh"):
@@ -165,8 +192,22 @@ class RemoteTabTests(unittest.TestCase):
         self.assertIn('id="remoteTabMenu"', auth.APP_HTML)
         self.assertIn("/api/servers", auth.APP_HTML)
         self.assertIn("/api/remote-tab", auth.APP_HTML)
+        self.assertIn("'Web Terminal'", auth.APP_HTML)
+        self.assertIn("'SSH Session'", auth.APP_HTML)
+        self.assertIn("function addRemoteWebTab(serverId)", auth.APP_HTML)
+        self.assertIn("type: 'web'", auth.APP_HTML)
+        self.assertIn("'https://' + server.web_hostname + '/'", auth.APP_HTML)
+        self.assertIn("tabs.filter(isTerminalTab)", auth.APP_HTML)
         self.assertIn("serverId: t.serverId", auth.APP_HTML)
         self.assertNotIn("sshHostname: t.sshHostname", auth.APP_HTML)
+        self.assertNotIn("webHostname: t.webHostname", auth.APP_HTML)
+
+    def test_trusted_origins_can_embed_web_terminal_html(self):
+        headers = auth.HTML_ONLY_SECURITY_HEADERS
+        self.assertNotIn("X-Frame-Options", headers)
+        csp = headers["Content-Security-Policy"]
+        self.assertIn("frame-src 'self' https://*.micstec.com https://*.wetigu.com", csp)
+        self.assertIn("frame-ancestors 'self' https://*.micstec.com https://*.wetigu.com", csp)
 
 
 if __name__ == "__main__":

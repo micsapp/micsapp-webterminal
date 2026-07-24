@@ -2,6 +2,7 @@
 """Tiny auth service for ttyd web terminal."""
 
 import base64
+import getpass
 import hashlib
 import hmac
 import http.server
@@ -15,6 +16,7 @@ import shutil
 import socket
 import struct
 import subprocess
+import sys
 import threading
 import time
 import urllib.parse
@@ -57,6 +59,13 @@ PORT = int(os.environ.get("AUTH_PORT", "7682"))
 ACCESS_LOG_ENABLED = env_bool("ACCESS_LOG_ENABLED", False)
 COOKIE_NAME = os.environ.get("SESSION_COOKIE_NAME", "__Host-ttyd_session")
 COOKIE_SECURE = env_bool("COOKIE_SECURE", True)
+FRAME_ORIGINS = " ".join(
+    origin for origin in os.environ.get(
+        "WEBTERMINAL_FRAME_ORIGINS",
+        "https://*.micstec.com https://*.wetigu.com",
+    ).split()
+    if re.fullmatch(r"https://(?:\*\.)?[A-Za-z0-9.-]+(?::[0-9]{1,5})?", origin)
+)
 
 import platform as _platform
 _IS_LINUX = _platform.system() == "Linux"
@@ -85,6 +94,11 @@ SERVER_REPO_CONFIG = os.environ.get(
     os.path.expanduser("~/.config/micsapp-webterminal/server-repo.conf"),
 )
 SERVER_REPO_CACHE_TTL = max(10, int(os.environ.get("WEBTERMINAL_SERVER_REPO_CACHE_TTL", "60")))
+SERVER_REPO_HELPER = os.path.join(BASE_DIR, "server-repo.py")
+SSH_CONFIG_FILE = os.environ.get(
+    "WEBTERMINAL_SSH_CONFIG", os.path.expanduser("~/.ssh/config")
+)
+REMOTE_SSH_USER = os.environ.get("WEBTERMINAL_REMOTE_SSH_USER") or getpass.getuser()
 
 # --- App version / build info (shown in the SPA's About dialog) ---
 APP_VERSION = "1.2.0"
@@ -171,9 +185,9 @@ DEFAULT_SECURITY_HEADERS = {
     "Pragma": "no-cache",
 }
 
-# Apply only to HTML responses. Applying CSP/XFO to PDFs/media can break built-in viewers (e.g. PDF in iframe).
+# Apply only to HTML responses. Trusted web-terminal origins may frame each
+# other; arbitrary sites remain blocked by CSP frame-ancestors.
 HTML_ONLY_SECURITY_HEADERS = {
-    "X-Frame-Options": "SAMEORIGIN",
     "Content-Security-Policy": (
         "default-src 'self'; "
         "script-src 'self' 'unsafe-inline' https://static.cloudflareinsights.com; "
@@ -181,10 +195,10 @@ HTML_ONLY_SECURITY_HEADERS = {
         "img-src 'self' data: blob:; "
         "media-src 'self' data: blob:; "
         "connect-src 'self'; "
-        "frame-src 'self'; "
+        "frame-src 'self' " + FRAME_ORIGINS + "; "
         "object-src 'none'; "
         "base-uri 'none'; "
-        "frame-ancestors 'self'"
+        "frame-ancestors 'self' " + FRAME_ORIGINS
     ),
 }
 
@@ -216,6 +230,8 @@ SERVER_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 SSH_HOST_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,251}[A-Za-z0-9])?$")
 SERVER_REPO_LOCK = threading.RLock()
 SERVER_REPO_CACHE = {"expires": 0.0, "servers": [], "error": ""}
+SSH_CONFIG_SYNC_LOCK = threading.Lock()
+SSH_CONFIG_SYNC_SIGNATURE = ""
 
 
 def _normalize_server_repo_url(value):
@@ -270,6 +286,8 @@ def validate_server_repository(document):
         name = str(raw.get("name") or server_id).strip()
         name = "".join(ch for ch in name if ch >= " " and ch != "\x7f")[:80]
         web_hostname = str(raw.get("web_hostname") or raw.get("hostname") or "").strip()
+        if web_hostname and not SSH_HOST_RE.fullmatch(web_hostname):
+            web_hostname = ""
         servers.append({
             "id": server_id,
             "name": name or server_id,
@@ -367,6 +385,51 @@ def public_server_catalog(servers):
         }
         for server in servers
     ]
+
+
+def append_new_tunnel_ssh_hosts(servers):
+    """Append only missing tunnel-host stanzas to this machine's SSH config."""
+    global SSH_CONFIG_SYNC_SIGNATURE
+    if not os.path.isfile(SERVER_REPO_HELPER):
+        return "server repository helper is unavailable"
+    tunnel_servers = [server for server in servers if server["ssh_mode"] == "tunnel"]
+    document = {
+        "kind": SERVER_REPO_KIND,
+        "schema_version": 2,
+        "servers": tunnel_servers,
+    }
+    payload = json.dumps(document, sort_keys=True, separators=(",", ":")).encode()
+    signature = hashlib.sha256(
+        payload + b"\0" + SSH_CONFIG_FILE.encode() + b"\0" + REMOTE_SSH_USER.encode()
+    ).hexdigest()
+    with SSH_CONFIG_SYNC_LOCK:
+        if signature == SSH_CONFIG_SYNC_SIGNATURE:
+            return ""
+        try:
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    SERVER_REPO_HELPER,
+                    "sync-ssh-config",
+                    "/dev/stdin",
+                    "--config", SSH_CONFIG_FILE,
+                    "--user", REMOTE_SSH_USER,
+                    "--cloudflared", CLOUDFLARED_BIN,
+                ],
+                input=payload,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=8,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return str(exc)
+        if result.returncode != 0:
+            return result.stderr.decode(errors="replace").strip()[:500]
+        SSH_CONFIG_SYNC_SIGNATURE = signature
+        detail = result.stdout.decode(errors="replace").strip()
+        if detail.startswith("added"):
+            print(f"remote SSH proxy config: {detail}", flush=True)
+        return ""
 
 
 def find_server_target(server_id, force=False):
@@ -931,6 +994,8 @@ __PWA_HEAD__
     left: 0;
     min-width: 250px;
     max-width: min(360px, 90vw);
+    max-height: min(70vh, 560px);
+    overflow-y: auto;
     padding: 6px;
     background: #16213e;
     border: 1px solid #0f3460;
@@ -940,6 +1005,7 @@ __PWA_HEAD__
   }
   .remote-tab-menu.open { display: block; }
   .remote-tab-item {
+    display: block;
     width: 100%;
     border: 0;
     background: transparent;
@@ -949,9 +1015,17 @@ __PWA_HEAD__
     cursor: pointer;
     text-align: left;
     font-size: 13px;
+    text-decoration: none;
   }
   .remote-tab-item:hover { background: #0f3460; }
   .remote-tab-item small { display: block; color: #7a7a9e; margin-top: 2px; }
+  .remote-tab-item:disabled { cursor: default; opacity: 0.45; }
+  .remote-tab-item:disabled:hover { background: transparent; }
+  .remote-server-group { padding: 4px 0; }
+  .remote-server-group + .remote-server-group { border-top: 1px solid #0f3460; }
+  .remote-server-title { display: block; padding: 6px 10px 3px; color: #f0f0fa; font-size: 13px; font-weight: 600; }
+  .remote-server-title small { display: block; color: #7a7a9e; margin-top: 2px; font-weight: 400; }
+  .remote-server-action { padding-left: 18px; }
   .remote-tab-empty { color: #7a7a9e; font-size: 12px; padding: 10px; }
   .nav-right { margin-left: auto; display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
 
@@ -2089,7 +2163,7 @@ __PWA_HEAD__
   <div class="new-tab-launcher">
     <button class="nav-btn" onclick="addTab()">&#43; New Tab</button>
     <button class="nav-btn new-tab-caret" id="remoteTabBtn" onclick="toggleRemoteTabMenu(event)"
-      title="Open a remote SSH tab" aria-label="Remote server menu">&#9662;</button>
+      title="Connect to a remote server" aria-label="Remote server menu">&#9662;</button>
     <div class="remote-tab-menu" id="remoteTabMenu">
       <div class="remote-tab-empty">Loading remote servers…</div>
     </div>
@@ -2445,6 +2519,10 @@ let nextWindowSlot = 0;
 let remoteServers = [];
 let remoteCatalogError = '';
 
+function isTerminalTab(tab) {
+  return !!tab && tab.type !== 'desktop' && tab.type !== 'web';
+}
+
 // --- Split Screen System ---
 // splitRoot: null (no split, single pane) or a tree node:
 //   { type:'pane', tabId:'tab-1' }
@@ -2593,11 +2671,11 @@ async function tileSessions(slotFilter) {
   if (!sessions.length) { showToast('No sessions to tile', true); return; }
   // Attach any session that isn't already open as a tab on this device.
   sessions.forEach(s => {
-    if (!tabs.find(t => t.type !== 'desktop' && t.windowSlot === s.slot)) addTab(s.slot, s.name);
+    if (!tabs.find(t => isTerminalTab(t) && t.windowSlot === s.slot)) addTab(s.slot, s.name);
   });
   // Order the tabs to match the session list (slot order).
   const bySlot = {};
-  tabs.filter(t => t.type !== 'desktop' && Number.isInteger(t.windowSlot)).forEach(t => { bySlot[t.windowSlot] = t; });
+  tabs.filter(t => isTerminalTab(t) && Number.isInteger(t.windowSlot)).forEach(t => { bySlot[t.windowSlot] = t; });
   let ordered = sessions.map(s => bySlot[s.slot]).filter(Boolean);
   // Nesting (>2 panes) is desktop-only; cap panes so they stay usable.
   const maxPanes = canNest() ? 9 : 2;
@@ -2957,18 +3035,48 @@ function renderRemoteTabMenu() {
     menu.appendChild(empty);
   } else {
     remoteServers.forEach(server => {
-      const item = document.createElement('button');
-      item.type = 'button';
-      item.className = 'remote-tab-item';
+      const group = document.createElement('div');
+      group.className = 'remote-server-group';
       const title = document.createElement('span');
+      title.className = 'remote-server-title';
       title.textContent = server.name;
       const detail = document.createElement('small');
-      detail.textContent = (server.ssh_mode === 'tunnel' ? 'Cloudflare tunnel' : 'Direct SSH')
-        + (server.web_hostname ? ' · ' + server.web_hostname : '');
-      item.appendChild(title);
-      item.appendChild(detail);
-      item.addEventListener('click', () => addRemoteTab(server.id));
-      menu.appendChild(item);
+      detail.textContent = server.web_hostname || server.id;
+      title.appendChild(detail);
+      group.appendChild(title);
+
+      if (server.web_hostname) {
+        const webItem = document.createElement('button');
+        webItem.type = 'button';
+        webItem.className = 'remote-tab-item remote-server-action';
+        webItem.textContent = 'Web Terminal';
+        const webDetail = document.createElement('small');
+        webDetail.textContent = 'Open in an internal tab';
+        webItem.appendChild(webDetail);
+        webItem.addEventListener('click', () => addRemoteWebTab(server.id));
+        group.appendChild(webItem);
+      } else {
+        const webItem = document.createElement('button');
+        webItem.type = 'button';
+        webItem.className = 'remote-tab-item remote-server-action';
+        webItem.disabled = true;
+        webItem.textContent = 'Web Terminal';
+        const webDetail = document.createElement('small');
+        webDetail.textContent = 'Web hostname unavailable';
+        webItem.appendChild(webDetail);
+        group.appendChild(webItem);
+      }
+
+      const sshItem = document.createElement('button');
+      sshItem.type = 'button';
+      sshItem.className = 'remote-tab-item remote-server-action';
+      sshItem.textContent = 'SSH Session';
+      const sshDetail = document.createElement('small');
+      sshDetail.textContent = server.ssh_mode === 'tunnel' ? 'Cloudflare tunnel' : 'Direct SSH';
+      sshItem.appendChild(sshDetail);
+      sshItem.addEventListener('click', () => addRemoteTab(server.id));
+      group.appendChild(sshItem);
+      menu.appendChild(group);
     });
   }
   const refresh = document.createElement('button');
@@ -3011,6 +3119,36 @@ function toggleRemoteTabMenu(event) {
 function closeRemoteTabMenu() {
   const menu = document.getElementById('remoteTabMenu');
   if (menu) menu.classList.remove('open');
+}
+
+function buildRemoteWebUrl(server) {
+  return server && server.web_hostname ? 'https://' + server.web_hostname + '/' : 'about:blank';
+}
+
+function addRemoteWebTab(serverId) {
+  closeRemoteTabMenu();
+  const server = remoteServers.find(item => item.id === serverId);
+  if (!server || !server.web_hostname) {
+    showToast('Remote Web Terminal is unavailable', true);
+    return;
+  }
+  tabCounter++;
+  const remoteNumber = tabs.filter(tab => tab.type === 'web' && tab.serverId === server.id).length + 1;
+  const tab = {
+    id: 'tab-' + tabCounter,
+    name: server.name + ' · Web ' + remoteNumber,
+    type: 'web',
+    serverId: server.id
+  };
+  tabs.push(tab);
+  const iframe = document.createElement('iframe');
+  iframe.id = 'frame-' + tab.id;
+  iframe.allow = 'clipboard-read; clipboard-write';
+  iframe.src = buildRemoteWebUrl(server);
+  document.getElementById('termContainer').appendChild(iframe);
+  if (!isSplitActive()) switchTab(tab.id);
+  renderTabs();
+  saveTabs();
 }
 
 async function ensureRemoteWindow(tab) {
@@ -3220,7 +3358,7 @@ function closeTab(id, e) {
   }
   renderTabs();
   saveTabs();
-  if (closing && closing.type !== 'desktop' && Number.isInteger(closing.windowSlot)) {
+  if (isTerminalTab(closing) && Number.isInteger(closing.windowSlot)) {
     killTabWindow(closing.windowSlot);
   }
 }
@@ -3317,7 +3455,7 @@ function startRename(id, labelEl) {
     if (done) return;
     done = true;
     const val = input.value.trim();
-    if (val) { t.name = val; if (t.type !== 'desktop') syncWindowName(t.windowSlot, val); }
+    if (val) { t.name = val; if (isTerminalTab(t)) syncWindowName(t.windowSlot, val); }
     renderTabs();
     saveTabs();
   };
@@ -3431,7 +3569,7 @@ function renderSessionList(sessions) {
     updateTileSelectedBtn();
     return;
   }
-  const openHere = new Set(tabs.filter(t => t.type !== 'desktop' && Number.isInteger(t.windowSlot)).map(t => t.windowSlot));
+  const openHere = new Set(tabs.filter(t => isTerminalTab(t) && Number.isInteger(t.windowSlot)).map(t => t.windowSlot));
   // Drop any checked slots that no longer exist, then refresh the button.
   const liveSlots = new Set(sessions.map(s => s.slot));
   [...sessSelected].forEach(sl => { if (!liveSlots.has(sl)) sessSelected.delete(sl); });
@@ -3473,7 +3611,7 @@ function renderSessionList(sessions) {
 }
 
 function openSessionSlot(slot, name) {
-  const existing = tabs.find(t => t.type !== 'desktop' && t.windowSlot === slot);
+  const existing = tabs.find(t => isTerminalTab(t) && t.windowSlot === slot);
   if (existing) { switchTab(existing.id); return; }
   addTab(slot, name);
 }
@@ -3482,7 +3620,7 @@ async function killSession(slot, name) {
   const ok = await dlgOpen({ kind: 'confirm', danger: true, title: 'Kill session', okText: 'Kill',
     message: 'Kill session "' + name + '" (slot ' + slot + ')? This closes it on every device.' });
   if (!ok) return;
-  const t = tabs.find(t => t.type !== 'desktop' && t.windowSlot === slot);
+  const t = tabs.find(t => isTerminalTab(t) && t.windowSlot === slot);
   if (t && tabs.length > 1) {
     closeTab(t.id);        // removes the local tab and kills its window
   } else {
@@ -4104,10 +4242,11 @@ function suppressLeaveAlertInFrame(frame) {
 
 function reconnectAllTabsNoLeaveAlert() {
   // Fallback path: apply without browser "leave alert".
-  const activeSlots = tabs.map(t => t.windowSlot).join(',');
+  const activeSlots = tabs.filter(isTerminalTab).map(t => t.windowSlot).join(',');
   getAllIframes().forEach((f) => {
     const tabId = f.id.replace('frame-', '');
     const tab = tabs.find(t => t.id === tabId);
+    if (!isTerminalTab(tab)) return;
     suppressLeaveAlertInFrame(f);
     f.src = buildTermUrl(tab, { disableLeaveAlert: true, _activeSlots: activeSlots });
   });
@@ -4130,6 +4269,7 @@ function applySettings(initial) {
   getAllIframes().forEach(f => {
     const tabId = f.id.replace('frame-', '');
     const tab = tabs.find(t => t.id === tabId);
+    if (!isTerminalTab(tab)) return;
     f.src = buildTermUrl(tab);
   });
   updateQuickFontDisplay(parseInt(s.fontSize, 10) || 15);
@@ -4278,7 +4418,12 @@ function reconnect() {
   const f = document.getElementById('frame-' + activeTabId);
   if (f) {
     const tab = tabs.find(t => t.id === activeTabId);
-    f.src = buildTermUrl(tab);
+    if (tab && tab.type === 'web') {
+      const server = remoteServers.find(item => item.id === tab.serverId);
+      f.src = buildRemoteWebUrl(server);
+    } else {
+      f.src = buildTermUrl(tab);
+    }
   }
 }
 
@@ -4632,21 +4777,31 @@ async function init() {
   // Restore tabs from localStorage, or create one new tab
   let saved = [];
   try { saved = JSON.parse(localStorage.getItem('ttyd_tabs') || '[]'); } catch(e) {}
-  saved = saved.filter(t => t && (
-    t.type !== 'ssh' || remoteServers.some(server => server.id === t.serverId)
-  ));
+  saved = saved.filter(t => {
+    if (!t) return false;
+    if (t.type === 'ssh') return remoteServers.some(server => server.id === t.serverId);
+    if (t.type === 'web') return remoteServers.some(server => server.id === t.serverId && server.web_hostname);
+    return true;
+  });
   if (saved.length > 0) {
     saved.forEach((t, idx) => {
       tabCounter++;
-      const slot = Number.isInteger(t.windowSlot) && t.windowSlot >= 0 ? t.windowSlot : idx;
-      nextWindowSlot = Math.max(nextWindowSlot, slot + 1);
-      const tabObj = { id: 'tab-' + tabCounter, name: t.name || ('Shell ' + tabCounter), windowSlot: slot };
+      const tabObj = { id: 'tab-' + tabCounter, name: t.name || ('Shell ' + tabCounter) };
+      if (t.type !== 'desktop' && t.type !== 'web') {
+        const slot = Number.isInteger(t.windowSlot) && t.windowSlot >= 0 ? t.windowSlot : idx;
+        tabObj.windowSlot = slot;
+        nextWindowSlot = Math.max(nextWindowSlot, slot + 1);
+      }
       if (t.type === 'desktop') { tabObj.type = 'desktop'; }
       if (t.type === 'ssh') {
         const server = remoteServers.find(item => item.id === t.serverId);
         tabObj.type = 'ssh';
         tabObj.serverId = server.id;
         tabObj.sshMode = server.ssh_mode;
+      }
+      if (t.type === 'web') {
+        tabObj.type = 'web';
+        tabObj.serverId = t.serverId;
       }
       tabs.push(tabObj);
     });
@@ -4660,7 +4815,7 @@ async function init() {
     // tmux slots unspawned, so the status bar showed fewer windows than
     // browser tabs and split panes rendered empty when the second pane
     // had never been visited.
-    const activeSlots = tabs.filter(t => t.type !== 'desktop').map(t => t.windowSlot).join(',');
+    const activeSlots = tabs.filter(isTerminalTab).map(t => t.windowSlot).join(',');
     tabs.forEach((t, i) => {
       const isActive = (t.id === activeTabId);
       setTimeout(async () => {
@@ -4678,6 +4833,9 @@ async function init() {
         let url;
         if (t.type === 'desktop') {
           url = 'about:blank';
+        } else if (t.type === 'web') {
+          const server = remoteServers.find(item => item.id === t.serverId);
+          url = buildRemoteWebUrl(server);
         } else {
           url = buildTermUrl(t, { _activeSlots: activeSlots });
         }
@@ -7971,6 +8129,10 @@ except Exception as ex:
             return
         force = bool(params and params.get("refresh", [""])[0] == "1")
         servers, error, configured = load_server_catalog(force=force)
+        if configured and not error:
+            sync_error = append_new_tunnel_ssh_hosts(servers)
+            if sync_error:
+                print(f"remote SSH proxy config sync failed: {sync_error}", flush=True)
         self._send_json(200, {
             "servers": public_server_catalog(servers),
             "configured": configured,
@@ -8442,7 +8604,7 @@ except Exception as ex:
                     f"{COOKIE_NAME}={token}",
                     "Path=/",
                     "HttpOnly",
-                    "SameSite=Strict",
+                    "SameSite=None" if COOKIE_SECURE else "SameSite=Lax",
                     f"Max-Age={SESSION_MAX_AGE}",
                 ]
                 if COOKIE_SECURE:

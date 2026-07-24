@@ -66,17 +66,16 @@ The browser communicates only with the current web-terminal installation. The cu
 
 The other servers do not need special federation endpoints. Their existing web-terminal services may continue running independently.
 
-## Why use SSH instead of embedding another web-terminal
+## Embedded web-terminal option
 
-Directly loading another web-terminal inside an iframe conflicts with the current security model:
+Each registered server also exposes its existing web-terminal as an internal
+iframe tab. Framing remains limited to the trusted HTTPS origins configured by
+`WEBTERMINAL_FRAME_ORIGINS`; the default allowlist covers `micstec.com` and
+`wetigu.com` subdomains. Remote login sessions remain independent, use Secure
+`SameSite=None` cookies, and are never converted into local tmux sessions.
 
-- `X-Frame-Options: SAMEORIGIN`
-- `Content-Security-Policy` with `frame-src 'self'`
-- Host-only, `SameSite=Strict` authentication cookies
-- Different origins and independent login sessions
-- A complete web-terminal interface nested inside another interface
-
-A full federation design would require secure WebSocket relaying, target-server tokens, session mapping, reconnect synchronization, and server-aware file and desktop APIs. SSH-backed tabs avoid that complexity while delivering the main capability: terminals on multiple systems in one browser window.
+The SSH-backed option remains separate and continues to provide the locally
+managed tmux session, reconnect, session-list, and shell settings behavior.
 
 ## Server configuration
 

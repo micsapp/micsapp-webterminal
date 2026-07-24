@@ -11,7 +11,7 @@
   <!-- Layer 2: Auth -->
   <rect x="60" y="110" width="680" height="50" rx="8" fill="#e94560" opacity="0.15" stroke="#e94560" stroke-width="1"/>
   <text x="80" y="132" fill="#e94560" font-size="12" font-weight="600">Authentication</text>
-  <text x="80" y="148" fill="#fecdd3" font-size="10">HMAC-SHA256 tokens &bull; __Host- cookie prefix &bull; HttpOnly + Secure + SameSite=Strict &bull; 24h expiry</text>
+  <text x="80" y="148" fill="#fecdd3" font-size="10">HMAC-SHA256 tokens &bull; __Host- cookie prefix &bull; HttpOnly + Secure + SameSite=None &bull; 24h expiry</text>
 
   <!-- Layer 3: Authorization -->
   <rect x="80" y="170" width="640" height="50" rx="8" fill="#f59e0b" opacity="0.15" stroke="#f59e0b" stroke-width="1"/>
@@ -26,5 +26,5 @@
   <!-- Layer 5: Headers -->
   <rect x="120" y="290" width="560" height="50" rx="8" fill="#8b5cf6" opacity="0.15" stroke="#8b5cf6" stroke-width="1"/>
   <text x="140" y="312" fill="#8b5cf6" font-size="12" font-weight="600">HTTP Hardening</text>
-  <text x="140" y="328" fill="#c4b5fd" font-size="10">CSP &bull; X-Frame-Options: SAMEORIGIN &bull; no-referrer &bull; nosniff &bull; Permissions-Policy</text>
+  <text x="140" y="328" fill="#c4b5fd" font-size="10">CSP trusted frame origins &bull; no-referrer &bull; nosniff &bull; Permissions-Policy</text>
 </svg>

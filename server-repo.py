@@ -4,13 +4,20 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
+import getpass
 import json
+import os
+import re
+import shlex
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, NoReturn
 
 
 REPOSITORY_KIND = "micsapp-webterminal-server-list"
+SSH_HOST_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,251}[A-Za-z0-9])?$")
+SSH_USER_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 
 
 def fail(message: str) -> NoReturn:
@@ -41,6 +48,89 @@ def load_repository(path: Path) -> dict[str, Any]:
 def server_web_hostname(server: dict[str, Any]) -> str:
     value = server.get("web_hostname") or server.get("hostname") or ""
     return value if isinstance(value, str) else ""
+
+
+def existing_exact_ssh_hosts(config: str) -> set[str]:
+    """Return literal Host tokens; wildcard patterns are deliberately ignored."""
+    hosts: set[str] = set()
+    for raw_line in config.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        if not parts or parts[0].lower() != "host":
+            continue
+        for token in parts[1:]:
+            if not any(char in token for char in "*!?") and SSH_HOST_RE.fullmatch(token):
+                hosts.add(token.lower())
+    return hosts
+
+
+def tunnel_ssh_hostnames(document: dict[str, Any]) -> list[str]:
+    """Return unique enabled Cloudflare SSH hostnames in repository order."""
+    hostnames: list[str] = []
+    seen: set[str] = set()
+    for server in document["servers"]:
+        if not server.get("enabled", True):
+            continue
+        hostname = server.get("ssh_hostname")
+        hostname = hostname.strip() if isinstance(hostname, str) else ""
+        mode = server.get("ssh_mode")
+        if not mode:
+            mode = "tunnel" if hostname else "none"
+        key = hostname.lower()
+        if mode == "tunnel" and SSH_HOST_RE.fullmatch(hostname) and key not in seen:
+            hostnames.append(hostname)
+            seen.add(key)
+    return hostnames
+
+
+def command_sync_ssh_config(args: argparse.Namespace) -> None:
+    """Append stanzas only for new tunnel hostnames; never rewrite existing config."""
+    document = load_repository(args.input)
+    if not SSH_USER_RE.fullmatch(args.user):
+        fail(f"invalid SSH user: {args.user!r}")
+
+    config_path: Path = args.config.expanduser()
+    additions: list[str] = []
+    try:
+        config_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(config_path, os.O_RDWR | os.O_CREAT, 0o600)
+        with os.fdopen(fd, "r+", encoding="utf-8") as config_file:
+            fcntl.flock(config_file.fileno(), fcntl.LOCK_EX)
+            existing = config_file.read()
+            known = existing_exact_ssh_hosts(existing)
+            additions = [
+                hostname
+                for hostname in tunnel_ssh_hostnames(document)
+                if hostname.lower() not in known
+            ]
+            if additions:
+                prefix = ""
+                if existing and not existing.endswith("\n"):
+                    prefix += "\n"
+                if existing and not (existing + prefix).endswith("\n\n"):
+                    prefix += "\n"
+                proxy = shlex.quote(args.cloudflared)
+                stanzas = []
+                for hostname in additions:
+                    stanzas.append(
+                        f"Host {hostname}\n"
+                        f"    HostName {hostname}\n"
+                        f"    User {args.user}\n"
+                        f"    ProxyCommand {proxy} access ssh --hostname %h"
+                    )
+                config_file.seek(0, os.SEEK_END)
+                config_file.write(prefix + "\n\n".join(stanzas) + "\n")
+                config_file.flush()
+                os.fsync(config_file.fileno())
+    except OSError as exc:
+        fail(f"cannot append to {config_path}: {exc}")
+
+    if additions:
+        print(f"added {len(additions)}: {', '.join(additions)}")
+    else:
+        print("unchanged")
 
 
 def command_show(args: argparse.Namespace) -> None:
@@ -137,6 +227,19 @@ def build_parser() -> argparse.ArgumentParser:
     show_parser.add_argument("input", type=Path)
     show_parser.add_argument("--current", default="", help="mark this web hostname")
     show_parser.set_defaults(handler=command_show)
+
+    sync_parser = subparsers.add_parser(
+        "sync-ssh-config", help="append missing Cloudflare SSH host stanzas"
+    )
+    sync_parser.add_argument("input", type=Path)
+    sync_parser.add_argument(
+        "--config", type=Path, default=Path("~/.ssh/config"), help="SSH config path"
+    )
+    sync_parser.add_argument("--user", default=getpass.getuser(), help="SSH login user")
+    sync_parser.add_argument(
+        "--cloudflared", default="cloudflared", help="cloudflared executable path"
+    )
+    sync_parser.set_defaults(handler=command_sync_ssh_config)
 
     merge_parser = subparsers.add_parser("merge", help="register or update one server")
     merge_parser.add_argument("input", type=Path)
