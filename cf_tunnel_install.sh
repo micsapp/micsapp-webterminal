@@ -528,6 +528,15 @@ server {
     # Without this, nginx redirects to http://<hostname>:<port>/... which breaks.
     absolute_redirect off;
 
+    # Security headers for this app come from auth.py, not nginx. This one
+    # add_header exists to BREAK INHERITANCE of any http{}-level add_header
+    # set by the host's global nginx config (nginx replaces ALL inherited
+    # add_headers once a block defines any of its own). Without it, e.g.
+    # TerraMaster TOS injects its portal CSP and X-Frame-Options SAMEORIGIN
+    # onto every response here, which blocks embedding peer web terminals
+    # ("This content is blocked") and blocks peers from embedding this one.
+    add_header X-Content-Type-Options nosniff always;
+
     # Secure session cookies are rejected by browsers on plain HTTP.
     # Cloudflare Tunnel sends the original visitor scheme in X-Forwarded-Proto.
     if (\$http_x_forwarded_proto = "http") {
@@ -805,7 +814,7 @@ COOKIE_SECURE = env_bool("COOKIE_SECURE", True)
 FRAME_ORIGINS = " ".join(
     origin for origin in os.environ.get(
         "WEBTERMINAL_FRAME_ORIGINS",
-        "https://*.micstec.com https://*.wetigu.com",
+        "https://*.micstec.com https://*.wetigu.com https://*.micsapp.com",
     ).split()
     if re.fullmatch(r"https://(?:\*\.)?[A-Za-z0-9.-]+(?::[0-9]{1,5})?", origin)
 )
@@ -7547,11 +7556,31 @@ def breadcrumb_tokens(username, abs_path):
 
 
 def run_as_user(username, python_script, timeout=10):
-    """Run a Python script as the given user via SSH. Returns (returncode, stdout_bytes, stderr_bytes)."""
+    """Run a Python script as the given user. Returns (returncode, stdout_bytes, stderr_bytes).
+
+    Prefers SSH with the login password (full login environment). When the
+    password is unavailable — user_instances is in-memory, so a service restart
+    empties it while the session cookie stays valid — fall back to `sudo -u`
+    when running as root, exactly like /api/exec does. Without the fallback,
+    remote tabs failed with "failed to create remote SSH session" after every
+    deploy until the user logged out and back in.
+    """
     info = user_instances.get(username)
-    if not info or "password" not in info:
-        return (1, b"", b"no session")
-    password = info["password"]
+    password = info.get("password") if info else None
+    if not password:
+        if os.geteuid() != 0:
+            return (1, b"", b"no session")
+        try:
+            result = subprocess.run(
+                ["sudo", "-u", username, "python3", "-"],
+                input=python_script.encode(),
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout
+            )
+            return (result.returncode, result.stdout, result.stderr)
+        except subprocess.TimeoutExpired:
+            return (1, b"", b"timeout")
+        except Exception as e:
+            return (1, b"", str(e).encode())
     try:
         result = subprocess.run(
             [SSHPASS_BIN, "-p", password, SSH_BIN,
