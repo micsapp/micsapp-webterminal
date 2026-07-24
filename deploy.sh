@@ -32,6 +32,10 @@ CF_CONFIG="${HOME}/.cloudflared/config.yml"
 CF_LOG="${PROJECT_DIR}/cloudflared.log"
 CF_TMUX_SESSION="cloudflared"
 
+DEFAULT_SERVER_REPO_URL="https://tnas_d.micsapp.com/s/web-terminal-servers/serverlist.json"
+SERVER_REPO_CONFIG="${WEBTERMINAL_SERVER_REPO_CONFIG:-$HOME/.config/micsapp-webterminal/server-repo.conf}"
+SERVER_REPO_HELPER="${PROJECT_DIR}/server-repo.py"
+
 say() { printf '%s\n' "$*"; }
 err() { printf 'ERROR: %s\n' "$*" >&2; }
 
@@ -41,6 +45,7 @@ Usage:
   ./deploy.sh              Deploy/start services (only starts what's down)
   ./deploy.sh --restart    Force restart all components
   ./deploy.sh --status     Show current health/status only
+  ./deploy.sh --remote-setup  Configure/test remote SSH tabs, then deploy
   ./deploy.sh --status --public-url https://example.com
   ./deploy.sh -h|--help    Show this help
 EOF
@@ -51,6 +56,154 @@ need_cmd() {
     err "Missing required command: $1"
     exit 1
   }
+}
+
+normalize_server_repo_url() {
+  local repo_url="${1%/}"
+  case "$repo_url" in
+    http://*|https://*) ;;
+    *) return 1 ;;
+  esac
+  if [[ "$repo_url" != *.json ]]; then
+    repo_url="${repo_url}/serverlist.json"
+  fi
+  printf '%s\n' "$repo_url"
+}
+
+load_remote_repo_settings() {
+  REMOTE_REPO_URL="${WEBTERMINAL_SERVER_REPO_URL:-}"
+  REMOTE_REPO_PASSCODE="${WEBTERMINAL_SERVER_REPO_PASSCODE:-}"
+
+  if [ -f "$SERVER_REPO_CONFIG" ]; then
+    local saved_url="" saved_passcode=""
+    IFS= read -r saved_url < "$SERVER_REPO_CONFIG" || true
+    saved_passcode="$(sed -n '2p' "$SERVER_REPO_CONFIG")"
+    REMOTE_REPO_URL="${REMOTE_REPO_URL:-$saved_url}"
+    REMOTE_REPO_PASSCODE="${REMOTE_REPO_PASSCODE:-$saved_passcode}"
+  fi
+
+  REMOTE_REPO_URL="${REMOTE_REPO_URL:-$DEFAULT_SERVER_REPO_URL}"
+  REMOTE_REPO_URL="$(normalize_server_repo_url "$REMOTE_REPO_URL" 2>/dev/null || true)"
+}
+
+fetch_remote_repository() {
+  local repo_url="$1" passcode="$2" output_file="$3"
+  local auth_header_file="${output_file}.auth-header" status rc
+
+  (umask 077
+    printf 'X-Droppy-Share-Passcode: %s\n' "$passcode" > "$auth_header_file"
+  )
+
+  set +e
+  status="$(curl --silent --show-error --connect-timeout 10 --max-time 30 \
+    -o "$output_file" -w '%{http_code}' -H "@$auth_header_file" "$repo_url")"
+  rc=$?
+  set -e
+  rm -f "$auth_header_file"
+
+  if [ "$rc" -ne 0 ]; then
+    err "Could not reach the remote-server repository"
+    return 1
+  fi
+  if [ "$status" != "200" ]; then
+    err "Repository returned HTTP $status; check the URL and passcode"
+    return 1
+  fi
+}
+
+ensure_remote_client_tools() {
+  need_cmd ssh
+  if command -v cloudflared >/dev/null 2>&1; then
+    say "cloudflared : OK ($(command -v cloudflared))"
+    return 0
+  fi
+
+  say "cloudflared is required for repository entries using tunnel SSH."
+  say "Installing it with the project's Cloudflare installer..."
+  if [ ! -f "${PROJECT_DIR}/cf_tunnel_install.sh" ]; then
+    err "Missing ${PROJECT_DIR}/cf_tunnel_install.sh"
+    return 1
+  fi
+  bash -c 'source "$1"; install_cloudflared' _ "${PROJECT_DIR}/cf_tunnel_install.sh"
+  need_cmd cloudflared
+}
+
+save_remote_repo_settings() {
+  local repo_url="$1" passcode="$2"
+  local settings_dir settings_tmp
+  settings_dir="$(dirname "$SERVER_REPO_CONFIG")"
+  mkdir -p "$settings_dir"
+  chmod 700 "$settings_dir"
+  settings_tmp="$(mktemp "$settings_dir/.server-repo.XXXXXX")"
+  chmod 600 "$settings_tmp"
+  printf '%s\n%s\n' "$repo_url" "$passcode" > "$settings_tmp"
+  mv "$settings_tmp" "$SERVER_REPO_CONFIG"
+}
+
+configure_remote_repository() {
+  load_remote_repo_settings
+
+  local entered_url entered_passcode repo_url passcode
+  local work_dir repo_file display_file
+  say ""
+  say "=== Remote SSH tab setup ==="
+  printf 'Droppy/TNAS repository URL [%s]: ' "$REMOTE_REPO_URL"
+  IFS= read -r entered_url
+  entered_url="${entered_url:-$REMOTE_REPO_URL}"
+  if ! repo_url="$(normalize_server_repo_url "$entered_url")"; then
+    err "Repository URL must start with http:// or https://"
+    return 1
+  fi
+  if [[ "$repo_url" == http://* ]]; then
+    say "WARNING: HTTP sends the repository passcode without TLS; HTTPS is recommended."
+  fi
+
+  if [ -n "$REMOTE_REPO_PASSCODE" ]; then
+    printf 'Droppy share passcode [Enter keeps saved value]: '
+  else
+    printf 'Droppy share passcode: '
+  fi
+  IFS= read -rs entered_passcode
+  printf '\n'
+  passcode="${entered_passcode:-$REMOTE_REPO_PASSCODE}"
+  if [ -z "$passcode" ]; then
+    err "Repository passcode is required"
+    return 1
+  fi
+  case "$passcode" in
+    *$'\r'*|*$'\n'*) err "Repository passcode cannot contain a newline"; return 1 ;;
+  esac
+
+  work_dir="$(mktemp -d)"
+  chmod 700 "$work_dir"
+  repo_file="${work_dir}/serverlist.json"
+  display_file="${work_dir}/serverlist.txt"
+
+  say "Validating protected repository..."
+  if ! fetch_remote_repository "$repo_url" "$passcode" "$repo_file"; then
+    rm -f "$repo_file" "$display_file"
+    rmdir "$work_dir" 2>/dev/null || true
+    return 1
+  fi
+  if ! python3 "$SERVER_REPO_HELPER" show "$repo_file" > "$display_file"; then
+    err "Downloaded JSON is not a valid web-terminal server repository"
+    rm -f "$repo_file" "$display_file"
+    rmdir "$work_dir" 2>/dev/null || true
+    return 1
+  fi
+
+  save_remote_repo_settings "$repo_url" "$passcode"
+  REMOTE_REPO_URL="$repo_url"
+  REMOTE_REPO_PASSCODE="$passcode"
+  say "Saved repository configuration: $SERVER_REPO_CONFIG (mode 600)"
+  say ""
+  sed -n '1,40p' "$display_file"
+  rm -f "$repo_file" "$display_file"
+  rmdir "$work_dir" 2>/dev/null || true
+
+  say ""
+  ensure_remote_client_tools
+  say "Remote repository and local SSH client are ready."
 }
 
 is_macos() {
@@ -860,6 +1013,7 @@ main() {
   local mode=""
   local public_url=""
   local force_restart=false
+  local remote_setup=false
 
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -873,6 +1027,10 @@ main() {
         ;;
       --restart)
         force_restart=true
+        shift
+        ;;
+      --remote-setup)
+        remote_setup=true
         shift
         ;;
       --public-url)
@@ -913,6 +1071,15 @@ main() {
   need_cmd sshpass
   need_cmd ttyd
 
+  if $remote_setup; then
+    need_cmd curl
+    [ -f "$SERVER_REPO_HELPER" ] || {
+      err "Missing repository helper: $SERVER_REPO_HELPER"
+      return 1
+    }
+    configure_remote_repository
+  fi
+
   local dest_conf
   dest_conf="$(detect_nginx_conf_dest)"
   local had_failure=false
@@ -949,7 +1116,7 @@ main() {
   fi
 
   # ── 3. auth.py ──
-  if $force_restart; then
+  if $force_restart || $remote_setup; then
     stop_auth_service
     start_auth_service || had_failure=true
   elif ! check_auth; then
@@ -985,6 +1152,20 @@ main() {
   say ""
   say "=== Deploy complete ==="
   status_report "$public_url"
+
+  if $remote_setup; then
+    say ""
+    say "=== Remote SSH readiness ==="
+    say "Repository : configured and validated"
+    say "Nginx/API  : deployed"
+    say "SSH client : available"
+    say "cloudflared: available for tunnel-mode targets"
+    say ""
+    say "Each destination must still be registered and reachable by SSH."
+    say "Users need a matching remote account, SSH config, key, or interactive password."
+  fi
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

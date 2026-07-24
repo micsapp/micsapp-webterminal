@@ -59,6 +59,31 @@ To expose SSH through the same named tunnel at installation time, add
 
 This is idempotent — it health-checks each component and only starts what's down. Use `./deploy.sh --status` to check health, or `./deploy.sh --restart` to force-restart everything.
 
+To configure remote SSH tabs on a new or existing deployment, run:
+
+```bash
+./deploy.sh --remote-setup
+```
+
+The setup prompts for the Droppy/TNAS repository URL and passcode, validates
+the protected JSON before changing the saved configuration, and writes the
+settings to `~/.config/micsapp-webterminal/server-repo.conf` with mode `600`.
+The passcode input is hidden. A saved URL/passcode can be retained by pressing
+Enter on later runs. The command also:
+
+- installs `cloudflared` when it is missing;
+- checks that the local SSH client is available;
+- deploys the authenticated Nginx API routes;
+- restarts the auth service so the new settings are active immediately; and
+- runs the normal service health report.
+
+The shared URL and passcode are all this web-terminal deployment needs to load
+the catalog. Each destination still has to be registered in that catalog and
+serve reachable direct or Cloudflare-tunneled SSH. Each web-terminal user also
+needs a valid account on the destination plus an SSH key/configuration or an
+interactive password. Those destination/user credentials are deliberately not
+stored by `--remote-setup`.
+
 ### 4. Create users
 
 ```bash
