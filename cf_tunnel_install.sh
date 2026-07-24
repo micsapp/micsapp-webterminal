@@ -595,6 +595,19 @@ server {
         proxy_send_timeout 86400s;
     }
 
+    # Remote SSH server catalog and tab creation (requires auth)
+    location = /api/servers {
+        auth_request /api/auth;
+        error_page 401 = @login_redirect;
+        proxy_pass http://127.0.0.1:${auth_port};
+    }
+    location = /api/remote-tab {
+        auth_request /api/auth;
+        error_page 401 = @login_redirect;
+        proxy_pass http://127.0.0.1:${auth_port};
+        client_max_body_size 16k;
+    }
+
     # Wrapper app page (requires auth)
     location = / {
         auth_request /api/auth;

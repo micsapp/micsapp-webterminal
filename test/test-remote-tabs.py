@@ -136,6 +136,13 @@ class RemoteTabTests(unittest.TestCase):
         self.assertNotIn("StrictHostKeyChecking=no", tunnel_script)
         self.assertNotIn("StrictHostKeyChecking=no", direct_script)
 
+    def test_nginx_exposes_remote_tab_api(self):
+        root = pathlib.Path(__file__).resolve().parents[1]
+        for relative_path in ("nginx/ttyd.conf", "cf_tunnel_install.sh"):
+            content = (root / relative_path).read_text(encoding="utf-8")
+            self.assertIn("location = /api/servers", content)
+            self.assertIn("location = /api/remote-tab", content)
+
     def test_spa_contains_remote_picker_and_safe_saved_state(self):
         self.assertIn('id="remoteTabMenu"', auth.APP_HTML)
         self.assertIn("/api/servers", auth.APP_HTML)
