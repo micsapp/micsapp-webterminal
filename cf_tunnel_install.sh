@@ -9229,6 +9229,17 @@ except Exception as ex:
                 self.send_header("Location", "/login")
                 self.end_headers()
                 return
+            # The cookie carries the ttyd port assigned at login. If that ttyd
+            # has since died (e.g. the auth service was restarted, which tears
+            # down its spawned ssh/ttyd children), serving the SPA would point
+            # every terminal iframe at a dead upstream — permanent 502s until
+            # the user thinks to log out. Send them to login instead; a fresh
+            # login spawns a new ttyd and mints a cookie with the live port.
+            if port_is_free(port):
+                self.send_response(302)
+                self.send_header("Location", "/login")
+                self.end_headers()
+                return
             # Inject the user's ttyd port into the app HTML
             html = (
                 APP_HTML
