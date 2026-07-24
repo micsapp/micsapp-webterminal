@@ -607,6 +607,13 @@ Environment=PYTHONUNBUFFERED=1
 Environment=AUTH_PORT=${AUTH_PORT}
 Environment=SSHPASS_BIN=${sshpass_bin}
 Environment=TTYD_BIN=${ttyd_bin}
+# systemd derives HOME from User=, i.e. /root — but on TOS the uid-0 login user's
+# real home is ${HOME}, and that is where deploy.sh --remote-setup saves the
+# remote-server repo config (~/.config/micsapp-webterminal/server-repo.conf) and
+# the cloudflared ProxyCommand entries (~/.ssh/config). Without this the service
+# resolves ~ to /root, finds neither, and the remote server list comes back empty.
+# Elsewhere the auth service is a --user unit, so this mismatch cannot arise.
+Environment=HOME=${HOME}
 # Dedicated ttyd port range so this host deployment never collides with a
 # Dockerized webterminal on the same box (the ubuntu container SSHes to the
 # host and spawns ttyd in the default 7700+ range as the same user). Keep
