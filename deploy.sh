@@ -627,6 +627,12 @@ WorkingDirectory=${PROJECT_DIR}
 ExecStart=${pybin} ${AUTH_PY}
 Restart=always
 RestartSec=5
+# Kill ONLY auth.py on stop/restart — not the whole cgroup. The spawned
+# sshpass/ssh clients carry the users' ttyd terminals; the default
+# control-group kill took every live terminal down on each deploy (mass 502s /
+# forced re-logins). Orphaned ssh/ttyd chains persist instead, exactly like the
+# non-systemd (WSL/nohup) deployments where only the python process is killed.
+KillMode=process
 StandardOutput=append:${AUTH_LOG}
 StandardError=append:${AUTH_LOG}
 

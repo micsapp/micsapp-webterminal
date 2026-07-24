@@ -7582,6 +7582,12 @@ def build_remote_window_script(server, slot):
     ssh_args.append(server["ssh_hostname"])
     config = {
         "slot": int(slot),
+        # The webterminal's tmux session. Hardcoding "main" here broke remote
+        # tabs on any deployment with a non-default TMUX_SESSION (e.g. a NAS
+        # host isolated from a co-located webterminal as "main-host"): the ssh
+        # window landed in the OTHER deployment's session while the tab's
+        # iframe attached to an empty slot in ours.
+        "session": TMUX_SESSION,
         "server_id": server["id"],
         "name": server["name"],
         "ssh_mode": server["ssh_mode"],
@@ -7596,14 +7602,15 @@ import sys
 
 cfg = json.loads({config_json!r})
 slot = cfg["slot"]
-target = "main:" + str(slot)
+sess = cfg["session"]
+target = sess + ":" + str(slot)
 
 def run(args, **kwargs):
     return subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **kwargs)
 
-has_main = run(["tmux", "has-session", "-t", "main"]).returncode == 0
+has_main = run(["tmux", "has-session", "-t", sess]).returncode == 0
 if has_main:
-    exists = run(["tmux", "list-windows", "-t", "main", "-F", "#{{window_index}}"])
+    exists = run(["tmux", "list-windows", "-t", sess, "-F", "#{{window_index}}"])
     live_slots = exists.stdout.decode(errors="replace").splitlines()
     if str(slot) in live_slots:
         marker = run([
@@ -7631,11 +7638,11 @@ if has_main:
     ])
 else:
     created = run([
-        "tmux", "new-session", "-d", "-s", "main",
+        "tmux", "new-session", "-d", "-s", sess,
         "-n", cfg["name"], window_command,
     ])
     if created.returncode == 0 and slot != 0:
-        created = run(["tmux", "move-window", "-s", "main:0", "-t", target])
+        created = run(["tmux", "move-window", "-s", sess + ":0", "-t", target])
 
 if created.returncode != 0:
     sys.stderr.buffer.write(created.stderr)
