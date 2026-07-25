@@ -2460,6 +2460,25 @@ __PWA_HEAD__
       <div style="color:#9a9abf;font-size:12px;margin-bottom:10px">Live terminal sessions for your account. Open one to attach it on this device — it stays in sync (live-mirrored) across devices. Double-click a tab to rename; the name syncs everywhere.</div>
       <div id="sessionsList"></div>
     </div>
+    <div class="session-send-bar">
+      <div class="session-send-row">
+        <div class="session-send-input-wrap">
+          <input type="text" id="sessSendInput" class="session-send-input" placeholder="Command to send…"
+                 autocomplete="off" spellcheck="false" onkeydown="sessSendKeydown(event)">
+          <button class="fp-btn" id="sessQcBtn" onclick="toggleSessQuickPicker(event)"
+                  title="Pick a quick command">&#9889;</button>
+        </div>
+        <button class="fp-btn" id="sessSendSelectedBtn" onclick="sendToSessions(false)"
+                title="Send to checked sessions" disabled>Send to selected</button>
+        <button class="fp-btn" onclick="sendToSessions(true)" title="Send to every local session">Send to all</button>
+      </div>
+      <div class="session-send-hint">Sent with Enter to the tmux window. Remote SSH and desktop tabs are skipped.</div>
+      <div class="sess-qc-popover" id="sessQcPopover">
+        <input type="text" id="sessQcSearch" class="session-send-input" placeholder="Search quick commands…"
+               autocomplete="off" oninput="sessQcRender()">
+        <div class="sess-qc-list" id="sessQcList"></div>
+      </div>
+    </div>
   </div>
 </div>
 <style>
@@ -2470,6 +2489,26 @@ __PWA_HEAD__
   .session-badge { font-size:10px; font-weight:600; color:#1fae6b; border:1px solid #1fae6b; border-radius:3px; padding:0 4px; margin-left:6px; }
   .session-actions { display:flex; gap:6px; flex-shrink:0; }
   .session-check { width:16px; height:16px; flex-shrink:0; cursor:pointer; accent-color:#e94560; }
+  .session-check:disabled { cursor:not-allowed; opacity:0.35; }
+  .session-badge.remote { color:#e0a44a; border-color:#e0a44a; }
+  .session-send-bar { position:relative; border-top:1px solid #2a2a4a; padding:10px 16px 12px; background:#101828; flex-shrink:0; }
+  .session-send-row { display:flex; gap:6px; align-items:center; }
+  .session-send-input-wrap { display:flex; gap:6px; flex:1; min-width:0; }
+  .session-send-input { flex:1; min-width:0; background:#16213e; border:1px solid #2a2a4a; border-radius:6px;
+    color:#e2e2e2; padding:7px 9px; font-size:13px; font-family:inherit; outline:none; }
+  .session-send-input:focus { border-color:#e94560; }
+  .session-send-hint { color:#7a7a9e; font-size:11px; margin-top:6px; }
+  .sess-qc-popover { display:none; position:absolute; left:16px; right:16px; bottom:100%; margin-bottom:6px;
+    background:#16213e; border:1px solid #2a2a4a; border-radius:8px; padding:8px; z-index:30;
+    box-shadow:0 8px 24px rgba(0,0,0,0.45); }
+  .sess-qc-popover.open { display:block; }
+  .sess-qc-list { max-height:220px; overflow-y:auto; margin-top:8px; }
+  .sess-qc-item { padding:7px 8px; border-radius:5px; cursor:pointer; }
+  .sess-qc-item:hover { background:#0f3460; }
+  .sess-qc-name { font-size:13px; color:#e2e2e2; }
+  .sess-qc-cmd { font-size:11px; color:#9a9abf; font-family:ui-monospace,Menlo,Consolas,monospace;
+    white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .sess-qc-empty { color:#7a7a9e; font-size:12px; padding:8px; }
 </style>
 
 <div id="toast" class="toast"></div>
@@ -3490,12 +3529,23 @@ function renameTab(id, name) {
 // refreshes; pruned to live slots whenever the list re-renders.
 let sessSelected = new Set();
 
+// Last rendered session list, so "send" can tell local windows from remote
+// SSH ones without a second round-trip.
+let sessLast = [];
+
 function updateTileSelectedBtn() {
   const btn = document.getElementById('tileSelectedBtn');
-  if (!btn) return;
-  const n = sessSelected.size;
-  btn.disabled = n === 0;
-  btn.innerHTML = '&#9707; Tile selected' + (n ? ' (' + n + ')' : '');
+  if (btn) {
+    const n = sessSelected.size;
+    btn.disabled = n === 0;
+    btn.innerHTML = '&#9707; Tile selected' + (n ? ' (' + n + ')' : '');
+  }
+  const send = document.getElementById('sessSendSelectedBtn');
+  if (send) {
+    const n = sessLast.filter(s => sessSelected.has(s.slot) && sessIsSendable(s)).length;
+    send.disabled = n === 0;
+    send.textContent = 'Send to selected' + (n ? ' (' + n + ')' : '');
+  }
 }
 
 function sessEscHtml(s) {
@@ -3530,7 +3580,7 @@ function sessFmtAgo(epoch) {
 }
 
 async function fetchSessions() {
-  const fmt = '#{window_index}\\t#{window_name}\\t#{pane_current_command}\\t#{window_activity}\\t#{window_panes}';
+  const fmt = '#{window_index}\\t#{window_name}\\t#{pane_current_command}\\t#{window_activity}\\t#{window_panes}\\t#{@webterminal_server_id}';
   const res = await fetch('/api/exec', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -3543,11 +3593,18 @@ async function fetchSessions() {
     const p = line.split('\\t');
     const slot = parseInt(p[0], 10);
     if (!Number.isInteger(slot)) return;
-    out.push({ slot: slot, name: p[1] || ('Shell ' + slot), cmd: p[2] || '', activity: p[3] || '', panes: p[4] || '1' });
+    out.push({ slot: slot, name: p[1] || ('Shell ' + slot), cmd: p[2] || '', activity: p[3] || '',
+               panes: p[4] || '1', serverId: (p[5] || '').trim() });
   });
   out.sort((a, b) => a.slot - b.slot);
   return out;
 }
+
+// A tmux window created for a remote SSH tab carries @webterminal_server_id.
+// Those (and desktop/remote-web tabs, which are iframes and have no tmux window
+// at all) are never valid targets for "send command" — typing into them would
+// land in a remote shell the user didn't select.
+function sessIsSendable(s) { return !s.serverId; }
 
 async function openSessions() {
   const overlay = document.getElementById('sessionsModal');
@@ -3562,11 +3619,13 @@ async function openSessions() {
 function closeSessions() {
   const overlay = document.getElementById('sessionsModal');
   if (overlay) overlay.classList.remove('open');
+  closeSessQuickPicker();
 }
 
 function renderSessionList(sessions) {
   const body = document.getElementById('sessionsList');
   if (!body) return;
+  sessLast = sessions;
   if (!sessions.length) {
     body.innerHTML = '<div style="color:#9a9abf;padding:16px">No live sessions found.</div>';
     sessSelected.clear();
@@ -3592,7 +3651,9 @@ function renderSessionList(sessions) {
     row.appendChild(cb);
     const info = document.createElement('div');
     info.className = 'session-info';
-    info.innerHTML = '<div class="session-name">' + sessEscHtml(s.name) + (here ? ' <span class="session-badge">open here</span>' : '') + '</div>'
+    info.innerHTML = '<div class="session-name">' + sessEscHtml(s.name)
+                   + (here ? ' <span class="session-badge">open here</span>' : '')
+                   + (sessIsSendable(s) ? '' : ' <span class="session-badge remote">remote</span>') + '</div>'
                    + '<div class="session-sub">slot ' + s.slot + (sub ? ' · ' + sessEscHtml(sub) : '') + '</div>';
     const actions = document.createElement('div');
     actions.className = 'session-actions';
@@ -3631,6 +3692,120 @@ async function killSession(slot, name) {
     killTabWindow(slot);   // not open here (or it's the last tab): kill directly
   }
   setTimeout(async () => { try { renderSessionList(await fetchSessions()); } catch (e) {} }, 250);
+}
+
+// --- Send a command into sessions from the picker ---------------------------
+// Delivery is server-side (`tmux send-keys`), not through the iframe, so a
+// session that isn't attached on this device still receives it.
+
+function sessShqStrict(s) { return "'" + String(s).replace(/'/g, "'\\\\''") + "'"; }
+
+function sessSendTargets(all) {
+  const chosen = all ? sessLast.slice() : sessLast.filter(s => sessSelected.has(s.slot));
+  return { ok: chosen.filter(sessIsSendable), skipped: chosen.filter(s => !sessIsSendable(s)).length };
+}
+
+async function sendToSessions(all) {
+  const input = document.getElementById('sessSendInput');
+  if (!input) return;
+  const cmd = (input.value || '').replace(/\\r/g, '');
+  if (!cmd.trim()) { showToast('Type a command first', true); input.focus(); return; }
+  const { ok, skipped } = sessSendTargets(all);
+  if (!ok.length) {
+    if (skipped) showToast('Only remote sessions matched — nothing sent', true);
+    else showToast(all ? 'No sessions to send to' : 'Check the sessions you want first', true);
+    return;
+  }
+  if (all && ok.length > 1) {
+    const go = await dlgOpen({ kind: 'confirm', title: 'Send to all sessions', okText: 'Send',
+      message: 'Run this in ' + ok.length + ' sessions?\\n\\n' + cmd });
+    if (!go) return;
+  }
+  const q = sessShqStrict(cmd);
+  const parts = ok.map(s => {
+    const t = TMUX_SESSION + ':' + s.slot;
+    return 'tmux send-keys -t ' + t + ' -l -- ' + q + ' 2>/dev/null; '
+         + 'tmux send-keys -t ' + t + ' Enter 2>/dev/null';
+  });
+  try {
+    const res = await fetch('/api/exec', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ command: parts.join('; ') + '; true' })
+    });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+  } catch (e) {
+    showToast('Send failed: ' + (e.message || e), true);
+    return;
+  }
+  input.value = '';
+  showToast('Sent to ' + ok.length + ' session' + (ok.length > 1 ? 's' : '')
+            + (skipped ? ' · ' + skipped + ' remote skipped' : ''));
+}
+
+function sessSendKeydown(ev) {
+  if (ev.key !== 'Enter') return;
+  ev.preventDefault();
+  sendToSessions(ev.ctrlKey || ev.metaKey);
+}
+
+// Quick-command picker for the send box: same catalog as the Quick Commands
+// modal (/api/quick-commands), but picking fills the input instead of running.
+let sessQcCache = null;
+
+function closeSessQuickPicker() {
+  const pop = document.getElementById('sessQcPopover');
+  if (pop) pop.classList.remove('open');
+}
+
+async function toggleSessQuickPicker(ev) {
+  if (ev) ev.stopPropagation();
+  const pop = document.getElementById('sessQcPopover');
+  if (!pop) return;
+  if (pop.classList.contains('open')) { closeSessQuickPicker(); return; }
+  pop.classList.add('open');
+  const search = document.getElementById('sessQcSearch');
+  if (search) { search.value = ''; search.focus(); }
+  const list = document.getElementById('sessQcList');
+  if (sessQcCache) { sessQcRender(); return; }
+  list.innerHTML = '<div class="sess-qc-empty">Loading…</div>';
+  try {
+    const res = await fetch('/api/quick-commands');
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const data = await res.json();
+    if (data.error) throw new Error(data.error);
+    sessQcCache = data.commands || [];
+    sessQcRender();
+  } catch (e) {
+    list.innerHTML = '<div class="sess-qc-empty" style="color:#e94560">Error: ' + sessEscHtml(e.message || e) + '</div>';
+  }
+}
+
+function sessQcRender() {
+  const list = document.getElementById('sessQcList');
+  if (!list) return;
+  const q = ((document.getElementById('sessQcSearch') || {}).value || '').toLowerCase().trim();
+  const items = (sessQcCache || []).filter(c => !q
+    || (c.name || '').toLowerCase().includes(q)
+    || (c.command || '').toLowerCase().includes(q)
+    || (c.tags || '').toLowerCase().includes(q));
+  list.innerHTML = '';
+  if (!items.length) {
+    list.innerHTML = '<div class="sess-qc-empty">No quick commands found.</div>';
+    return;
+  }
+  items.forEach(c => {
+    const el = document.createElement('div');
+    el.className = 'sess-qc-item';
+    el.innerHTML = '<div class="sess-qc-name">' + sessEscHtml(c.name || '') + '</div>'
+                 + '<div class="sess-qc-cmd">' + sessEscHtml(c.command || '') + '</div>';
+    el.onclick = () => {
+      const input = document.getElementById('sessSendInput');
+      if (input) { input.value = c.command || ''; input.focus(); }
+      closeSessQuickPicker();
+    };
+    list.appendChild(el);
+  });
 }
 
 function getSettings() {
@@ -4486,6 +4661,8 @@ document.getElementById('aboutModal').addEventListener('click', (e) => {
 });
 document.getElementById('sessionsModal').addEventListener('click', (e) => {
   if (e.target.id === 'sessionsModal') closeSessions();
+  // Any click inside the modal that isn't on the picker itself dismisses it.
+  else if (!e.target.closest('#sessQcPopover') && !e.target.closest('#sessQcBtn')) closeSessQuickPicker();
 });
 
 // Keyboard shortcuts

@@ -31,6 +31,7 @@ The toolbar provides quick access to all features:
 | **Split Right / Split Down** | Split the view into side-by-side or stacked panes |
 | **A- / A+** | Decrease / increase font size (current size shown between them) |
 | **Commands** | Open the quick commands library |
+| **☰ Sessions** | List every live session, attach/tile them, or send a command to them |
 | **Files** | Toggle the file browser sidebar |
 | **Settings** | Terminal settings (font, cursor, scrollback) |
 | **Themes** | Color theme picker |
@@ -130,6 +131,47 @@ Split the terminal view to see two sessions side by side.
 | Close split | **Unsplit** | `Ctrl+Shift+U` |
 
 Each pane shows a different tab. Click a pane to focus it, then use the tab bar to change which session is displayed. You can drag the divider to resize panes.
+
+---
+
+## Sessions
+
+Click **☰ Sessions** to see every live session on your account, including ones
+opened from another device. Each row shows the session name, its slot number,
+the running command, when it was last active, and the pane count. A session
+already attached in this browser is marked **open here**; a session that is a
+remote SSH tab is marked **remote**.
+
+| Action | How |
+|--------|-----|
+| **Attach / focus** | Click **Open** (or **Focus** if it is already a tab here) |
+| **Kill** | Click **✕** — this closes the session on every device |
+| **Tile all** | Lay every session out in a grid of split panes |
+| **Tile selected** | Check the sessions you want, then tile only those |
+| **Refresh** | Click **↻** to reload the list |
+
+Attaching is a live attach, not a copy: the same session stays mirrored on
+every device that has it open. Renaming a tab (double-click its name) renames
+the session everywhere.
+
+### Sending a command to sessions
+
+The bar at the bottom of the Sessions dialog runs a command in several sessions
+at once, without having to switch to each tab.
+
+1. Type the command in the input, or click **⚡** to pick one from your
+   [Quick Commands](#quick-commands) library — a searchable list pops up and the
+   command you click is placed in the input so you can edit it first.
+2. Click **Send to selected** to run it in the checked sessions, or **Send to
+   all** for every session. Sending to all asks for confirmation first.
+
+Keyboard: `Enter` sends to the selected sessions, `Ctrl+Enter` (`Cmd+Enter` on
+macOS) sends to all.
+
+The command is delivered server-side and submitted with Enter, so it also runs
+in sessions that are not currently attached in this browser. Remote SSH tabs and
+remote desktop tabs are always skipped — the toast tells you how many were
+skipped.
 
 ---
 

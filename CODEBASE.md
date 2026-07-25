@@ -339,6 +339,39 @@ Binary tree: each node is either `{type:'pane', tabId}` or `{type:'split', direc
 
 ---
 
+## Session Manager (`#sessionsModal`)
+
+Lists every live session for the user by enumerating tmux windows in
+`TMUX_SESSION`, so sessions opened on other devices show up too. All data flows
+through `/api/exec`; there is no dedicated backend route.
+
+### Key Functions (auth.py, "Session picker" block)
+| Function | Purpose |
+|----------|---------|
+| `fetchSessions()` | `tmux list-windows -F ...` → `[{slot,name,cmd,activity,panes,serverId}]` |
+| `sessIsSendable(s)` | False for remote SSH windows (those carry `@webterminal_server_id`) |
+| `renderSessionList(sessions)` | Build rows; caches the list in `sessLast` |
+| `openSessionSlot(slot,name)` | Attach a session as a tab here (or focus the existing tab) |
+| `killSession(slot,name)` | `tmux kill-window` — removes it on every device |
+| `syncWindowName(slot,name)` | Renames the tmux window so tab names match everywhere |
+| `tileSessions(slotFilter)` | Attach + lay sessions out in a grid of split panes |
+| `sendToSessions(all)` | Broadcast a command to selected/all sessions |
+| `toggleSessQuickPicker()` / `sessQcRender()` | Quick-command popover over `/api/quick-commands` |
+
+### Send-command bar
+- Delivery is server-side: one `/api/exec` call batching, per target slot,
+  `tmux send-keys -t <session>:<slot> -l -- '<cmd>'` then `send-keys ... Enter`.
+  Going through tmux (not the iframe) reaches sessions not attached here.
+- Quoting uses `sessShqStrict()` — POSIX `'\''` escaping. (The older
+  `sessShq()`, used only for window names, escapes differently.)
+- Skipped targets: rows with `serverId` set (remote SSH). Desktop (`type:'desktop'`)
+  and remote-web (`type:'web'`) tabs are iframes with no tmux window, so they
+  never appear in the list at all.
+- `sessSelected` (Set of slots) is shared with "Tile selected"; the send buttons
+  count only sendable rows.
+
+---
+
 ## Key Constants
 
 | Constant | Default | Env Var | Purpose |
