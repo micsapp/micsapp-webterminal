@@ -142,6 +142,8 @@ the running command, when it was last active, and the pane count. A session
 already attached in this browser is marked **open here**; a session that is a
 remote SSH tab is marked **remote**.
 
+![Sessions](images/sessions.png)
+
 | Action | How |
 |--------|-----|
 | **Attach / focus** | Click **Open** (or **Focus** if it is already a tab here) |
@@ -164,6 +166,8 @@ at once, without having to switch to each tab.
    command you click is placed in the input so you can edit it first.
 2. Click **Send to selected** to run it in the checked sessions, or **Send to
    all** for every session. Sending to all asks for confirmation first.
+
+![Quick command picker in the send bar](images/sessions-send.png)
 
 Keyboard: `Enter` sends to the selected sessions, `Ctrl+Enter` (`Cmd+Enter` on
 macOS) sends to all.
