@@ -2,6 +2,7 @@
 """Tiny auth service for ttyd web terminal."""
 
 import base64
+import concurrent.futures
 import getpass
 import hashlib
 import hmac
@@ -236,6 +237,12 @@ SERVER_REPO_LOCK = threading.RLock()
 SERVER_REPO_CACHE = {"expires": 0.0, "servers": [], "error": ""}
 SSH_CONFIG_SYNC_LOCK = threading.Lock()
 SSH_CONFIG_SYNC_SIGNATURE = ""
+SERVER_STATUS_LOCK = threading.RLock()
+SERVER_STATUS_CACHE = {"expires": 0.0, "status": {}}
+SERVER_STATUS_TTL = max(5, int(os.environ.get("WEBTERMINAL_SERVER_STATUS_TTL", "30")))
+SERVER_STATUS_TIMEOUT = max(
+    0.5, float(os.environ.get("WEBTERMINAL_SERVER_STATUS_TIMEOUT", "3"))
+)
 
 
 def _normalize_server_repo_url(value):
@@ -389,6 +396,65 @@ def public_server_catalog(servers):
         }
         for server in servers
     ]
+
+
+def _probe_tcp(host, port, timeout):
+    """True when the endpoint completes a TCP handshake. No data is sent."""
+    if not host or not SSH_HOST_RE.fullmatch(host):
+        return False
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def server_status_snapshot(servers, force=False):
+    """Per-server reachability keyed by server id: {"id": {"web": "up", ...}}.
+
+    Cloudflare-tunnelled SSH has no reachable port 22 -- the tunnel edge answers
+    on 443 and `cloudflared access ssh` brokers the session, so 443 is the only
+    honest signal there. Web terminals are always fronted by HTTPS.
+
+    Probes are TCP-only: nothing is sent, nothing is authenticated, and the
+    result deliberately never includes ssh_hostname, so the browser still cannot
+    learn SSH targets (see public_server_catalog).
+    """
+    now = time.monotonic()
+    with SERVER_STATUS_LOCK:
+        if not force and now < SERVER_STATUS_CACHE["expires"]:
+            return {key: dict(value) for key, value in SERVER_STATUS_CACHE["status"].items()}
+
+    targets = []
+    for server in servers:
+        server_id = server.get("id")
+        if not server_id:
+            continue
+        targets.append((server_id, "web", server.get("web_hostname") or "", 443))
+        mode = server.get("ssh_mode") or "none"
+        if mode != "none":
+            port = 443 if mode == "tunnel" else 22
+            targets.append((server_id, "ssh", server.get("ssh_hostname") or "", port))
+
+    def probe(target):
+        server_id, kind, host, port = target
+        if not host:
+            return server_id, kind, "unknown"
+        return server_id, kind, "up" if _probe_tcp(host, port, SERVER_STATUS_TIMEOUT) else "down"
+
+    status = {}
+    if targets:
+        workers = min(12, len(targets))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+            for server_id, kind, state in pool.map(probe, targets):
+                status.setdefault(server_id, {})[kind] = state
+
+    with SERVER_STATUS_LOCK:
+        SERVER_STATUS_CACHE.update({
+            "expires": time.monotonic() + SERVER_STATUS_TTL,
+            "status": status,
+        })
+    return {key: dict(value) for key, value in status.items()}
 
 
 def append_new_tunnel_ssh_hosts(servers):
@@ -1030,6 +1096,16 @@ __PWA_HEAD__
   .remote-server-title { display: block; padding: 6px 10px 3px; color: #f0f0fa; font-size: 13px; font-weight: 600; }
   .remote-server-title small { display: block; color: #7a7a9e; margin-top: 2px; font-weight: 400; }
   .remote-server-action { padding-left: 18px; }
+  .server-dot {
+    display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+    margin-right: 7px; vertical-align: middle; flex-shrink: 0;
+    background: #4a4a6a; transition: background 0.2s;
+  }
+  .server-dot.up { background: #3fb950; box-shadow: 0 0 5px rgba(63,185,80,0.65); }
+  .server-dot.down { background: #f85149; }
+  .server-dot.unknown { background: #4a4a6a; }
+  .server-dot.pending { background: #d29922; animation: dot-pulse 1.1s ease-in-out infinite; }
+  @keyframes dot-pulse { 50% { opacity: 0.35; } }
   .remote-tab-empty { color: #7a7a9e; font-size: 12px; padding: 10px; }
   .nav-right { margin-left: auto; display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
 
@@ -2561,6 +2637,10 @@ let tabCounter = 0;
 let nextWindowSlot = 0;
 let remoteServers = [];
 let remoteCatalogError = '';
+let remoteStatus = {};
+let remoteStatusLoaded = false;
+let remoteStatusError = '';
+let remoteStatusInFlight = false;
 
 function isTerminalTab(tab) {
   return !!tab && tab.type !== 'desktop' && tab.type !== 'web';
@@ -3080,9 +3160,15 @@ function renderRemoteTabMenu() {
     remoteServers.forEach(server => {
       const group = document.createElement('div');
       group.className = 'remote-server-group';
+      const health = remoteStatus[server.id] || {};
       const title = document.createElement('span');
       title.className = 'remote-server-title';
-      title.textContent = server.name;
+      title.appendChild(statusDot(
+        (health.web === 'up' || health.ssh === 'up') ? 'up'
+          : (health.web === 'down' || health.ssh === 'down') ? 'down'
+          : undefined
+      ));
+      title.appendChild(document.createTextNode(server.name));
       const detail = document.createElement('small');
       detail.textContent = server.web_hostname || server.id;
       title.appendChild(detail);
@@ -3092,9 +3178,12 @@ function renderRemoteTabMenu() {
         const webItem = document.createElement('button');
         webItem.type = 'button';
         webItem.className = 'remote-tab-item remote-server-action';
-        webItem.textContent = 'Web Terminal';
+        webItem.appendChild(statusDot(health.web));
+        webItem.appendChild(document.createTextNode('Web Terminal'));
         const webDetail = document.createElement('small');
-        webDetail.textContent = 'Open in an internal tab';
+        webDetail.textContent = health.web === 'down'
+          ? 'Unreachable — ' + server.web_hostname
+          : 'Open in an internal tab';
         webItem.appendChild(webDetail);
         webItem.addEventListener('click', () => addRemoteWebTab(server.id));
         group.appendChild(webItem);
@@ -3113,9 +3202,11 @@ function renderRemoteTabMenu() {
       const sshItem = document.createElement('button');
       sshItem.type = 'button';
       sshItem.className = 'remote-tab-item remote-server-action';
-      sshItem.textContent = 'SSH Session';
+      sshItem.appendChild(statusDot(health.ssh));
+      sshItem.appendChild(document.createTextNode('SSH Session'));
       const sshDetail = document.createElement('small');
-      sshDetail.textContent = server.ssh_mode === 'tunnel' ? 'Cloudflare tunnel' : 'Direct SSH';
+      const sshWhere = server.ssh_mode === 'tunnel' ? 'Cloudflare tunnel' : 'Direct SSH';
+      sshDetail.textContent = health.ssh === 'down' ? sshWhere + ' — unreachable' : sshWhere;
       sshItem.appendChild(sshDetail);
       sshItem.addEventListener('click', () => addRemoteTab(server.id));
       group.appendChild(sshItem);
@@ -3127,13 +3218,52 @@ function renderRemoteTabMenu() {
   refresh.className = 'remote-tab-item';
   refresh.style.borderTop = '1px solid #0f3460';
   refresh.style.marginTop = '4px';
-  refresh.textContent = '↻ Refresh server list';
+  refresh.textContent = '↻ Refresh server list & status';
   refresh.addEventListener('click', async () => {
     remoteCatalogError = 'Refreshing…';
+    remoteStatus = {};
+    remoteStatusLoaded = false;
+    remoteStatusError = '';
     renderRemoteTabMenu();
     await loadRemoteServers(true);
+    await loadServerStatus(true);
   });
   menu.appendChild(refresh);
+}
+
+function statusDot(state) {
+  // Before the first response every dot is 'pending'; afterwards a missing
+  // state means unknown, so a failure degrades to grey instead of pulsing.
+  const resolved = state || (remoteStatusLoaded ? 'unknown' : 'pending');
+  const dot = document.createElement('span');
+  dot.className = 'server-dot ' + resolved;
+  dot.title = resolved === 'unknown' && remoteStatusError
+    ? 'Status unavailable: ' + remoteStatusError
+    : 'Status: ' + (resolved === 'pending' ? 'checking…' : resolved);
+  return dot;
+}
+
+async function loadServerStatus(force) {
+  if (remoteStatusInFlight) return remoteStatus;
+  remoteStatusInFlight = true;
+  try {
+    const response = await fetch('/api/server-status' + (force ? '?refresh=1' : ''), {
+      cache: 'no-store'
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.error || ('HTTP ' + response.status));
+    remoteStatus = data.status || {};
+    remoteStatusError = data.error || '';
+  } catch (error) {
+    // Never leave the dots pulsing: a failed probe is reported as unknown, with
+    // the reason on the tooltip, so the panel can't look like it is still working.
+    remoteStatus = {};
+    remoteStatusError = String((error && error.message) || error);
+  }
+  remoteStatusLoaded = true;
+  remoteStatusInFlight = false;
+  renderRemoteTabMenu();
+  return remoteStatus;
 }
 
 async function loadRemoteServers(force) {
@@ -3156,7 +3286,11 @@ async function loadRemoteServers(force) {
 function toggleRemoteTabMenu(event) {
   if (event) event.stopPropagation();
   const menu = document.getElementById('remoteTabMenu');
-  if (menu) menu.classList.toggle('open');
+  if (!menu) return;
+  menu.classList.toggle('open');
+  // Probe lazily: opening the panel is the only time status is worth spending
+  // a round of TCP connects on. The backend caches for WEBTERMINAL_SERVER_STATUS_TTL.
+  if (menu.classList.contains('open')) loadServerStatus(false);
 }
 
 function closeRemoteTabMenu() {
@@ -8352,6 +8486,20 @@ except Exception as ex:
             "error": error,
         })
 
+    def _handle_server_status(self, params=None):
+        username = self._get_authenticated_user()
+        if not username:
+            self._send_error(401, "not authenticated")
+            return
+        force = bool(params and params.get("refresh", [""])[0] == "1")
+        servers, error, configured = load_server_catalog()
+        status = server_status_snapshot(servers, force=force) if configured else {}
+        self._send_json(200, {
+            "status": status,
+            "configured": configured,
+            "error": error,
+        })
+
     def _handle_remote_tab(self):
         username = self._get_authenticated_user()
         if not username:
@@ -8793,6 +8941,8 @@ except Exception as ex:
             self._handle_shell_ws(params)
         elif path == "/api/servers":
             self._handle_servers(params)
+        elif path == "/api/server-status":
+            self._handle_server_status(params)
         else:
             self.send_response(404)
             self.end_headers()

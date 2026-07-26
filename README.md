@@ -292,6 +292,22 @@ strictly additive: it does not add web-host aliases or direct SSH entries, and
 it never rewrites, reorders, updates, or removes existing SSH configuration.
 `./deploy.sh --remote-setup` performs the same check immediately.
 
+### Listing the catalog from the shell
+
+`./list-servers.sh` prints every registered Web Terminal hostname and SSH DNS
+name, reading the URL and passcode written by `--remote-setup`:
+
+```bash
+./list-servers.sh                # grouped table
+./list-servers.sh --status       # same, with a live reachability probe
+./list-servers.sh --ssh --plain  # bare SSH hostnames, one per line
+./list-servers.sh --json         # raw catalog
+```
+
+`--plain` is pipe-friendly, e.g. `./list-servers.sh --ssh --plain | xargs -n1 ssh -o BatchMode=yes`.
+The passcode is passed to curl over stdin (`-H @-`), so it never appears in
+`ps` output.
+
 ### Remote server connections
 
 The arrow beside **+ New Tab** groups two connection choices beneath every
@@ -306,6 +322,21 @@ The SSH action automatically follows the registered connection mode:
 - `ssh_mode: "direct"` runs regular SSH to `ssh_hostname`.
 - `ssh_mode: "tunnel"` uses `cloudflared access ssh` as SSH's `ProxyCommand`.
 - `ssh_mode: "none"` and disabled entries are not shown.
+
+Each entry carries a status dot: green when the endpoint completed a TCP
+handshake, red when it did not, amber while the probe is in flight, and grey
+when no hostname is registered. The dot beside the server name summarises both
+endpoints. Status is probed only when the panel is opened and cached server-side
+for `WEBTERMINAL_SERVER_STATUS_TTL` seconds (default 30); **↻ Refresh server
+list & status** forces a re-probe. Probes are TCP-only — port 443 for web hosts
+and tunnelled SSH (whose port 22 is never reachable, since `cloudflared access
+ssh` brokers the session), port 22 for direct SSH. Nothing is sent and nothing
+is authenticated, and the status payload is keyed by server ID, so `ssh_hostname`
+still never reaches the browser. Tune the per-probe timeout with
+`WEBTERMINAL_SERVER_STATUS_TIMEOUT` (default 3 seconds).
+
+A reachable endpoint is not a guarantee that login will succeed — it means the
+listener answered, not that your account or key is valid there.
 
 Embedded Web Terminal tabs are restored by server ID, so arbitrary URLs are
 never persisted in browser tab state. HTML framing is restricted by default to
