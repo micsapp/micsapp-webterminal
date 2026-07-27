@@ -554,6 +554,9 @@ server {
         proxy_set_header Authorization \$http_authorization;
         # Used by auth.py to authorize /ut/<port>/ access (prevents cross-user port access).
         proxy_set_header X-TTYD-Port \$ttyd_port;
+        # Must match the largest client_max_body_size of any location using auth_request,
+        # because nginx checks this limit on the subrequest before stripping the body.
+        client_max_body_size 40m;
     }
 
     # Login page and login API (no auth required)
@@ -574,7 +577,15 @@ server {
         auth_request /api/auth;
         error_page 401 = @login_redirect;
         proxy_pass http://127.0.0.1:${auth_port};
-        client_max_body_size 10m;
+        client_max_body_size 40m;
+    }
+
+    # Shell command execution (requires auth)
+    location = /api/exec {
+        auth_request /api/auth;
+        error_page 401 = @login_redirect;
+        proxy_pass http://127.0.0.1:${auth_port};
+        client_max_body_size 64k;
     }
 
     # Quick commands API (requires auth)
@@ -582,7 +593,14 @@ server {
         auth_request /api/auth;
         error_page 401 = @login_redirect;
         proxy_pass http://127.0.0.1:${auth_port};
-        client_max_body_size 2m;
+        client_max_body_size 8m;
+    }
+
+    # API token management (requires auth)
+    location /api/tokens {
+        auth_request /api/auth;
+        error_page 401 = @login_redirect;
+        proxy_pass http://127.0.0.1:${auth_port};
     }
 
     # Per-user shared settings (e.g. browser tab-title) (requires auth)
@@ -668,6 +686,13 @@ server {
 
     # Desktop API (requires auth)
     location = /api/desktop {
+        auth_request /api/auth;
+        error_page 401 = @login_redirect;
+        proxy_pass http://127.0.0.1:${auth_port};
+    }
+
+    # Help manual (requires auth)
+    location /api/help {
         auth_request /api/auth;
         error_page 401 = @login_redirect;
         proxy_pass http://127.0.0.1:${auth_port};
@@ -1830,6 +1855,20 @@ __PWA_HEAD__
     z-index: 130;
   }
   .remote-tab-menu.open { display: block; }
+  .remote-tab-filter {
+    position: sticky; top: -6px; z-index: 1;
+    margin: -6px -6px 4px; padding: 6px;
+    background: #16213e; border-bottom: 1px solid #0f3460;
+  }
+  .remote-tab-filter input {
+    width: 100%; box-sizing: border-box;
+    padding: 6px 8px; font-size: 13px;
+    color: #d4d4ea; background: #0f172f;
+    border: 1px solid #0f3460; border-radius: 5px;
+    outline: none;
+  }
+  .remote-tab-filter input:focus { border-color: #2d5fa8; }
+  .remote-tab-filter input::placeholder { color: #6a6a8e; }
   .remote-tab-item {
     display: block;
     width: 100%;
@@ -3001,7 +3040,14 @@ __PWA_HEAD__
     <button class="nav-btn new-tab-caret" id="remoteTabBtn" onclick="toggleRemoteTabMenu(event)"
       title="Connect to a remote server" aria-label="Remote server menu">&#9662;</button>
     <div class="remote-tab-menu" id="remoteTabMenu">
-      <div class="remote-tab-empty">Loading remote servers…</div>
+      <div class="remote-tab-filter" id="remoteTabFilterRow">
+        <input type="text" id="remoteTabFilter" placeholder="Filter servers…" autocomplete="off"
+          spellcheck="false" aria-label="Filter remote servers"
+          oninput="renderRemoteTabMenu()" onkeydown="onRemoteFilterKey(event)">
+      </div>
+      <div id="remoteTabMenuBody">
+        <div class="remote-tab-empty">Loading remote servers…</div>
+      </div>
     </div>
   </div>
   <button class="nav-btn" id="sessionsBtn" onclick="openSessions()" title="Session list — bring a session to this device">&#9776; Sessions</button>
@@ -3903,17 +3949,62 @@ function getAllIframes() {
   return document.querySelectorAll('#termContainer iframe');
 }
 
+// Every token of the query must appear somewhere in the server's searchable
+// text, so "prod db" matches a "db-01 (production)" host in either order.
+function remoteServerMatches(server, tokens) {
+  if (!tokens.length) return true;
+  const haystack = [server.name, server.id, server.web_hostname, server.ssh_host, server.ssh_mode]
+    .filter(Boolean).join(' ').toLowerCase();
+  return tokens.every(token => haystack.includes(token));
+}
+
+function filteredRemoteServers() {
+  const input = document.getElementById('remoteTabFilter');
+  const tokens = ((input && input.value) || '').trim().toLowerCase().split(/\\s+/).filter(Boolean);
+  return remoteServers.filter(server => remoteServerMatches(server, tokens));
+}
+
+function onRemoteFilterKey(event) {
+  const input = event.currentTarget;
+  if (event.key === 'Escape') {
+    event.stopPropagation();
+    if (input.value) {
+      input.value = '';
+      renderRemoteTabMenu();
+    } else {
+      closeRemoteTabMenu();
+    }
+  } else if (event.key === 'Enter') {
+    // One match left: Enter launches it — web terminal if it has one, else SSH.
+    const matches = filteredRemoteServers();
+    if (matches.length !== 1) return;
+    event.preventDefault();
+    const server = matches[0];
+    if (server.web_hostname) addRemoteWebTab(server.id);
+    else addRemoteTab(server.id);
+  }
+}
+
 function renderRemoteTabMenu() {
   const menu = document.getElementById('remoteTabMenu');
-  if (!menu) return;
-  menu.innerHTML = '';
+  const body = document.getElementById('remoteTabMenuBody');
+  if (!menu || !body) return;
+  body.innerHTML = '';
+  const filterRow = document.getElementById('remoteTabFilterRow');
+  if (filterRow) filterRow.style.display = remoteServers.length > 1 ? '' : 'none';
+  const visible = filteredRemoteServers();
   if (!remoteServers.length) {
     const empty = document.createElement('div');
     empty.className = 'remote-tab-empty';
     empty.textContent = remoteCatalogError || 'No remote SSH servers are configured.';
-    menu.appendChild(empty);
+    body.appendChild(empty);
+  } else if (!visible.length) {
+    const empty = document.createElement('div');
+    empty.className = 'remote-tab-empty';
+    empty.textContent = 'No servers match this filter.';
+    body.appendChild(empty);
   } else {
-    remoteServers.forEach(server => {
+    visible.forEach(server => {
       const group = document.createElement('div');
       group.className = 'remote-server-group';
       const health = remoteStatus[server.id] || {};
@@ -3966,7 +4057,7 @@ function renderRemoteTabMenu() {
       sshItem.appendChild(sshDetail);
       sshItem.addEventListener('click', () => addRemoteTab(server.id));
       group.appendChild(sshItem);
-      menu.appendChild(group);
+      body.appendChild(group);
     });
   }
   const refresh = document.createElement('button');
@@ -3984,7 +4075,7 @@ function renderRemoteTabMenu() {
     await loadRemoteServers(true);
     await loadServerStatus(true);
   });
-  menu.appendChild(refresh);
+  body.appendChild(refresh);
 }
 
 function statusDot(state) {
@@ -4046,7 +4137,17 @@ function toggleRemoteTabMenu(event) {
   menu.classList.toggle('open');
   // Probe lazily: opening the panel is the only time status is worth spending
   // a round of TCP connects on. The backend caches for WEBTERMINAL_SERVER_STATUS_TTL.
-  if (menu.classList.contains('open')) loadServerStatus(false);
+  if (menu.classList.contains('open')) {
+    const input = document.getElementById('remoteTabFilter');
+    if (input) {
+      input.value = '';
+      renderRemoteTabMenu();
+      // Skip the autofocus on touch devices so the on-screen keyboard doesn't
+      // cover the list the user just asked to see.
+      if (!window.matchMedia('(pointer: coarse)').matches) input.focus();
+    }
+    loadServerStatus(false);
+  }
 }
 
 function closeRemoteTabMenu() {
