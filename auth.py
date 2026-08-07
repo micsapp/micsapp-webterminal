@@ -6832,10 +6832,44 @@ next_port = int(os.environ.get("TTYD_START_PORT", "7700"))
 
 
 def port_is_free(port):
+    """Return True if nothing is listening on 127.0.0.1:port.
+
+    The connect() probe is the load-bearing part. bind() alone is not a
+    reliable liveness test on every platform we run on: under WSL 1 the
+    Winsock-backed stack lets bind() succeed with SO_REUSEADDR even while
+    another socket is actively listening on the same address, so this reported
+    every port as free. /app reads that as "the user's ttyd died" and bounces
+    them to /login, which turned correct credentials into an endless login
+    loop, and allocate_port() would hand out ports already in use.
+
+    The bind() fallback below intentionally keeps SO_REUSEADDR so behaviour is
+    unchanged on hosts where bind() already worked: whenever a socket is truly
+    listening, connect() succeeds and we return False before reaching it, and
+    that is exactly the case bind() was already catching there. Ports idling in
+    TIME_WAIT still count as free, as before.
+    """
+    port = int(port)
+
+    # Authoritative: something is accepting connections here.
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.settimeout(0.5)
+        s.connect(("127.0.0.1", port))
+        return False
+    except OSError:
+        pass
+    finally:
+        try:
+            s.close()
+        except Exception:
+            pass
+
+    # Nothing is listening; fall back to the original bind() probe to also
+    # catch sockets that are bound but not listening.
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        s.bind(("127.0.0.1", int(port)))
+        s.bind(("127.0.0.1", port))
         return True
     except OSError:
         return False
@@ -7509,8 +7543,10 @@ class AuthHandler(http.server.BaseHTTPRequestHandler):
                 self.send_response(200)
                 self.send_header("Content-Type", "text/plain; charset=utf-8")
                 self.send_header("Cache-Control", "no-store")
+                _resp_body = content.encode("utf-8")
+                self.send_header("Content-Length", str(len(_resp_body)))
                 self.end_headers()
-                self.wfile.write(content.encode("utf-8"))
+                self.wfile.write(_resp_body)
             except FileNotFoundError:
                 self._send_error(404, "manual not found")
         elif path.startswith("/api/help/images/"):
@@ -8865,8 +8901,10 @@ except Exception as ex:
         if path == "/login":
             self.send_response(200)
             self.send_header("Content-Type", "text/html")
+            _resp_body = LOGIN_HTML.replace("__PWA_HEAD__", PWA_HEAD).encode()
+            self.send_header("Content-Length", str(len(_resp_body)))
             self.end_headers()
-            self.wfile.write(LOGIN_HTML.replace("__PWA_HEAD__", PWA_HEAD).encode())
+            self.wfile.write(_resp_body)
         elif path == "/manifest.webmanifest":
             # Per-user app name (configurable, like the browser tab title). The
             # browser sends the session cookie because the <link> uses
@@ -8882,33 +8920,43 @@ except Exception as ex:
                     name = None
             self.send_response(200)
             self.send_header("Content-Type", "application/manifest+json")
+            _resp_body = build_pwa_manifest(name).encode()
+            self.send_header("Content-Length", str(len(_resp_body)))
             self.end_headers()
-            self.wfile.write(build_pwa_manifest(name).encode())
+            self.wfile.write(_resp_body)
         elif path == "/sw.js":
             self.send_response(200)
             self.send_header("Content-Type", "application/javascript; charset=utf-8")
             # Allow root-scope control even though served from /sw.js.
             self.send_header("Service-Worker-Allowed", "/")
+            _resp_body = SW_JS.replace("__APP_VERSION__", APP_VERSION).encode()
+            self.send_header("Content-Length", str(len(_resp_body)))
             self.end_headers()
-            self.wfile.write(SW_JS.replace("__APP_VERSION__", APP_VERSION).encode())
+            self.wfile.write(_resp_body)
         elif path == "/offline.html":
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
+            _resp_body = OFFLINE_HTML.encode()
+            self.send_header("Content-Length", str(len(_resp_body)))
             self.end_headers()
-            self.wfile.write(OFFLINE_HTML.encode())
+            self.wfile.write(_resp_body)
         elif path == "/icon.svg":
             self.send_response(200)
             self.send_header("Content-Type", "image/svg+xml")
+            _resp_body = ICON_SVG.encode()
+            self.send_header("Content-Length", str(len(_resp_body)))
             self.end_headers()
-            self.wfile.write(ICON_SVG.encode())
+            self.wfile.write(_resp_body)
         elif path in ("/icon-192.png", "/icon-512.png", "/apple-touch-icon.png"):
             data = {"/icon-192.png": ICON_PNG_192,
                     "/icon-512.png": ICON_PNG_512,
                     "/apple-touch-icon.png": ICON_PNG_180}[path]
             self.send_response(200)
             self.send_header("Content-Type", "image/png")
+            _resp_body = data
+            self.send_header("Content-Length", str(len(_resp_body)))
             self.end_headers()
-            self.wfile.write(data)
+            self.wfile.write(_resp_body)
         elif path == "/app":
             # Extract username and port from session
             token = get_cookie_token(self.headers)
@@ -8916,6 +8964,7 @@ except Exception as ex:
             if not username or not port:
                 self.send_response(302)
                 self.send_header("Location", "/login")
+                self.send_header("Content-Length", "0")
                 self.end_headers()
                 return
             # The cookie carries the ttyd port assigned at login. If that ttyd
@@ -8927,6 +8976,7 @@ except Exception as ex:
             if port_is_free(port):
                 self.send_response(302)
                 self.send_header("Location", "/login")
+                self.send_header("Content-Length", "0")
                 self.end_headers()
                 return
             # Inject the user's ttyd port into the app HTML
@@ -8942,20 +8992,25 @@ except Exception as ex:
             )
             self.send_response(200)
             self.send_header("Content-Type", "text/html")
+            _resp_body = html.encode()
+            self.send_header("Content-Length", str(len(_resp_body)))
             self.end_headers()
-            self.wfile.write(html.encode())
+            self.wfile.write(_resp_body)
         elif path == "/api/term-hook.js":
             token = get_cookie_token(self.headers)
             username, _port = verify_token(token)
             if not username:
                 self.send_response(401)
+                self.send_header("Content-Length", "0")
                 self.end_headers()
                 return
             self.send_response(200)
             self.send_header("Content-Type", "application/javascript; charset=utf-8")
             self.send_header("Cache-Control", "no-store")
+            _resp_body = TERM_HOOK_JS.encode("utf-8")
+            self.send_header("Content-Length", str(len(_resp_body)))
             self.end_headers()
-            self.wfile.write(TERM_HOOK_JS.encode("utf-8"))
+            self.wfile.write(_resp_body)
         elif path == "/api/auth":
             token = get_cookie_token(self.headers)
             username, token_port = verify_token(token)
@@ -8968,12 +9023,15 @@ except Exception as ex:
                         # Bearer tokens cannot authorize /ut/ terminal access
                         if (self.headers.get("X-TTYD-Port") or "").strip():
                             self.send_response(401)
+                            self.send_header("Content-Length", "0")
                             self.end_headers()
                             return
                         self.send_response(200)
+                        self.send_header("Content-Length", "0")
                         self.end_headers()
                         return
                 self.send_response(401)
+                self.send_header("Content-Length", "0")
                 self.end_headers()
                 return
 
@@ -8985,15 +9043,18 @@ except Exception as ex:
                     req_port_i = int(req_port)
                 except ValueError:
                     self.send_response(401)
+                    self.send_header("Content-Length", "0")
                     self.end_headers()
                     return
                 # Enforce that the cookie is bound to the requested ttyd port.
                 if token_port != req_port_i:
                     self.send_response(401)
+                    self.send_header("Content-Length", "0")
                     self.end_headers()
                     return
 
             self.send_response(200)
+            self.send_header("Content-Length", "0")
             self.end_headers()
         elif path == "/api/desktop":
             self._handle_desktop_request(params)
@@ -9021,6 +9082,7 @@ except Exception as ex:
             self._handle_server_status(params)
         else:
             self.send_response(404)
+            self.send_header("Content-Length", "0")
             self.end_headers()
 
     def do_POST(self):
@@ -9035,6 +9097,7 @@ except Exception as ex:
                 data = json.loads(body)
             except Exception:
                 self.send_response(400)
+                self.send_header("Content-Length", "0")
                 self.end_headers()
                 return
             username = data.get("username", "")
@@ -9045,8 +9108,10 @@ except Exception as ex:
                 except Exception:
                     self.send_response(500)
                     self.send_header("Content-Type", "application/json")
+                    _resp_body = b'{"ok":false,"error":"terminal startup failed"}'
+                    self.send_header("Content-Length", str(len(_resp_body)))
                     self.end_headers()
-                    self.wfile.write(b'{"ok":false,"error":"terminal startup failed"}')
+                    self.wfile.write(_resp_body)
                     return
                 token = make_token(username, port)
                 self.send_response(200)
@@ -9061,13 +9126,17 @@ except Exception as ex:
                     cookie_parts.append("Secure")
                 self.send_header("Set-Cookie", "; ".join(cookie_parts))
                 self.send_header("Content-Type", "application/json")
+                _resp_body = json.dumps({"ok": True, "port": port}).encode()
+                self.send_header("Content-Length", str(len(_resp_body)))
                 self.end_headers()
-                self.wfile.write(json.dumps({"ok": True, "port": port}).encode())
+                self.wfile.write(_resp_body)
             else:
                 self.send_response(401)
                 self.send_header("Content-Type", "application/json")
+                _resp_body = b'{"ok":false,"error":"invalid username or password"}'
+                self.send_header("Content-Length", str(len(_resp_body)))
                 self.end_headers()
-                self.wfile.write(b'{"ok":false,"error":"invalid username or password"}')
+                self.wfile.write(_resp_body)
         elif path == "/api/files/upload":
             self._handle_files_upload(params)
         elif path == "/api/files/write":
@@ -9094,6 +9163,7 @@ except Exception as ex:
             self._handle_remote_tab()
         else:
             self.send_response(404)
+            self.send_header("Content-Length", "0")
             self.end_headers()
 
 
