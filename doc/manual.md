@@ -256,8 +256,18 @@ Click **Commands** to open a library of saved terminal commands you can run with
 - **Run** -- click any command to send it to the active terminal
 - **Add** -- create a new command with a name, command text, and tags
 - **Edit / Delete** -- manage existing commands
+- **Sync** -- merge local commands with the protected shared Droppy repository
 
-Commands are stored server-side and shared across sessions.
+Commands are stored in `~/ttyd_quick_command.json` for the authenticated user,
+so they are shared across that user's browser sessions on one server. **Sync**
+adds and updates commands in both the local file and the shared
+`commands.json` without duplicating commands that have the same normalized
+name.
+
+Sync is additive in the first repository version. If you delete a command
+locally while it still exists in the shared repository, it returns on the next
+sync. The server administrator initializes the repository once from
+`./ssh-tunnel-tui.sh server`.
 
 ---
 
@@ -397,7 +407,7 @@ mics_cli mkdir <path>                    Create a directory
 mics_cli rm <path>                       Delete a file or directory
 mics_cli tokens list                     List your bearer tokens
 mics_cli tokens revoke <name>            Revoke a token
-mics_cli quick-commands list/export/import
+mics_cli quick-commands list/sync/export/import
 mics_cli login / logout / whoami / help [cmd]
 ```
 

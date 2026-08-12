@@ -106,6 +106,11 @@ describe('Quick Commands', () => {
       cy.get('#qcExportBtn').should('be.visible');
     });
 
+    it('should have a shared repository sync button', () => {
+      cy.openQuickCommands();
+      cy.get('#qcSyncBtn').should('be.visible').and('contain.text', 'Sync');
+    });
+
     it('should export quick commands via API', () => {
       cy.loginViaApi();
       cy.request('/api/quick-commands/export').then((resp) => {

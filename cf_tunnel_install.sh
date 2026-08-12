@@ -799,10 +799,12 @@ import socket
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.parse
 import zlib
+from pathlib import Path
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -881,6 +883,7 @@ SERVER_REPO_CONFIG = os.environ.get(
 )
 SERVER_REPO_CACHE_TTL = max(10, int(os.environ.get("WEBTERMINAL_SERVER_REPO_CACHE_TTL", "60")))
 SERVER_REPO_HELPER = os.path.join(BASE_DIR, "server-repo.py")
+COMMANDS_REPO_HELPER = os.path.join(BASE_DIR, "commands-repo.py")
 SSH_CONFIG_FILE = os.environ.get(
     "WEBTERMINAL_SSH_CONFIG", os.path.expanduser("~/.ssh/config")
 )
@@ -1024,6 +1027,9 @@ SERVER_STATUS_TTL = max(5, int(os.environ.get("WEBTERMINAL_SERVER_STATUS_TTL", "
 SERVER_STATUS_TIMEOUT = max(
     0.5, float(os.environ.get("WEBTERMINAL_SERVER_STATUS_TIMEOUT", "3"))
 )
+COMMANDS_REPO_MAX_BYTES = 8 * 1024 * 1024
+COMMANDS_SYNC_LOCKS_GUARD = threading.Lock()
+COMMANDS_SYNC_LOCKS = {}
 
 
 def _normalize_server_repo_url(value):
@@ -1033,6 +1039,37 @@ def _normalize_server_repo_url(value):
     if not value.endswith(".json"):
         value += "/serverlist.json"
     return value
+
+
+def _commands_repo_url(server_url):
+    """Return commands.json beside the configured server repository."""
+    override = os.environ.get("WEBTERMINAL_COMMANDS_REPO_URL", "").strip()
+    value = override or server_url
+    if not isinstance(value, str) or "\r" in value or "\n" in value:
+        return ""
+    try:
+        parsed = urllib.parse.urlsplit(value.strip())
+    except ValueError:
+        return ""
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        return ""
+    path = parsed.path.rstrip("/")
+    if override and not path.endswith(".json"):
+        path += "/commands.json"
+    else:
+        parent = path.rsplit("/", 1)[0] if "/" in path else ""
+        path = f"{parent}/commands.json"
+    return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, path, parsed.query, ""))
+
+
+def commands_repo_settings():
+    server_url, passcode = server_repo_settings()
+    return _commands_repo_url(server_url), passcode
+
+
+def _commands_sync_lock(username):
+    with COMMANDS_SYNC_LOCKS_GUARD:
+        return COMMANDS_SYNC_LOCKS.setdefault(username, threading.Lock())
 
 
 def server_repo_settings():
@@ -1115,6 +1152,247 @@ def fetch_server_repository(url, passcode):
         detail = result.stderr.decode(errors="replace").strip()[:500]
         raise OSError(detail or f"curl exited with status {result.returncode}")
     return result.stdout
+
+
+class CommandsSyncError(Exception):
+    def __init__(self, message, status=502):
+        super().__init__(message)
+        self.status = status
+
+
+def _read_etag(headers_path):
+    try:
+        lines = Path(headers_path).read_text(encoding="iso-8859-1").splitlines()
+    except OSError as exc:
+        raise CommandsSyncError(f"cannot read repository response headers: {exc}")
+    values = [line.split(":", 1)[1].strip() for line in lines if line.lower().startswith("etag:")]
+    etag = values[-1] if values else ""
+    if len(etag) > 512 or "\r" in etag or "\n" in etag:
+        raise CommandsSyncError("commands repository returned an invalid ETag")
+    return etag
+
+
+def _curl_commands_get(url, passcode, body_path, headers_path):
+    if not url:
+        raise CommandsSyncError("commands repository URL is invalid", 503)
+    if not passcode:
+        raise CommandsSyncError("server repository passcode is not configured", 503)
+    if "\r" in passcode or "\n" in passcode:
+        raise CommandsSyncError("repository passcode is invalid", 503)
+    try:
+        result = subprocess.run(
+            [
+                CURL_BIN,
+                "--silent",
+                "--show-error",
+                "--connect-timeout", "10",
+                "--max-time", "30",
+                "-D", str(headers_path),
+                "-o", str(body_path),
+                "-w", "%{http_code}",
+                "-H", "@-",
+                url,
+            ],
+            input=f"X-Droppy-Share-Passcode: {passcode}\n".encode("utf-8"),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=35,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise CommandsSyncError(f"commands repository download failed: {exc}")
+    detail = result.stderr.decode(errors="replace").strip()[:500]
+    try:
+        status = int(result.stdout.decode().strip() or "0")
+    except ValueError:
+        status = 0
+    if result.returncode != 0 or status != 200:
+        if status == 404:
+            raise CommandsSyncError("commands repository is not initialized", 404)
+        raise CommandsSyncError(
+            f"commands repository download failed (HTTP {status or 'unknown'}): "
+            f"{detail or 'request rejected'}"
+        )
+    try:
+        size = os.path.getsize(body_path)
+    except OSError as exc:
+        raise CommandsSyncError(f"cannot read commands repository: {exc}")
+    if size > COMMANDS_REPO_MAX_BYTES:
+        raise CommandsSyncError("commands repository is too large", 413)
+    return _read_etag(headers_path)
+
+
+def _curl_commands_put(url, passcode, etag, body_path):
+    if not etag:
+        raise CommandsSyncError("commands repository response had no ETag; refusing unsafe overwrite")
+    try:
+        result = subprocess.run(
+            [
+                CURL_BIN,
+                "--silent",
+                "--show-error",
+                "--connect-timeout", "10",
+                "--max-time", "30",
+                "-o", "/dev/null",
+                "-w", "%{http_code}",
+                "-X", "PUT",
+                "-H", "@-",
+                "-H", f"If-Match: {etag}",
+                "-H", "Content-Type: application/json",
+                "--data-binary", f"@{body_path}",
+                url,
+            ],
+            input=f"X-Droppy-Share-Passcode: {passcode}\n".encode("utf-8"),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=35,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise CommandsSyncError(f"commands repository upload failed: {exc}")
+    detail = result.stderr.decode(errors="replace").strip()[:500]
+    try:
+        status = int(result.stdout.decode().strip() or "0")
+    except ValueError:
+        status = 0
+    if result.returncode != 0:
+        raise CommandsSyncError(
+            f"commands repository upload failed: {detail or f'curl exited {result.returncode}'}"
+        )
+    return status
+
+
+def _read_user_quick_commands(username):
+    script = """
+import json, os
+p = os.path.expanduser("~/ttyd_quick_command.json")
+try:
+    if os.path.exists(p):
+        with open(p, "r", encoding="utf-8") as fh:
+            commands = json.load(fh)
+        if not isinstance(commands, list):
+            raise ValueError("local quick-command file must contain a JSON array")
+    else:
+        commands = []
+    print(json.dumps({"ok": True, "commands": commands}))
+except Exception as exc:
+    print(json.dumps({"error": str(exc)}))
+"""
+    rc, out, err = run_as_user(username, script)
+    if rc != 0:
+        raise CommandsSyncError(
+            f"cannot read local quick commands: {err.decode(errors='replace').strip()[:300]}",
+            500,
+        )
+    try:
+        result = json.loads(out)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        raise CommandsSyncError("cannot read local quick commands: invalid helper response", 500)
+    if result.get("error"):
+        raise CommandsSyncError(f"cannot read local quick commands: {result['error']}", 400)
+    return result.get("commands", [])
+
+
+def _write_user_quick_commands(username, commands):
+    payload = base64.b64encode(
+        (json.dumps(commands, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+    ).decode()
+    script = f"""
+import base64, os, tempfile
+p = os.path.expanduser("~/ttyd_quick_command.json")
+data = base64.b64decode({payload!r})
+tmp = ""
+try:
+    fd, tmp = tempfile.mkstemp(prefix=".ttyd_quick_command.", dir=os.path.dirname(p))
+    os.fchmod(fd, 0o600)
+    with os.fdopen(fd, "wb") as fh:
+        fh.write(data)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, p)
+    tmp = ""
+    try:
+        dir_fd = os.open(os.path.dirname(p), os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except OSError:
+        pass
+    print("ok")
+finally:
+    if tmp:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+"""
+    rc, out, err = run_as_user(username, script)
+    if rc != 0 or out.strip() != b"ok":
+        detail = err.decode(errors="replace").strip()[:300]
+        raise CommandsSyncError(f"remote sync succeeded but local write failed: {detail or 'unknown error'}", 500)
+
+
+def sync_quick_commands(username):
+    if not os.path.isfile(COMMANDS_REPO_HELPER):
+        raise CommandsSyncError("commands repository helper is unavailable", 503)
+    url, passcode = commands_repo_settings()
+    with _commands_sync_lock(username):
+        local_commands = _read_user_quick_commands(username)
+        local_payload = json.dumps(local_commands, ensure_ascii=False).encode("utf-8")
+        if len(local_payload) > COMMANDS_REPO_MAX_BYTES:
+            raise CommandsSyncError("local quick-command file is too large", 413)
+
+        with tempfile.TemporaryDirectory(prefix="webterminal-command-sync-") as temp:
+            temp_path = Path(temp)
+            local_path = temp_path / "local.json"
+            local_path.write_bytes(local_payload)
+            for attempt in range(2):
+                remote_path = temp_path / "commands.json"
+                headers_path = temp_path / "headers"
+                remote_output = temp_path / "commands.updated.json"
+                local_output = temp_path / "local.updated.json"
+                etag = _curl_commands_get(url, passcode, remote_path, headers_path)
+                try:
+                    result = subprocess.run(
+                        [
+                            sys.executable,
+                            COMMANDS_REPO_HELPER,
+                            "merge",
+                            str(remote_path),
+                            str(local_path),
+                            str(remote_output),
+                            str(local_output),
+                        ],
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        timeout=10,
+                    )
+                except (OSError, subprocess.TimeoutExpired) as exc:
+                    raise CommandsSyncError(f"commands merge failed: {exc}", 500)
+                if result.returncode != 0:
+                    detail = result.stderr.decode(errors="replace").strip()[:500]
+                    raise CommandsSyncError(f"commands merge failed: {detail or 'invalid repository'}", 400)
+                try:
+                    metadata = json.loads(result.stdout)
+                    merged_local = json.loads(local_output.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+                    raise CommandsSyncError(f"commands merge returned invalid output: {exc}", 500)
+
+                if metadata.get("remote_changed"):
+                    status = _curl_commands_put(url, passcode, etag, remote_output)
+                    if status == 412:
+                        if attempt == 0:
+                            continue
+                        raise CommandsSyncError(
+                            "commands repository changed twice; retry sync", 409
+                        )
+                    if status not in (200, 201, 204):
+                        raise CommandsSyncError(
+                            f"commands repository rejected the upload (HTTP {status or 'unknown'})"
+                        )
+                if metadata.get("local_changed"):
+                    _write_user_quick_commands(username, merged_local)
+                return metadata
+    raise CommandsSyncError("commands repository sync did not complete", 500)
 
 
 def load_server_catalog(force=False):
@@ -3255,6 +3533,7 @@ __PWA_HEAD__
     <div class="qc-header">
       <span class="qc-header-title">&#9889; Quick Commands</span>
       <button class="fp-btn" id="qcAddBtn" onclick="qcShowForm()">+ Add</button>
+      <button class="fp-btn" id="qcSyncBtn" onclick="qcSync()" title="Merge local commands with the shared repository">&#8635; Sync</button>
       <button class="fp-btn" id="qcImportBtn" onclick="document.getElementById('qcImportInput').click()">&#8593; Import</button>
       <button class="fp-btn" id="qcExportBtn" onclick="qcExport()">&#8595; Export</button>
       <button class="fp-btn" onclick="closeQuickCommands()">&#10005;</button>
@@ -7527,6 +7806,48 @@ async function qcDeleteCommand(id, name) {
   }
 }
 
+async function qcSync() {
+  const button = document.getElementById('qcSyncBtn');
+  if (!button || button.disabled) return;
+  const oldText = button.innerHTML;
+  button.disabled = true;
+  button.textContent = 'Syncing...';
+  try {
+    const res = await fetch('/api/quick-commands/sync', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mode: 'merge' }),
+    });
+    const text = await res.text();
+    let data;
+    try {
+      data = JSON.parse(text);
+    } catch (parseError) {
+      throw new Error('Server returned an invalid response (HTTP ' + res.status + ')');
+    }
+    if (!res.ok || data.error) {
+      throw new Error(data.error || ('HTTP ' + res.status));
+    }
+    await qcLoadCommands();
+    const parts = [];
+    if (data.added_local) parts.push(data.added_local + ' downloaded');
+    if (data.added_remote) parts.push(data.added_remote + ' uploaded');
+    if (data.updated) parts.push(data.updated + ' updated');
+    if (data.deduplicated) parts.push(data.deduplicated + ' deduplicated');
+    showToast(
+      parts.length
+        ? 'Commands synced: ' + parts.join(', ')
+        : 'Commands already in sync',
+      false
+    );
+  } catch (error) {
+    showToast('Sync failed: ' + error.message, true);
+  } finally {
+    button.disabled = false;
+    button.innerHTML = oldText;
+  }
+}
+
 function qcExport() {
   const a = document.createElement('a');
   a.href = '/api/quick-commands/export';
@@ -7613,10 +7934,44 @@ next_port = int(os.environ.get("TTYD_START_PORT", "7700"))
 
 
 def port_is_free(port):
+    """Return True if nothing is listening on 127.0.0.1:port.
+
+    The connect() probe is the load-bearing part. bind() alone is not a
+    reliable liveness test on every platform we run on: under WSL 1 the
+    Winsock-backed stack lets bind() succeed with SO_REUSEADDR even while
+    another socket is actively listening on the same address, so this reported
+    every port as free. /app reads that as "the user's ttyd died" and bounces
+    them to /login, which turned correct credentials into an endless login
+    loop, and allocate_port() would hand out ports already in use.
+
+    The bind() fallback below intentionally keeps SO_REUSEADDR so behaviour is
+    unchanged on hosts where bind() already worked: whenever a socket is truly
+    listening, connect() succeeds and we return False before reaching it, and
+    that is exactly the case bind() was already catching there. Ports idling in
+    TIME_WAIT still count as free, as before.
+    """
+    port = int(port)
+
+    # Authoritative: something is accepting connections here.
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.settimeout(0.5)
+        s.connect(("127.0.0.1", port))
+        return False
+    except OSError:
+        pass
+    finally:
+        try:
+            s.close()
+        except Exception:
+            pass
+
+    # Nothing is listening; fall back to the original bind() probe to also
+    # catch sockets that are bound but not listening.
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        s.bind(("127.0.0.1", int(port)))
+        s.bind(("127.0.0.1", port))
         return True
     except OSError:
         return False
@@ -8290,8 +8645,10 @@ class AuthHandler(http.server.BaseHTTPRequestHandler):
                 self.send_response(200)
                 self.send_header("Content-Type", "text/plain; charset=utf-8")
                 self.send_header("Cache-Control", "no-store")
+                _resp_body = content.encode("utf-8")
+                self.send_header("Content-Length", str(len(_resp_body)))
                 self.end_headers()
-                self.wfile.write(content.encode("utf-8"))
+                self.wfile.write(_resp_body)
             except FileNotFoundError:
                 self._send_error(404, "manual not found")
         elif path.startswith("/api/help/images/"):
@@ -8798,6 +9155,33 @@ except Exception as ex:
             self._send_json(200, data)
 
     # --- Quick Commands API handlers ---
+
+    def _handle_quick_commands_sync(self):
+        username = self._get_authenticated_user()
+        if not username:
+            self._send_error(401, "not authenticated")
+            return
+        length = int(self.headers.get("Content-Length", 0))
+        if length > 64 * 1024:
+            self._send_error(413, "payload too large")
+            return
+        if length:
+            body = self.rfile.read(length)
+            try:
+                request = json.loads(body)
+            except json.JSONDecodeError:
+                self._send_error(400, "invalid json")
+                return
+            if not isinstance(request, dict):
+                self._send_error(400, "body must be a JSON object")
+                return
+            if request.get("mode", "merge") != "merge":
+                self._send_error(400, "only merge mode is supported")
+                return
+        try:
+            self._send_json(200, sync_quick_commands(username))
+        except CommandsSyncError as exc:
+            self._send_error(exc.status, str(exc))
 
     def _load_user_settings(self, username):
         """Return the user's persisted settings dict (best-effort; {} on error).
@@ -9646,8 +10030,10 @@ except Exception as ex:
         if path == "/login":
             self.send_response(200)
             self.send_header("Content-Type", "text/html")
+            _resp_body = LOGIN_HTML.replace("__PWA_HEAD__", PWA_HEAD).encode()
+            self.send_header("Content-Length", str(len(_resp_body)))
             self.end_headers()
-            self.wfile.write(LOGIN_HTML.replace("__PWA_HEAD__", PWA_HEAD).encode())
+            self.wfile.write(_resp_body)
         elif path == "/manifest.webmanifest":
             # Per-user app name (configurable, like the browser tab title). The
             # browser sends the session cookie because the <link> uses
@@ -9663,33 +10049,43 @@ except Exception as ex:
                     name = None
             self.send_response(200)
             self.send_header("Content-Type", "application/manifest+json")
+            _resp_body = build_pwa_manifest(name).encode()
+            self.send_header("Content-Length", str(len(_resp_body)))
             self.end_headers()
-            self.wfile.write(build_pwa_manifest(name).encode())
+            self.wfile.write(_resp_body)
         elif path == "/sw.js":
             self.send_response(200)
             self.send_header("Content-Type", "application/javascript; charset=utf-8")
             # Allow root-scope control even though served from /sw.js.
             self.send_header("Service-Worker-Allowed", "/")
+            _resp_body = SW_JS.replace("__APP_VERSION__", APP_VERSION).encode()
+            self.send_header("Content-Length", str(len(_resp_body)))
             self.end_headers()
-            self.wfile.write(SW_JS.replace("__APP_VERSION__", APP_VERSION).encode())
+            self.wfile.write(_resp_body)
         elif path == "/offline.html":
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
+            _resp_body = OFFLINE_HTML.encode()
+            self.send_header("Content-Length", str(len(_resp_body)))
             self.end_headers()
-            self.wfile.write(OFFLINE_HTML.encode())
+            self.wfile.write(_resp_body)
         elif path == "/icon.svg":
             self.send_response(200)
             self.send_header("Content-Type", "image/svg+xml")
+            _resp_body = ICON_SVG.encode()
+            self.send_header("Content-Length", str(len(_resp_body)))
             self.end_headers()
-            self.wfile.write(ICON_SVG.encode())
+            self.wfile.write(_resp_body)
         elif path in ("/icon-192.png", "/icon-512.png", "/apple-touch-icon.png"):
             data = {"/icon-192.png": ICON_PNG_192,
                     "/icon-512.png": ICON_PNG_512,
                     "/apple-touch-icon.png": ICON_PNG_180}[path]
             self.send_response(200)
             self.send_header("Content-Type", "image/png")
+            _resp_body = data
+            self.send_header("Content-Length", str(len(_resp_body)))
             self.end_headers()
-            self.wfile.write(data)
+            self.wfile.write(_resp_body)
         elif path == "/app":
             # Extract username and port from session
             token = get_cookie_token(self.headers)
@@ -9697,6 +10093,7 @@ except Exception as ex:
             if not username or not port:
                 self.send_response(302)
                 self.send_header("Location", "/login")
+                self.send_header("Content-Length", "0")
                 self.end_headers()
                 return
             # The cookie carries the ttyd port assigned at login. If that ttyd
@@ -9708,6 +10105,7 @@ except Exception as ex:
             if port_is_free(port):
                 self.send_response(302)
                 self.send_header("Location", "/login")
+                self.send_header("Content-Length", "0")
                 self.end_headers()
                 return
             # Inject the user's ttyd port into the app HTML
@@ -9723,20 +10121,25 @@ except Exception as ex:
             )
             self.send_response(200)
             self.send_header("Content-Type", "text/html")
+            _resp_body = html.encode()
+            self.send_header("Content-Length", str(len(_resp_body)))
             self.end_headers()
-            self.wfile.write(html.encode())
+            self.wfile.write(_resp_body)
         elif path == "/api/term-hook.js":
             token = get_cookie_token(self.headers)
             username, _port = verify_token(token)
             if not username:
                 self.send_response(401)
+                self.send_header("Content-Length", "0")
                 self.end_headers()
                 return
             self.send_response(200)
             self.send_header("Content-Type", "application/javascript; charset=utf-8")
             self.send_header("Cache-Control", "no-store")
+            _resp_body = TERM_HOOK_JS.encode("utf-8")
+            self.send_header("Content-Length", str(len(_resp_body)))
             self.end_headers()
-            self.wfile.write(TERM_HOOK_JS.encode("utf-8"))
+            self.wfile.write(_resp_body)
         elif path == "/api/auth":
             token = get_cookie_token(self.headers)
             username, token_port = verify_token(token)
@@ -9749,12 +10152,15 @@ except Exception as ex:
                         # Bearer tokens cannot authorize /ut/ terminal access
                         if (self.headers.get("X-TTYD-Port") or "").strip():
                             self.send_response(401)
+                            self.send_header("Content-Length", "0")
                             self.end_headers()
                             return
                         self.send_response(200)
+                        self.send_header("Content-Length", "0")
                         self.end_headers()
                         return
                 self.send_response(401)
+                self.send_header("Content-Length", "0")
                 self.end_headers()
                 return
 
@@ -9766,15 +10172,18 @@ except Exception as ex:
                     req_port_i = int(req_port)
                 except ValueError:
                     self.send_response(401)
+                    self.send_header("Content-Length", "0")
                     self.end_headers()
                     return
                 # Enforce that the cookie is bound to the requested ttyd port.
                 if token_port != req_port_i:
                     self.send_response(401)
+                    self.send_header("Content-Length", "0")
                     self.end_headers()
                     return
 
             self.send_response(200)
+            self.send_header("Content-Length", "0")
             self.end_headers()
         elif path == "/api/desktop":
             self._handle_desktop_request(params)
@@ -9802,6 +10211,7 @@ except Exception as ex:
             self._handle_server_status(params)
         else:
             self.send_response(404)
+            self.send_header("Content-Length", "0")
             self.end_headers()
 
     def do_POST(self):
@@ -9816,6 +10226,7 @@ except Exception as ex:
                 data = json.loads(body)
             except Exception:
                 self.send_response(400)
+                self.send_header("Content-Length", "0")
                 self.end_headers()
                 return
             username = data.get("username", "")
@@ -9826,8 +10237,10 @@ except Exception as ex:
                 except Exception:
                     self.send_response(500)
                     self.send_header("Content-Type", "application/json")
+                    _resp_body = b'{"ok":false,"error":"terminal startup failed"}'
+                    self.send_header("Content-Length", str(len(_resp_body)))
                     self.end_headers()
-                    self.wfile.write(b'{"ok":false,"error":"terminal startup failed"}')
+                    self.wfile.write(_resp_body)
                     return
                 token = make_token(username, port)
                 self.send_response(200)
@@ -9842,13 +10255,17 @@ except Exception as ex:
                     cookie_parts.append("Secure")
                 self.send_header("Set-Cookie", "; ".join(cookie_parts))
                 self.send_header("Content-Type", "application/json")
+                _resp_body = json.dumps({"ok": True, "port": port}).encode()
+                self.send_header("Content-Length", str(len(_resp_body)))
                 self.end_headers()
-                self.wfile.write(json.dumps({"ok": True, "port": port}).encode())
+                self.wfile.write(_resp_body)
             else:
                 self.send_response(401)
                 self.send_header("Content-Type", "application/json")
+                _resp_body = b'{"ok":false,"error":"invalid username or password"}'
+                self.send_header("Content-Length", str(len(_resp_body)))
                 self.end_headers()
-                self.wfile.write(b'{"ok":false,"error":"invalid username or password"}')
+                self.wfile.write(_resp_body)
         elif path == "/api/files/upload":
             self._handle_files_upload(params)
         elif path == "/api/files/write":
@@ -9863,6 +10280,8 @@ except Exception as ex:
             self._handle_quick_commands_action()
         elif path == "/api/quick-commands/import":
             self._handle_quick_commands_import()
+        elif path == "/api/quick-commands/sync":
+            self._handle_quick_commands_sync()
         elif path == "/api/settings":
             self._handle_settings_set()
         elif path == "/api/tokens":
@@ -9875,6 +10294,7 @@ except Exception as ex:
             self._handle_remote_tab()
         else:
             self.send_response(404)
+            self.send_header("Content-Length", "0")
             self.end_headers()
 
 
@@ -9887,6 +10307,339 @@ if __name__ == "__main__":
     print(f"Auth service running on http://127.0.0.1:{PORT}")
     server.serve_forever()
 AUTHEOF
+
+  cat > "${auth_dir}/commands-repo.py" <<'COMMANDSREPOEOF'
+#!/usr/bin/env python3
+"""Validate, display, initialize, and merge the shared quick-command repository."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import re
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, NoReturn
+
+
+REPOSITORY_KIND = "micsapp-webterminal-commands"
+COMMAND_ID_RE = re.compile(r"^[a-f0-9]{12}$")
+MAX_COMMANDS = 10_000
+
+
+def fail(message: str) -> NoReturn:
+    raise SystemExit(f"commands-repo: {message}")
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def normalized_name(value: str) -> str:
+    return " ".join(value.strip().casefold().split())
+
+
+def normalize_tags(value: Any) -> str:
+    if isinstance(value, list):
+        return ",".join(str(tag).strip() for tag in value if str(tag).strip())
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def valid_timestamp(value: Any) -> int:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
+
+
+def canonical_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def generated_id(command: dict[str, Any], used: set[str]) -> str:
+    seed = canonical_json({
+        "name": normalized_name(command["name"]),
+        "command": command["command"],
+        "tags": command["tags"],
+    })
+    attempt = 0
+    while True:
+        suffix = "" if attempt == 0 else f"\0{attempt}"
+        candidate = hashlib.sha256((seed + suffix).encode("utf-8")).hexdigest()[:12]
+        if candidate not in used:
+            return candidate
+        attempt += 1
+
+
+def normalize_command(raw: Any, *, used_ids: set[str], require_valid_id: bool) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        fail("every command must be a JSON object")
+    name = raw.get("name")
+    command_text = raw.get("command")
+    if not isinstance(name, str) or not name.strip():
+        fail("every command must have a non-empty string name")
+    if not isinstance(command_text, str) or not command_text.strip():
+        fail("every command must have a non-empty string command")
+
+    result = dict(raw)
+    result["name"] = name.strip()
+    result["command"] = command_text
+    result["tags"] = normalize_tags(raw.get("tags", ""))
+    result["created"] = valid_timestamp(raw.get("created"))
+    result["updated"] = valid_timestamp(raw.get("updated"))
+
+    command_id = raw.get("id")
+    command_id = command_id.strip().lower() if isinstance(command_id, str) else ""
+    if require_valid_id and not COMMAND_ID_RE.fullmatch(command_id):
+        fail(f"invalid command id for {result['name']!r}")
+    if not COMMAND_ID_RE.fullmatch(command_id) or command_id in used_ids:
+        if require_valid_id and command_id in used_ids:
+            fail(f"duplicate command id: {command_id}")
+        command_id = generated_id(result, used_ids)
+    result["id"] = command_id
+    used_ids.add(command_id)
+    return result
+
+
+def normalize_commands(raw_commands: Any, *, remote: bool) -> list[dict[str, Any]]:
+    if not isinstance(raw_commands, list):
+        fail("commands must be a JSON array")
+    if len(raw_commands) > MAX_COMMANDS:
+        fail(f"repository exceeds the {MAX_COMMANDS} command limit")
+    used_ids: set[str] = set()
+    return [
+        normalize_command(raw, used_ids=used_ids, require_valid_id=remote)
+        for raw in raw_commands
+    ]
+
+
+def load_repository(path: Path) -> dict[str, Any]:
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        fail(f"cannot read {path}: {exc}")
+    if not isinstance(document, dict):
+        fail("repository root must be a JSON object")
+    if document.get("kind") != REPOSITORY_KIND:
+        fail(f"unexpected repository kind (expected {REPOSITORY_KIND})")
+    schema_version = document.get("schema_version")
+    revision = document.get("revision")
+    if not isinstance(schema_version, int) or isinstance(schema_version, bool) or schema_version < 1:
+        fail("repository schema_version must be a positive integer")
+    if not isinstance(revision, int) or isinstance(revision, bool) or revision < 0:
+        fail("repository revision must be a non-negative integer")
+    normalized = dict(document)
+    normalized["commands"] = normalize_commands(document.get("commands"), remote=True)
+    return normalized
+
+
+def load_local(path: Path) -> list[dict[str, Any]]:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        fail(f"cannot read local commands {path}: {exc}")
+    return normalize_commands(raw, remote=False)
+
+
+def editable_signature(command: dict[str, Any]) -> str:
+    return canonical_json({key: command.get(key) for key in ("name", "command", "tags")})
+
+
+def merge_entry(shared: dict[str, Any], incoming: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+    shared_updated = shared.get("updated", 0)
+    incoming_updated = incoming.get("updated", 0)
+    if incoming_updated > shared_updated:
+        winner, loser = incoming, shared
+    elif incoming_updated < shared_updated:
+        winner, loser = shared, incoming
+    elif editable_signature(incoming) > editable_signature(shared):
+        winner, loser = incoming, shared
+    else:
+        winner, loser = shared, incoming
+
+    merged = dict(loser)
+    merged.update(winner)
+    merged["id"] = shared["id"]
+    created_values = [value for value in (shared.get("created", 0), incoming.get("created", 0)) if value > 0]
+    merged["created"] = min(created_values) if created_values else 0
+    merged["updated"] = max(shared_updated, incoming_updated)
+    return merged, editable_signature(shared) != editable_signature(incoming)
+
+
+def merge_collections(
+    remote_commands: list[dict[str, Any]], local_commands: list[dict[str, Any]]
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    stats = {"added_local": 0, "added_remote": 0, "updated": 0, "deduplicated": 0}
+    merged: list[dict[str, Any]] = []
+    by_id: dict[str, int] = {}
+    by_name: dict[str, int] = {}
+    for command in remote_commands:
+        name_key = normalized_name(command["name"])
+        index = by_name.get(name_key)
+        if index is None:
+            index = len(merged)
+            merged.append(dict(command))
+            by_id[command["id"]] = index
+            by_name[name_key] = index
+            continue
+        shared = merged[index]
+        combined, fields_differ = merge_entry(shared, command)
+        merged[index] = combined
+        by_id[combined["id"]] = index
+        by_name[normalized_name(combined["name"])] = index
+        stats["deduplicated"] += 1
+        if fields_differ:
+            stats["updated"] += 1
+
+    remote_ids = set(by_id)
+    local_match_ids: set[str] = set()
+
+    for incoming in local_commands:
+        name_key = normalized_name(incoming["name"])
+        index = by_id.get(incoming["id"])
+        name_matched = False
+        if index is None:
+            index = by_name.get(name_key)
+            name_matched = index is not None
+        if index is None:
+            command = dict(incoming)
+            if command["id"] in by_id:
+                command["id"] = generated_id(command, set(by_id))
+            index = len(merged)
+            merged.append(command)
+            by_id[command["id"]] = index
+            by_name[name_key] = index
+            stats["added_remote"] += 1
+            local_match_ids.add(command["id"])
+            continue
+
+        shared = merged[index]
+        if name_matched and shared["id"] != incoming["id"]:
+            stats["deduplicated"] += 1
+        combined, fields_differ = merge_entry(shared, incoming)
+        old_name_key = normalized_name(shared["name"])
+        merged[index] = combined
+        by_id[combined["id"]] = index
+        if by_name.get(old_name_key) == index and old_name_key != normalized_name(combined["name"]):
+            del by_name[old_name_key]
+        by_name[normalized_name(combined["name"])] = index
+        local_match_ids.add(combined["id"])
+        if fields_differ:
+            stats["updated"] += 1
+
+    stats["added_local"] = len(remote_ids - local_match_ids)
+    unique: list[dict[str, Any]] = []
+    unique_by_name: dict[str, int] = {}
+    for command in merged:
+        name_key = normalized_name(command["name"])
+        index = unique_by_name.get(name_key)
+        if index is None:
+            unique_by_name[name_key] = len(unique)
+            unique.append(command)
+            continue
+        combined, fields_differ = merge_entry(unique[index], command)
+        unique[index] = combined
+        stats["deduplicated"] += 1
+        if fields_differ:
+            stats["updated"] += 1
+
+    merged = unique
+    merged.sort(key=lambda command: (normalized_name(command["name"]), command["id"]))
+    return merged, stats
+
+
+def write_json(path: Path, value: Any) -> None:
+    try:
+        path.write_text(json.dumps(value, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    except OSError as exc:
+        fail(f"cannot write {path}: {exc}")
+
+
+def command_init(args: argparse.Namespace) -> None:
+    document = {
+        "kind": REPOSITORY_KIND,
+        "schema_version": 1,
+        "revision": 0,
+        "updated_at": utc_now(),
+        "commands": [],
+    }
+    write_json(args.output, document)
+    print(canonical_json({"ok": True, "revision": 0, "total": 0}))
+
+
+def command_show(args: argparse.Namespace) -> None:
+    document = load_repository(args.input)
+    print(f"Kind:      {document['kind']}")
+    print(f"Schema:    {document['schema_version']}")
+    print(f"Revision:  {document['revision']}")
+    print(f"Commands:  {len(document['commands'])}")
+    if document["commands"]:
+        print()
+        print(f"  {'ID':<12}  {'NAME':<32} TAGS")
+        print(f"  {'-' * 12}  {'-' * 32} {'-' * 24}")
+        for command in document["commands"]:
+            print(f"  {command['id']:<12}  {command['name'][:32]:<32} {command['tags']}")
+
+
+def command_merge(args: argparse.Namespace) -> None:
+    document = load_repository(args.remote)
+    local_commands = load_local(args.local)
+    merged, stats = merge_collections(document["commands"], local_commands)
+
+    remote_changed = canonical_json(merged) != canonical_json(document["commands"])
+    local_changed = canonical_json(merged) != canonical_json(local_commands)
+    output_document = dict(document)
+    output_document["commands"] = merged
+    if remote_changed:
+        output_document["schema_version"] = max(1, document["schema_version"])
+        output_document["revision"] = document["revision"] + 1
+        output_document["updated_at"] = utc_now()
+
+    write_json(args.remote_output, output_document)
+    write_json(args.local_output, merged)
+    metadata = {
+        "ok": True,
+        "mode": "merge",
+        **stats,
+        "total": len(merged),
+        "revision": output_document["revision"],
+        "remote_changed": remote_changed,
+        "local_changed": local_changed,
+        "changed": remote_changed or local_changed,
+    }
+    print(canonical_json(metadata))
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    init_parser = subparsers.add_parser("init", help="create an empty commands repository")
+    init_parser.add_argument("output", type=Path)
+    init_parser.set_defaults(handler=command_init)
+
+    show_parser = subparsers.add_parser("show", help="display a commands repository")
+    show_parser.add_argument("input", type=Path)
+    show_parser.set_defaults(handler=command_show)
+
+    merge_parser = subparsers.add_parser("merge", help="merge remote and local commands")
+    merge_parser.add_argument("remote", type=Path)
+    merge_parser.add_argument("local", type=Path)
+    merge_parser.add_argument("remote_output", type=Path)
+    merge_parser.add_argument("local_output", type=Path)
+    merge_parser.set_defaults(handler=command_merge)
+    return parser
+
+
+def main() -> None:
+    args = build_parser().parse_args()
+    args.handler(args)
+
+
+if __name__ == "__main__":
+    main()
+COMMANDSREPOEOF
+  chmod +x "${auth_dir}/commands-repo.py"
 
   # Replace the ttyd path placeholder with the resolved path
   if is_macos; then

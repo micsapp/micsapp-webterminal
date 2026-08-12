@@ -292,6 +292,38 @@ strictly additive: it does not add web-host aliases or direct SSH entries, and
 it never rewrites, reorders, updates, or removes existing SSH configuration.
 `./deploy.sh --remote-setup` performs the same check immediately.
 
+### Shared quick-command repository
+
+Quick commands can be merged between web-terminal servers through a second
+file in the same protected Droppy folder:
+
+```text
+https://tnas_d.micsapp.com/s/web-terminal-servers/commands.json
+```
+
+The commands URL is derived automatically from the configured server-list URL
+and uses the same passcode. Set `WEBTERMINAL_COMMANDS_REPO_URL` only when the
+file lives elsewhere.
+
+In `./ssh-tunnel-tui.sh server`, use **Initialize shared quick commands
+repository** once, then **Display shared quick commands** or **Sync this user's
+quick commands** as needed. The Quick Commands dialog also has a **Sync**
+button, and API-token users can run:
+
+```bash
+mics_cli quick-commands sync
+```
+
+Sync is bidirectional merge mode. Commands match first by stable ID and then by
+case-insensitive, whitespace-normalized name, so independently created copies
+do not duplicate. Newer `updated` timestamps win conflicts. Droppy updates
+use `ETag` and `If-Match`, with one refetch/remerge retry if another server
+changes the file concurrently.
+
+Version 1 sync is additive: deleting a local command does not delete the shared
+copy, so it returns on the next sync. Cross-server deletion requires a future
+tombstone schema. Local commands remain in `~/ttyd_quick_command.json`.
+
 ### Listing the catalog from the shell
 
 `./list-servers.sh` prints every registered Web Terminal hostname and SSH DNS

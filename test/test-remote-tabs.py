@@ -146,6 +146,77 @@ class RemoteTabTests(unittest.TestCase):
         self.assertEqual(url, "https://files.example.com/s/servers/serverlist.json")
         self.assertEqual(passcode, "secret-value")
 
+    def test_commands_repository_url_is_a_sibling_and_preserves_query(self):
+        with mock.patch.dict(os.environ, {"WEBTERMINAL_COMMANDS_REPO_URL": ""}):
+            self.assertEqual(
+                auth._commands_repo_url(
+                    "https://files.example.com/s/servers/serverlist.json?token=abc"
+                ),
+                "https://files.example.com/s/servers/commands.json?token=abc",
+            )
+        with mock.patch.dict(
+            os.environ,
+            {"WEBTERMINAL_COMMANDS_REPO_URL": "https://other.example/s/shared"},
+        ):
+            self.assertEqual(
+                auth._commands_repo_url("https://ignored.example/serverlist.json"),
+                "https://other.example/s/shared/commands.json",
+            )
+
+    def test_quick_commands_sync_merges_and_writes_both_sides(self):
+        remote_document = {
+            "kind": "micsapp-webterminal-commands",
+            "schema_version": 1,
+            "revision": 3,
+            "updated_at": "2026-08-12T00:00:00Z",
+            "commands": [{
+                "id": "aaaaaaaaaaaa",
+                "name": "Status",
+                "command": "old",
+                "tags": "",
+                "created": 1,
+                "updated": 1,
+            }],
+        }
+        local_commands = [{
+            "id": "bbbbbbbbbbbb",
+            "name": " status ",
+            "command": "new",
+            "tags": ["ops"],
+            "created": 2,
+            "updated": 2,
+        }]
+        uploaded = {}
+        local_written = {}
+
+        def fake_get(_url, _passcode, body_path, headers_path):
+            pathlib.Path(body_path).write_text(json.dumps(remote_document), encoding="utf-8")
+            pathlib.Path(headers_path).write_text('ETag: "rev-3"\n', encoding="utf-8")
+            return '"rev-3"'
+
+        def fake_put(_url, _passcode, etag, body_path):
+            self.assertEqual(etag, '"rev-3"')
+            uploaded.update(json.loads(pathlib.Path(body_path).read_text(encoding="utf-8")))
+            return 204
+
+        with mock.patch.object(auth, "commands_repo_settings", return_value=("https://example/commands.json", "pass")), mock.patch.object(
+            auth, "_read_user_quick_commands", return_value=local_commands
+        ), mock.patch.object(
+            auth, "_write_user_quick_commands", side_effect=lambda _user, value: local_written.update({"commands": value})
+        ), mock.patch.object(
+            auth, "_curl_commands_get", side_effect=fake_get
+        ), mock.patch.object(
+            auth, "_curl_commands_put", side_effect=fake_put
+        ):
+            result = auth.sync_quick_commands("tester")
+
+        self.assertEqual(result["deduplicated"], 1)
+        self.assertEqual(result["revision"], 4)
+        self.assertEqual(len(uploaded["commands"]), 1)
+        self.assertEqual(uploaded["commands"][0]["id"], "aaaaaaaaaaaa")
+        self.assertEqual(uploaded["commands"][0]["command"], "new")
+        self.assertEqual(local_written["commands"], uploaded["commands"])
+
     def test_remote_window_scripts_preserve_host_key_checks(self):
         servers = auth.validate_server_repository(repository_document())
         tunnel_script = auth.build_remote_window_script(servers[0], 4)

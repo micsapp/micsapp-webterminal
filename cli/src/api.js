@@ -115,6 +115,7 @@ function buildClient({ token, baseUrl }) {
     // ── Quick commands ──────────────────────────────────────────────────────
     listQuickCommands()      { return request('GET', '/api/quick-commands'); },
     exportQuickCommands()    { return request('GET', '/api/quick-commands/export'); },
+    syncQuickCommands()      { return request('POST', '/api/quick-commands/sync', { body: { mode: 'merge' } }); },
     importQuickCommands(arr, mode) {
       return request('POST', '/api/quick-commands/import', { body: { commands: arr, mode } });
     },

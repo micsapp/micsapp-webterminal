@@ -18,10 +18,12 @@ import socket
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.parse
 import zlib
+from pathlib import Path
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -100,6 +102,7 @@ SERVER_REPO_CONFIG = os.environ.get(
 )
 SERVER_REPO_CACHE_TTL = max(10, int(os.environ.get("WEBTERMINAL_SERVER_REPO_CACHE_TTL", "60")))
 SERVER_REPO_HELPER = os.path.join(BASE_DIR, "server-repo.py")
+COMMANDS_REPO_HELPER = os.path.join(BASE_DIR, "commands-repo.py")
 SSH_CONFIG_FILE = os.environ.get(
     "WEBTERMINAL_SSH_CONFIG", os.path.expanduser("~/.ssh/config")
 )
@@ -243,6 +246,9 @@ SERVER_STATUS_TTL = max(5, int(os.environ.get("WEBTERMINAL_SERVER_STATUS_TTL", "
 SERVER_STATUS_TIMEOUT = max(
     0.5, float(os.environ.get("WEBTERMINAL_SERVER_STATUS_TIMEOUT", "3"))
 )
+COMMANDS_REPO_MAX_BYTES = 8 * 1024 * 1024
+COMMANDS_SYNC_LOCKS_GUARD = threading.Lock()
+COMMANDS_SYNC_LOCKS = {}
 
 
 def _normalize_server_repo_url(value):
@@ -252,6 +258,37 @@ def _normalize_server_repo_url(value):
     if not value.endswith(".json"):
         value += "/serverlist.json"
     return value
+
+
+def _commands_repo_url(server_url):
+    """Return commands.json beside the configured server repository."""
+    override = os.environ.get("WEBTERMINAL_COMMANDS_REPO_URL", "").strip()
+    value = override or server_url
+    if not isinstance(value, str) or "\r" in value or "\n" in value:
+        return ""
+    try:
+        parsed = urllib.parse.urlsplit(value.strip())
+    except ValueError:
+        return ""
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        return ""
+    path = parsed.path.rstrip("/")
+    if override and not path.endswith(".json"):
+        path += "/commands.json"
+    else:
+        parent = path.rsplit("/", 1)[0] if "/" in path else ""
+        path = f"{parent}/commands.json"
+    return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, path, parsed.query, ""))
+
+
+def commands_repo_settings():
+    server_url, passcode = server_repo_settings()
+    return _commands_repo_url(server_url), passcode
+
+
+def _commands_sync_lock(username):
+    with COMMANDS_SYNC_LOCKS_GUARD:
+        return COMMANDS_SYNC_LOCKS.setdefault(username, threading.Lock())
 
 
 def server_repo_settings():
@@ -334,6 +371,247 @@ def fetch_server_repository(url, passcode):
         detail = result.stderr.decode(errors="replace").strip()[:500]
         raise OSError(detail or f"curl exited with status {result.returncode}")
     return result.stdout
+
+
+class CommandsSyncError(Exception):
+    def __init__(self, message, status=502):
+        super().__init__(message)
+        self.status = status
+
+
+def _read_etag(headers_path):
+    try:
+        lines = Path(headers_path).read_text(encoding="iso-8859-1").splitlines()
+    except OSError as exc:
+        raise CommandsSyncError(f"cannot read repository response headers: {exc}")
+    values = [line.split(":", 1)[1].strip() for line in lines if line.lower().startswith("etag:")]
+    etag = values[-1] if values else ""
+    if len(etag) > 512 or "\r" in etag or "\n" in etag:
+        raise CommandsSyncError("commands repository returned an invalid ETag")
+    return etag
+
+
+def _curl_commands_get(url, passcode, body_path, headers_path):
+    if not url:
+        raise CommandsSyncError("commands repository URL is invalid", 503)
+    if not passcode:
+        raise CommandsSyncError("server repository passcode is not configured", 503)
+    if "\r" in passcode or "\n" in passcode:
+        raise CommandsSyncError("repository passcode is invalid", 503)
+    try:
+        result = subprocess.run(
+            [
+                CURL_BIN,
+                "--silent",
+                "--show-error",
+                "--connect-timeout", "10",
+                "--max-time", "30",
+                "-D", str(headers_path),
+                "-o", str(body_path),
+                "-w", "%{http_code}",
+                "-H", "@-",
+                url,
+            ],
+            input=f"X-Droppy-Share-Passcode: {passcode}\n".encode("utf-8"),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=35,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise CommandsSyncError(f"commands repository download failed: {exc}")
+    detail = result.stderr.decode(errors="replace").strip()[:500]
+    try:
+        status = int(result.stdout.decode().strip() or "0")
+    except ValueError:
+        status = 0
+    if result.returncode != 0 or status != 200:
+        if status == 404:
+            raise CommandsSyncError("commands repository is not initialized", 404)
+        raise CommandsSyncError(
+            f"commands repository download failed (HTTP {status or 'unknown'}): "
+            f"{detail or 'request rejected'}"
+        )
+    try:
+        size = os.path.getsize(body_path)
+    except OSError as exc:
+        raise CommandsSyncError(f"cannot read commands repository: {exc}")
+    if size > COMMANDS_REPO_MAX_BYTES:
+        raise CommandsSyncError("commands repository is too large", 413)
+    return _read_etag(headers_path)
+
+
+def _curl_commands_put(url, passcode, etag, body_path):
+    if not etag:
+        raise CommandsSyncError("commands repository response had no ETag; refusing unsafe overwrite")
+    try:
+        result = subprocess.run(
+            [
+                CURL_BIN,
+                "--silent",
+                "--show-error",
+                "--connect-timeout", "10",
+                "--max-time", "30",
+                "-o", "/dev/null",
+                "-w", "%{http_code}",
+                "-X", "PUT",
+                "-H", "@-",
+                "-H", f"If-Match: {etag}",
+                "-H", "Content-Type: application/json",
+                "--data-binary", f"@{body_path}",
+                url,
+            ],
+            input=f"X-Droppy-Share-Passcode: {passcode}\n".encode("utf-8"),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=35,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise CommandsSyncError(f"commands repository upload failed: {exc}")
+    detail = result.stderr.decode(errors="replace").strip()[:500]
+    try:
+        status = int(result.stdout.decode().strip() or "0")
+    except ValueError:
+        status = 0
+    if result.returncode != 0:
+        raise CommandsSyncError(
+            f"commands repository upload failed: {detail or f'curl exited {result.returncode}'}"
+        )
+    return status
+
+
+def _read_user_quick_commands(username):
+    script = """
+import json, os
+p = os.path.expanduser("~/ttyd_quick_command.json")
+try:
+    if os.path.exists(p):
+        with open(p, "r", encoding="utf-8") as fh:
+            commands = json.load(fh)
+        if not isinstance(commands, list):
+            raise ValueError("local quick-command file must contain a JSON array")
+    else:
+        commands = []
+    print(json.dumps({"ok": True, "commands": commands}))
+except Exception as exc:
+    print(json.dumps({"error": str(exc)}))
+"""
+    rc, out, err = run_as_user(username, script)
+    if rc != 0:
+        raise CommandsSyncError(
+            f"cannot read local quick commands: {err.decode(errors='replace').strip()[:300]}",
+            500,
+        )
+    try:
+        result = json.loads(out)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        raise CommandsSyncError("cannot read local quick commands: invalid helper response", 500)
+    if result.get("error"):
+        raise CommandsSyncError(f"cannot read local quick commands: {result['error']}", 400)
+    return result.get("commands", [])
+
+
+def _write_user_quick_commands(username, commands):
+    payload = base64.b64encode(
+        (json.dumps(commands, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+    ).decode()
+    script = f"""
+import base64, os, tempfile
+p = os.path.expanduser("~/ttyd_quick_command.json")
+data = base64.b64decode({payload!r})
+tmp = ""
+try:
+    fd, tmp = tempfile.mkstemp(prefix=".ttyd_quick_command.", dir=os.path.dirname(p))
+    os.fchmod(fd, 0o600)
+    with os.fdopen(fd, "wb") as fh:
+        fh.write(data)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, p)
+    tmp = ""
+    try:
+        dir_fd = os.open(os.path.dirname(p), os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except OSError:
+        pass
+    print("ok")
+finally:
+    if tmp:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+"""
+    rc, out, err = run_as_user(username, script)
+    if rc != 0 or out.strip() != b"ok":
+        detail = err.decode(errors="replace").strip()[:300]
+        raise CommandsSyncError(f"remote sync succeeded but local write failed: {detail or 'unknown error'}", 500)
+
+
+def sync_quick_commands(username):
+    if not os.path.isfile(COMMANDS_REPO_HELPER):
+        raise CommandsSyncError("commands repository helper is unavailable", 503)
+    url, passcode = commands_repo_settings()
+    with _commands_sync_lock(username):
+        local_commands = _read_user_quick_commands(username)
+        local_payload = json.dumps(local_commands, ensure_ascii=False).encode("utf-8")
+        if len(local_payload) > COMMANDS_REPO_MAX_BYTES:
+            raise CommandsSyncError("local quick-command file is too large", 413)
+
+        with tempfile.TemporaryDirectory(prefix="webterminal-command-sync-") as temp:
+            temp_path = Path(temp)
+            local_path = temp_path / "local.json"
+            local_path.write_bytes(local_payload)
+            for attempt in range(2):
+                remote_path = temp_path / "commands.json"
+                headers_path = temp_path / "headers"
+                remote_output = temp_path / "commands.updated.json"
+                local_output = temp_path / "local.updated.json"
+                etag = _curl_commands_get(url, passcode, remote_path, headers_path)
+                try:
+                    result = subprocess.run(
+                        [
+                            sys.executable,
+                            COMMANDS_REPO_HELPER,
+                            "merge",
+                            str(remote_path),
+                            str(local_path),
+                            str(remote_output),
+                            str(local_output),
+                        ],
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        timeout=10,
+                    )
+                except (OSError, subprocess.TimeoutExpired) as exc:
+                    raise CommandsSyncError(f"commands merge failed: {exc}", 500)
+                if result.returncode != 0:
+                    detail = result.stderr.decode(errors="replace").strip()[:500]
+                    raise CommandsSyncError(f"commands merge failed: {detail or 'invalid repository'}", 400)
+                try:
+                    metadata = json.loads(result.stdout)
+                    merged_local = json.loads(local_output.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+                    raise CommandsSyncError(f"commands merge returned invalid output: {exc}", 500)
+
+                if metadata.get("remote_changed"):
+                    status = _curl_commands_put(url, passcode, etag, remote_output)
+                    if status == 412:
+                        if attempt == 0:
+                            continue
+                        raise CommandsSyncError(
+                            "commands repository changed twice; retry sync", 409
+                        )
+                    if status not in (200, 201, 204):
+                        raise CommandsSyncError(
+                            f"commands repository rejected the upload (HTTP {status or 'unknown'})"
+                        )
+                if metadata.get("local_changed"):
+                    _write_user_quick_commands(username, merged_local)
+                return metadata
+    raise CommandsSyncError("commands repository sync did not complete", 500)
 
 
 def load_server_catalog(force=False):
@@ -2474,6 +2752,7 @@ __PWA_HEAD__
     <div class="qc-header">
       <span class="qc-header-title">&#9889; Quick Commands</span>
       <button class="fp-btn" id="qcAddBtn" onclick="qcShowForm()">+ Add</button>
+      <button class="fp-btn" id="qcSyncBtn" onclick="qcSync()" title="Merge local commands with the shared repository">&#8635; Sync</button>
       <button class="fp-btn" id="qcImportBtn" onclick="document.getElementById('qcImportInput').click()">&#8593; Import</button>
       <button class="fp-btn" id="qcExportBtn" onclick="qcExport()">&#8595; Export</button>
       <button class="fp-btn" onclick="closeQuickCommands()">&#10005;</button>
@@ -6746,6 +7025,48 @@ async function qcDeleteCommand(id, name) {
   }
 }
 
+async function qcSync() {
+  const button = document.getElementById('qcSyncBtn');
+  if (!button || button.disabled) return;
+  const oldText = button.innerHTML;
+  button.disabled = true;
+  button.textContent = 'Syncing...';
+  try {
+    const res = await fetch('/api/quick-commands/sync', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mode: 'merge' }),
+    });
+    const text = await res.text();
+    let data;
+    try {
+      data = JSON.parse(text);
+    } catch (parseError) {
+      throw new Error('Server returned an invalid response (HTTP ' + res.status + ')');
+    }
+    if (!res.ok || data.error) {
+      throw new Error(data.error || ('HTTP ' + res.status));
+    }
+    await qcLoadCommands();
+    const parts = [];
+    if (data.added_local) parts.push(data.added_local + ' downloaded');
+    if (data.added_remote) parts.push(data.added_remote + ' uploaded');
+    if (data.updated) parts.push(data.updated + ' updated');
+    if (data.deduplicated) parts.push(data.deduplicated + ' deduplicated');
+    showToast(
+      parts.length
+        ? 'Commands synced: ' + parts.join(', ')
+        : 'Commands already in sync',
+      false
+    );
+  } catch (error) {
+    showToast('Sync failed: ' + error.message, true);
+  } finally {
+    button.disabled = false;
+    button.innerHTML = oldText;
+  }
+}
+
 function qcExport() {
   const a = document.createElement('a');
   a.href = '/api/quick-commands/export';
@@ -8054,6 +8375,33 @@ except Exception as ex:
 
     # --- Quick Commands API handlers ---
 
+    def _handle_quick_commands_sync(self):
+        username = self._get_authenticated_user()
+        if not username:
+            self._send_error(401, "not authenticated")
+            return
+        length = int(self.headers.get("Content-Length", 0))
+        if length > 64 * 1024:
+            self._send_error(413, "payload too large")
+            return
+        if length:
+            body = self.rfile.read(length)
+            try:
+                request = json.loads(body)
+            except json.JSONDecodeError:
+                self._send_error(400, "invalid json")
+                return
+            if not isinstance(request, dict):
+                self._send_error(400, "body must be a JSON object")
+                return
+            if request.get("mode", "merge") != "merge":
+                self._send_error(400, "only merge mode is supported")
+                return
+        try:
+            self._send_json(200, sync_quick_commands(username))
+        except CommandsSyncError as exc:
+            self._send_error(exc.status, str(exc))
+
     def _load_user_settings(self, username):
         """Return the user's persisted settings dict (best-effort; {} on error).
         Used by callers that just need a value (e.g. the PWA manifest name)."""
@@ -9151,6 +9499,8 @@ except Exception as ex:
             self._handle_quick_commands_action()
         elif path == "/api/quick-commands/import":
             self._handle_quick_commands_import()
+        elif path == "/api/quick-commands/sync":
+            self._handle_quick_commands_sync()
         elif path == "/api/settings":
             self._handle_settings_set()
         elif path == "/api/tokens":

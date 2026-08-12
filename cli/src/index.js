@@ -42,6 +42,7 @@ Commands:
   tokens list                List your bearer tokens
   tokens revoke <name>       Revoke a bearer token by name
   quick-commands list        List your saved quick commands
+  quick-commands sync        Merge with the shared Droppy repository
   quick-commands export      Export quick commands as JSON
   quick-commands import <f>  Import quick commands from a JSON file
   login                      Log in with username/password (mints a bearer token)
@@ -144,6 +145,7 @@ Subcommands:
 
 Subcommands:
   list                       List your saved quick commands
+  sync [--json]              Merge local and shared commands without duplicates
   export [-o file]           Export as JSON (stdout, or to file via -o)
   import <file> [--mode m]   Import from a JSON file. mode is 'merge' (default) or 'replace'.
 `,
@@ -387,7 +389,7 @@ async function cmdTokens(rest) {
 
 async function cmdQuickCommands(rest) {
   const sub = rest[0];
-  if (!sub) throw new Error('quick-commands requires a subcommand: list | export | import');
+  if (!sub) throw new Error('quick-commands requires a subcommand: list | sync | export | import');
   const subRest = rest.slice(1);
 
   if (sub === 'list') {
@@ -400,6 +402,24 @@ async function cmdQuickCommands(rest) {
     if (!arr.length) { out('(no quick commands)'); return; }
     for (const c of arr) {
       out(`${c.name || '(unnamed)'}\n  ${c.command || ''}`);
+    }
+    return;
+  }
+
+  if (sub === 'sync') {
+    const f = parseArgs(subRest, { boolFlags: ['json'] });
+    const { api } = buildContext(f);
+    const res = await api.syncQuickCommands();
+    if (f.json) return printJson(res);
+    const parts = [];
+    if (res.added_local) parts.push(`${res.added_local} downloaded`);
+    if (res.added_remote) parts.push(`${res.added_remote} uploaded`);
+    if (res.updated) parts.push(`${res.updated} updated`);
+    if (res.deduplicated) parts.push(`${res.deduplicated} deduplicated`);
+    if (parts.length) {
+      out(`commands synced: ${parts.join(', ')} (total ${res.total})`);
+    } else {
+      out(`commands already in sync (total ${res.total})`);
     }
     return;
   }

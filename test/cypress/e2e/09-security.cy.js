@@ -25,6 +25,7 @@ describe('Security', () => {
       '/api/files/download?path=test',
       '/api/quick-commands',
       '/api/quick-commands/export',
+      '/api/quick-commands/sync',
       '/api/desktop',
       '/api/help',
     ];

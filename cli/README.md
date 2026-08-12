@@ -158,6 +158,7 @@ mics_cli tokens list
 mics_cli tokens revoke "old laptop"
 
 # Quick-commands sync
+mics_cli quick-commands sync
 mics_cli quick-commands export -o qc.json
 mics_cli quick-commands import qc.json --mode replace
 ```

@@ -12,8 +12,11 @@ LOG_FILE="$CONFIG_DIR/tunnel.log"
 SERVER_REPO_CONFIG="${WEBTERMINAL_SERVER_REPO_CONFIG:-$HOME/.config/micsapp-webterminal/server-repo.conf}"
 DEFAULT_SERVER_REPO_URL="https://tnas_d.micsapp.com/s/web-terminal-servers/serverlist.json"
 SERVER_REPO_URL="${WEBTERMINAL_SERVER_REPO_URL:-}"
+COMMANDS_REPO_URL="${WEBTERMINAL_COMMANDS_REPO_URL:-}"
 SERVER_REPO_PASSCODE="${WEBTERMINAL_SERVER_REPO_PASSCODE:-}"
 SERVER_REPO_HELPER="$SCRIPT_DIR/server-repo.py"
+COMMANDS_REPO_HELPER="$SCRIPT_DIR/commands-repo.py"
+LOCAL_COMMANDS_FILE="${WEBTERMINAL_QUICK_COMMANDS_FILE:-$HOME/ttyd_quick_command.json}"
 WEBTERMINAL_EMBED_ORIGINS="${WEBTERMINAL_FRAME_ORIGINS:-https://*.micstec.com https://*.wetigu.com}"
 
 # ── colours ────────────────────────────────────────────────────────────────────
@@ -123,6 +126,12 @@ load_server_repo_settings() {
     if [ -n "$SERVER_REPO_URL" ]; then
         SERVER_REPO_URL="$(normalize_server_repo_url "$SERVER_REPO_URL" 2>/dev/null || true)"
     fi
+
+    if [ -z "${WEBTERMINAL_COMMANDS_REPO_URL:-}" ]; then
+        COMMANDS_REPO_URL="${SERVER_REPO_URL%/*}/commands.json"
+    elif [[ "${WEBTERMINAL_COMMANDS_REPO_URL}" != *.json ]]; then
+        COMMANDS_REPO_URL="${WEBTERMINAL_COMMANDS_REPO_URL%/}/commands.json"
+    fi
 }
 
 save_server_repo_settings() {
@@ -179,8 +188,8 @@ ensure_server_repo_settings() {
     fi
 }
 
-server_repo_get() {
-    local body_file="$1" headers_file="$2" auth_header_file
+droppy_repo_get() {
+    local repo_url="$1" body_file="$2" headers_file="$3" auth_header_file
     auth_header_file="${body_file}.auth-header"
     (umask 077
         printf 'X-Droppy-Share-Passcode: %s\n' "$SERVER_REPO_PASSCODE" > "$auth_header_file"
@@ -188,7 +197,15 @@ server_repo_get() {
     curl -sS --connect-timeout 10 --max-time 30 \
         -D "$headers_file" -o "$body_file" -w '%{http_code}' \
         -H "@$auth_header_file" \
-        "$SERVER_REPO_URL"
+        "$repo_url"
+}
+
+server_repo_get() {
+    droppy_repo_get "$SERVER_REPO_URL" "$1" "$2"
+}
+
+commands_repo_get() {
+    droppy_repo_get "$COMMANDS_REPO_URL" "$1" "$2"
 }
 
 webterminal_headers_allow_embedding() {
@@ -1050,6 +1067,223 @@ server_register_repository() (
     done
 )
 
+# ── shared Droppy quick-command repository ───────────────────────────────────
+commands_show_repository() (
+    header "Server: Shared Commands"
+    echo ""
+
+    if ! command -v curl >/dev/null 2>&1 || ! command -v python3 >/dev/null 2>&1; then
+        error "This action requires curl and python3"
+        pause
+        return
+    fi
+    if [ ! -f "$COMMANDS_REPO_HELPER" ]; then
+        error "Missing repository helper: $COMMANDS_REPO_HELPER"
+        pause
+        return
+    fi
+    if ! ensure_server_repo_settings; then
+        pause
+        return
+    fi
+
+    local temp_dir body_file headers_file http_code
+    temp_dir="$(mktemp -d)"
+    trap 'rm -rf "$temp_dir"' EXIT
+    body_file="$temp_dir/commands.json"
+    headers_file="$temp_dir/headers"
+
+    step "Downloading $COMMANDS_REPO_URL... "
+    if ! http_code="$(commands_repo_get "$body_file" "$headers_file")"; then
+        printf "\n"
+        error "Could not reach the commands repository"
+        pause
+        return
+    fi
+    if [ "$http_code" != "200" ]; then
+        printf "${R}HTTP %s${NC}\n" "$http_code"
+        error "Commands repository download failed"
+        pause
+        return
+    fi
+    printf "${G}done${NC}\n\n"
+    if ! python3 "$COMMANDS_REPO_HELPER" show "$body_file"; then
+        error "The downloaded file is not a valid commands repository"
+    fi
+    pause
+)
+
+commands_initialize_repository() (
+    header "Server: Initialize Commands"
+    echo ""
+
+    if ! command -v curl >/dev/null 2>&1 || ! command -v python3 >/dev/null 2>&1; then
+        error "This action requires curl and python3"
+        pause
+        return
+    fi
+    if [ ! -f "$COMMANDS_REPO_HELPER" ]; then
+        error "Missing repository helper: $COMMANDS_REPO_HELPER"
+        pause
+        return
+    fi
+    if ! ensure_server_repo_settings; then
+        pause
+        return
+    fi
+
+    echo -e "  ${BOLD}Target:${NC} $COMMANDS_REPO_URL"
+    echo "  This creates an empty repository only if no file exists."
+    printf "\n  ${W}Continue? [y/N]:${NC} "
+    read -rn1 yn
+    echo
+    [[ "${yn:-n}" != "y" && "${yn:-n}" != "Y" ]] && return
+
+    local temp_dir body_file auth_header_file put_code
+    temp_dir="$(mktemp -d)"
+    trap 'rm -rf "$temp_dir"' EXIT
+    body_file="$temp_dir/commands.json"
+    auth_header_file="$temp_dir/auth-header"
+    if ! python3 "$COMMANDS_REPO_HELPER" init "$body_file" >/dev/null; then
+        error "Could not create the initial commands repository"
+        pause
+        return
+    fi
+    (umask 077
+        printf 'X-Droppy-Share-Passcode: %s\n' "$SERVER_REPO_PASSCODE" > "$auth_header_file"
+    )
+
+    step "Creating commands.json... "
+    if ! put_code="$(curl -sS --connect-timeout 10 --max-time 30 \
+        -o "$temp_dir/put-response" -w '%{http_code}' -X PUT \
+        -H "@$auth_header_file" -H "If-None-Match: *" \
+        -H "Content-Type: application/json" \
+        --data-binary "@$body_file" "$COMMANDS_REPO_URL")"; then
+        printf "\n"
+        error "Commands repository upload failed"
+        pause
+        return
+    fi
+    case "$put_code" in
+        200|201|204)
+            printf "${G}done${NC}\n"
+            info "Initialized $COMMANDS_REPO_URL"
+            ;;
+        412)
+            printf "${Y}already exists${NC}\n"
+            warn "The existing commands repository was not overwritten"
+            ;;
+        *)
+            printf "${R}HTTP %s${NC}\n" "$put_code"
+            error "Droppy rejected repository initialization"
+            ;;
+    esac
+    pause
+)
+
+commands_sync_repository() (
+    header "Server: Sync Commands"
+    echo ""
+
+    if ! command -v curl >/dev/null 2>&1 || ! command -v python3 >/dev/null 2>&1; then
+        error "This action requires curl and python3"
+        pause
+        return
+    fi
+    if [ ! -f "$COMMANDS_REPO_HELPER" ]; then
+        error "Missing repository helper: $COMMANDS_REPO_HELPER"
+        pause
+        return
+    fi
+    if ! ensure_server_repo_settings; then
+        pause
+        return
+    fi
+
+    local temp_dir body_file headers_file local_file remote_updated local_updated
+    local metadata http_code etag remote_changed local_changed put_code attempt target_tmp
+    temp_dir="$(mktemp -d)"
+    trap 'rm -rf "$temp_dir"' EXIT
+    body_file="$temp_dir/commands.json"
+    headers_file="$temp_dir/headers"
+    local_file="$temp_dir/local.json"
+    remote_updated="$temp_dir/commands.updated.json"
+    local_updated="$temp_dir/local.updated.json"
+    if [ -f "$LOCAL_COMMANDS_FILE" ]; then
+        cp "$LOCAL_COMMANDS_FILE" "$local_file"
+    else
+        printf '[]\n' > "$local_file"
+    fi
+
+    for attempt in 1 2; do
+        step "Downloading current commands repository... "
+        if ! http_code="$(commands_repo_get "$body_file" "$headers_file")"; then
+            printf "\n"
+            error "Could not reach the commands repository"
+            pause
+            return
+        fi
+        if [ "$http_code" != "200" ]; then
+            printf "${R}HTTP %s${NC}\n" "$http_code"
+            error "Commands repository download failed; initialize it first"
+            pause
+            return
+        fi
+        printf "${G}done${NC}\n"
+
+        if ! metadata="$(python3 "$COMMANDS_REPO_HELPER" merge \
+            "$body_file" "$local_file" "$remote_updated" "$local_updated")"; then
+            error "Could not merge local and shared commands"
+            pause
+            return
+        fi
+        remote_changed="$(python3 -c 'import json,sys; print("1" if json.loads(sys.argv[1])["remote_changed"] else "0")' "$metadata")"
+        local_changed="$(python3 -c 'import json,sys; print("1" if json.loads(sys.argv[1])["local_changed"] else "0")' "$metadata")"
+
+        if [ "$remote_changed" = "1" ]; then
+            etag="$(awk 'tolower($1) == "etag:" {gsub("\r", "", $2); print $2; exit}' "$headers_file")"
+            if [ -z "$etag" ]; then
+                error "Repository response had no ETag; refusing an unsafe overwrite"
+                pause
+                return
+            fi
+            step "Uploading merged commands... "
+            if ! put_code="$(curl -sS --connect-timeout 10 --max-time 30 \
+                -o "$temp_dir/put-response" -w '%{http_code}' -X PUT \
+                -H "@${body_file}.auth-header" -H "If-Match: $etag" \
+                -H "Content-Type: application/json" \
+                --data-binary "@$remote_updated" "$COMMANDS_REPO_URL")"; then
+                printf "\n"
+                error "Commands repository upload failed"
+                pause
+                return
+            fi
+            if [ "$put_code" = "412" ] && [ "$attempt" -eq 1 ]; then
+                printf "${Y}changed remotely${NC}\n"
+                warn "Refreshing and retrying once"
+                continue
+            fi
+            if [[ "$put_code" != "200" && "$put_code" != "201" && "$put_code" != "204" ]]; then
+                printf "${R}HTTP %s${NC}\n" "$put_code"
+                error "Commands repository rejected the upload"
+                pause
+                return
+            fi
+            printf "${G}done${NC}\n"
+        fi
+
+        if [ "$local_changed" = "1" ]; then
+            target_tmp="$(mktemp "$(dirname "$LOCAL_COMMANDS_FILE")/.ttyd_quick_command.XXXXXX")"
+            cp "$local_updated" "$target_tmp"
+            chmod 600 "$target_tmp"
+            mv "$target_tmp" "$LOCAL_COMMANDS_FILE"
+        fi
+        python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print("  Synced: {added_local} downloaded, {added_remote} uploaded, {updated} updated, {deduplicated} deduplicated; {total} total (revision {revision})".format(**d))' "$metadata"
+        pause
+        return
+    done
+)
+
 # ── full server setup wizard ──────────────────────────────────────────────────
 server_full_setup() {
     header "Server: Full SSH Setup"
@@ -1218,6 +1452,10 @@ server_menu() {
         menu_item 11 "Display shared server repository"
         menu_item 12 "Register/update this server in repository"
         hr
+        menu_item 13 "Display shared quick commands"
+        menu_item 14 "Initialize shared quick commands repository"
+        menu_item 15 "Sync this user's quick commands"
+        hr
         menu_item b "Back to main menu"
         menu_item q "Quit"
         printf "\n  ${W}Choose: ${NC}"
@@ -1235,6 +1473,9 @@ server_menu() {
             10) server_list_tunnels ;;
             11) server_show_repository ;;
             12) server_register_repository ;;
+            13) commands_show_repository ;;
+            14) commands_initialize_repository ;;
+            15) commands_sync_repository ;;
             b|B) return ;;
             q|Q) echo ""; info "Bye!"; exit 0 ;;
         esac

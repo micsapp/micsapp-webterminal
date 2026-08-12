@@ -50,6 +50,8 @@ EOF
   load_server_repo_settings
   [ "$SERVER_REPO_URL" = "$DEFAULT_SERVER_REPO_URL" ] \
     || fail "TUI did not load the TNAS repository default"
+  [ "$COMMANDS_REPO_URL" = "https://tnas_d.micsapp.com/s/web-terminal-servers/commands.json" ] \
+    || fail "TUI did not derive the commands repository URL"
   [ "$DEFAULT_SERVER_REPO_URL" = "https://tnas_d.micsapp.com/s/web-terminal-servers/serverlist.json" ] \
     || fail "TUI does not default to the TNAS server repository"
 
