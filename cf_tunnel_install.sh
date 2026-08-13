@@ -87,6 +87,78 @@ need_cmd() {
 
 is_macos() { [ "$(uname -s)" = "Darwin" ]; }
 
+cloudflared_service_unit() {
+  local tunnel_name="$1"
+  tunnel_name="$(printf '%s' "$tunnel_name" | tr -c 'A-Za-z0-9_.@-' '-')"
+  printf 'cloudflared-%s.service\n' "$tunnel_name"
+}
+
+legacy_cloudflared_service_uses_tunnel() {
+  local tunnel_name="$1" legacy_config="/etc/cloudflared/config.yml" legacy_tunnel
+  [ -f "$legacy_config" ] || return 1
+  systemctl cat cloudflared.service >/dev/null 2>&1 || return 1
+  systemctl is-active --quiet cloudflared.service 2>/dev/null \
+    || systemctl is-enabled --quiet cloudflared.service 2>/dev/null \
+    || return 1
+  systemctl cat cloudflared.service 2>/dev/null \
+    | grep -Eq -- '--config([=[:space:]])+/etc/cloudflared/config\.yml([[:space:]]|$)' || return 1
+  legacy_tunnel="$(awk '$1 == "tunnel:" {print $2; exit}' "$legacy_config" | tr -d "\"'")"
+  [ "$legacy_tunnel" = "$tunnel_name" ]
+}
+
+install_cloudflared_systemd_service() {
+  local tunnel_name="$1" cfg="$2" cf_bin unit
+  cf_bin="$(command -v cloudflared)"
+  unit="$(cloudflared_service_unit "$tunnel_name")"
+  if legacy_cloudflared_service_uses_tunnel "$tunnel_name"; then
+    say "Migrating legacy cloudflared.service to $unit..."
+    sudo systemctl disable --now cloudflared.service >/dev/null 2>&1 || true
+  fi
+  if legacy_cloudflared_tmux_uses_tunnel "$tunnel_name"; then
+    say "Migrating legacy tmux connector to $unit..."
+    tmux kill-session -t cloudflared
+  fi
+  sudo tee "/etc/systemd/system/${unit}" >/dev/null <<SVCEOF
+[Unit]
+Description=cloudflared tunnel (${tunnel_name})
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=${cf_bin} --no-autoupdate --config ${cfg} tunnel run ${tunnel_name}
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+SVCEOF
+  sudo systemctl daemon-reload
+  sudo systemctl enable "$unit" >/dev/null
+  sudo systemctl restart "$unit"
+  say "Linux: cloudflared service installed (${unit})."
+}
+
+legacy_cloudflared_tmux_uses_tunnel() {
+  local tunnel_name="$1" command
+  command -v tmux >/dev/null 2>&1 || return 1
+  tmux has-session -t cloudflared 2>/dev/null || return 1
+  while IFS= read -r command; do
+    case "$command" in
+      *cloudflared*"run ${tunnel_name}"|*cloudflared*"run ${tunnel_name} "*) return 0 ;;
+    esac
+  done < <(tmux list-panes -t cloudflared -F '#{pane_start_command}' 2>/dev/null)
+  return 1
+}
+
+tunnel_has_active_connections() {
+  local tunnel_name="$1" output
+  output="$(cloudflared tunnel info "$tunnel_name" 2>/dev/null)" || return 1
+  ! printf '%s\n' "$output" | grep -qi 'does not have any active connection' \
+    && printf '%s\n' "$output" | grep -qi 'connector'
+}
+
 # ─── Cloudflare Tunnel helpers ─────────────────────────────────────────────────
 
 install_cloudflared() {
@@ -11098,31 +11170,7 @@ main() {
       fi
     else
       if pidof systemd >/dev/null 2>&1; then
-        local service_cfg="$cfg"
-        if [ "$cfg" != "/etc/cloudflared/config.yml" ]; then
-          sudo mkdir -p /etc/cloudflared
-          if [ -f /etc/cloudflared/config.yml ]; then
-            sudo cp -a /etc/cloudflared/config.yml "/etc/cloudflared/config.yml.bak.$(date +%Y%m%d_%H%M%S)"
-          fi
-          sudo cp "$cfg" /etc/cloudflared/config.yml
-          service_cfg="/etc/cloudflared/config.yml"
-          say "Installed cloudflared service config: $service_cfg"
-        fi
-        set +e
-        local install_output install_rc
-        install_output="$(sudo cloudflared --config "$service_cfg" service install 2>&1)"
-        install_rc=$?
-        set -e
-        if [ "$install_rc" -eq 0 ]; then
-          [ -n "$install_output" ] && say "$install_output"
-          say "Linux: cloudflared service installed (systemd)."
-        elif printf '%s\n' "$install_output" | grep -qi 'service is already installed'; then
-          say "Linux: cloudflared service already installed; restarting with $service_cfg."
-          sudo systemctl restart cloudflared
-        else
-          [ -n "$install_output" ] && printf '%s\n' "$install_output" >&2
-          return "$install_rc"
-        fi
+        install_cloudflared_systemd_service "$name" "$cfg"
       else
         say "No systemd detected (WSL2?). Starting cloudflared in background..."
         local cf_log="${AUTH_DIR}/cloudflared.log"
@@ -11190,7 +11238,7 @@ EOF
   # won't be running. Start it in a tmux session so the user doesn't hit
   # error 1033 (tunnel not connected).
   if [ "$run_fg" = false ] && [ "$install_service" = false ]; then
-    if ! pgrep -x cloudflared >/dev/null 2>&1; then
+    if ! tunnel_has_active_connections "$name"; then
       say ""
       say "Starting tunnel in tmux session 'cloudflared'..."
       need_cmd tmux
@@ -11210,29 +11258,21 @@ EOF
       say "Waiting for tunnel to connect..."
       local _i _connected=false
       for _i in $(seq 1 30); do
-        if pgrep -x cloudflared >/dev/null 2>&1; then
-          local _conns
-          _conns="$(cloudflared tunnel info "$name" 2>/dev/null | grep -c 'CONNECTIONS\|connector' || true)"
-          if [ "${_conns:-0}" -gt 0 ]; then
-            _connected=true
-            break
-          fi
+        if tunnel_has_active_connections "$name"; then
+          _connected=true
+          break
         fi
         sleep 0.5
       done
 
       if $_connected; then
         say "Tunnel '${name}' is connected and serving https://${hostname}"
-      elif pgrep -x cloudflared >/dev/null 2>&1; then
-        say "cloudflared is running (connections still establishing)."
-        say "  Log: ${cf_log}"
-        say "  Attach: tmux attach -t cloudflared"
       else
-        err "cloudflared failed to start. Check log: ${cf_log}"
+        err "Tunnel '${name}' did not connect. Check log: ${cf_log}"
       fi
     else
       say ""
-      say "cloudflared is already running."
+      say "Tunnel '${name}' already has an active connector."
     fi
   fi
 }

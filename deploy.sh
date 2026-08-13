@@ -891,36 +891,108 @@ check_auth() {
   fi
 }
 
+cloudflared_service_unit() {
+  local tunnel_name="${1:-}"
+  [ -n "$tunnel_name" ] || tunnel_name="$(detect_tunnel_name)"
+  tunnel_name="$(printf '%s' "$tunnel_name" | tr -c 'A-Za-z0-9_.@-' '-')"
+  printf 'cloudflared-%s.service\n' "$tunnel_name"
+}
+
+has_systemd() {
+  is_linux && pidof systemd >/dev/null 2>&1
+}
+
 check_cloudflared() {
-  # NAS: there may be other, unrelated cloudflared tunnels running, so check our
-  # specific managed service rather than any cloudflared process.
-  if is_tos_nas; then
-    _priv systemctl is-active --quiet cloudflared.service 2>/dev/null
+  local tunnel_name unit
+  tunnel_name="$(detect_tunnel_name)"
+  [ -n "$tunnel_name" ] || return 1
+  if has_systemd; then
+    unit="$(cloudflared_service_unit "$tunnel_name")"
+    systemctl is-active --quiet "$unit" 2>/dev/null
   else
-    pgrep -x cloudflared >/dev/null 2>&1
+    legacy_cloudflared_tmux_uses_tunnel "$tunnel_name"
   fi
 }
 
 write_cloudflared_systemd_unit() {
   local tunnel_name="$1"
-  local cf_bin
+  local cf_bin unit
   cf_bin="$(command -v cloudflared)"
-  _priv tee "${NAS_SYSTEMD_DIR}/cloudflared.service" >/dev/null <<SVCEOF
+  unit="$(cloudflared_service_unit "$tunnel_name")"
+  _priv tee "${NAS_SYSTEMD_DIR}/${unit}" >/dev/null <<SVCEOF
 [Unit]
-Description=cloudflared tunnel (web terminal)
+Description=cloudflared tunnel (${tunnel_name})
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
 User=root
-ExecStart=${cf_bin} tunnel --no-autoupdate --config ${CF_CONFIG} run ${tunnel_name}
+ExecStart=${cf_bin} --no-autoupdate --config ${CF_CONFIG} tunnel run ${tunnel_name}
 Restart=always
 RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
 SVCEOF
+}
+
+legacy_cloudflared_service_uses_tunnel() {
+  local tunnel_name="$1" legacy_config="/etc/cloudflared/config.yml" legacy_tunnel
+  [ -f "$legacy_config" ] || return 1
+  systemctl cat cloudflared.service >/dev/null 2>&1 || return 1
+  systemctl is-active --quiet cloudflared.service 2>/dev/null \
+    || systemctl is-enabled --quiet cloudflared.service 2>/dev/null \
+    || return 1
+  systemctl cat cloudflared.service 2>/dev/null \
+    | grep -Eq -- '--config([=[:space:]])+/etc/cloudflared/config\.yml([[:space:]]|$)' || return 1
+  legacy_tunnel="$(awk '$1 == "tunnel:" {print $2; exit}' "$legacy_config" | tr -d "\"'")"
+  [ "$legacy_tunnel" = "$tunnel_name" ]
+}
+
+migrate_legacy_cloudflared_service() {
+  local tunnel_name="$1"
+  if legacy_cloudflared_service_uses_tunnel "$tunnel_name"; then
+    say "Migrating legacy cloudflared.service to $(cloudflared_service_unit "$tunnel_name")..."
+    _priv systemctl disable --now cloudflared.service >/dev/null 2>&1 || true
+  fi
+}
+
+legacy_cloudflared_tmux_uses_tunnel() {
+  local tunnel_name="$1" command
+  tmux has-session -t "$CF_TMUX_SESSION" 2>/dev/null || return 1
+  while IFS= read -r command; do
+    case "$command" in
+      *cloudflared*"run ${tunnel_name}"|*cloudflared*"run ${tunnel_name} "*) return 0 ;;
+    esac
+  done < <(tmux list-panes -t "$CF_TMUX_SESSION" -F '#{pane_start_command}' 2>/dev/null)
+  return 1
+}
+
+migrate_legacy_cloudflared_tmux() {
+  local tunnel_name="$1"
+  if legacy_cloudflared_tmux_uses_tunnel "$tunnel_name"; then
+    say "Migrating legacy tmux connector to $(cloudflared_service_unit "$tunnel_name")..."
+    tmux kill-session -t "$CF_TMUX_SESSION"
+  fi
+}
+
+tunnel_has_active_connections() {
+  local tunnel_name="$1" output
+  output="$(cloudflared tunnel info "$tunnel_name" 2>/dev/null)" || return 1
+  ! printf '%s\n' "$output" | grep -qi 'does not have any active connection' \
+    && printf '%s\n' "$output" | grep -qi 'connector'
+}
+
+wait_for_cloudflared_connection() {
+  local tunnel_name="$1" i
+  for i in $(seq 1 15); do
+    if check_cloudflared && tunnel_has_active_connections "$tunnel_name"; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
 }
 
 # Return 0 (true) if auth.py on disk is newer than the running process.
@@ -944,21 +1016,16 @@ auth_py_changed() {
 }
 
 stop_cloudflared() {
-  say "Stopping cloudflared..."
-  # NAS: stop ONLY our managed service. Never `pkill -x cloudflared` here — other
-  # unrelated tunnels may be running on this box.
-  if is_tos_nas; then
-    _priv systemctl stop cloudflared.service 2>/dev/null || true
-    return 0
+  local tunnel_name unit
+  tunnel_name="$(detect_tunnel_name)"
+  say "Stopping cloudflared tunnel '${tunnel_name}'..."
+  if has_systemd; then
+    unit="$(cloudflared_service_unit "$tunnel_name")"
+    _priv systemctl stop "$unit" 2>/dev/null || true
   fi
-  if tmux has-session -t "$CF_TMUX_SESSION" 2>/dev/null; then
+  if legacy_cloudflared_tmux_uses_tunnel "$tunnel_name"; then
     tmux kill-session -t "$CF_TMUX_SESSION" 2>/dev/null || true
   fi
-  # Also kill any stray cloudflared processes (e.g. from nohup or systemd).
-  if is_linux && pidof systemd >/dev/null 2>&1; then
-    sudo systemctl stop cloudflared 2>/dev/null || true
-  fi
-  pkill -x cloudflared 2>/dev/null || true
   sleep 1
 }
 
@@ -975,19 +1042,22 @@ start_cloudflared() {
     return 1
   fi
 
-  # NAS: run as a system service (survives reboot, auto-restarts), not tmux.
-  if is_tos_nas; then
-    say "Starting cloudflared tunnel '${tunnel_name}' via systemd (cloudflared.service)..."
+  if has_systemd; then
+    local unit
+    unit="$(cloudflared_service_unit "$tunnel_name")"
+    say "Starting cloudflared tunnel '${tunnel_name}' via systemd (${unit})..."
+    migrate_legacy_cloudflared_service "$tunnel_name"
+    migrate_legacy_cloudflared_tmux "$tunnel_name"
     write_cloudflared_systemd_unit "$tunnel_name"
     _priv systemctl daemon-reload
-    _priv systemctl enable cloudflared.service >/dev/null 2>&1 || true
-    _priv systemctl restart cloudflared.service
-    sleep 2
-    if _priv systemctl is-active --quiet cloudflared.service; then
-      say "  cloudflared.service active."
+    _priv systemctl enable "$unit" >/dev/null 2>&1 || true
+    _priv systemctl restart "$unit"
+    say "Waiting for tunnel to connect..."
+    if wait_for_cloudflared_connection "$tunnel_name"; then
+      say "  Tunnel '${tunnel_name}' connected via ${unit}."
       return 0
     fi
-    err "cloudflared.service failed to start. Check: journalctl -u cloudflared.service"
+    err "Tunnel '${tunnel_name}' did not connect. Check: journalctl -u ${unit}"
     return 1
   fi
 
@@ -1002,31 +1072,13 @@ start_cloudflared() {
   tmux new-session -d -s "$CF_TMUX_SESSION" \
     "cloudflared tunnel run ${tunnel_name} 2>&1 | tee -a ${CF_LOG}"
 
-  # Wait for cloudflared to establish connections (up to 15s).
   say "Waiting for tunnel to connect..."
-  local i
-  for i in $(seq 1 30); do
-    if pgrep -x cloudflared >/dev/null 2>&1; then
-      # Check if tunnel has active connections.
-      local conns
-      conns="$(cloudflared tunnel info "$tunnel_name" 2>/dev/null | grep -c 'CONNECTIONS\|connector' || true)"
-      if [ "${conns:-0}" -gt 0 ]; then
-        say "  Tunnel '${tunnel_name}' connected."
-        return 0
-      fi
-    fi
-    sleep 0.5
-  done
-
-  # Even if connections aren't confirmed yet, check process is alive.
-  if pgrep -x cloudflared >/dev/null 2>&1; then
-    say "  cloudflared is running (connections may still be establishing)."
-    say "  Log: ${CF_LOG}"
-    say "  Attach: tmux attach -t ${CF_TMUX_SESSION}"
+  if wait_for_cloudflared_connection "$tunnel_name"; then
+    say "  Tunnel '${tunnel_name}' connected."
     return 0
   fi
 
-  err "cloudflared failed to start. Check log: ${CF_LOG}"
+  err "Tunnel '${tunnel_name}' did not connect. Check log: ${CF_LOG}"
   return 1
 }
 
@@ -1170,12 +1222,10 @@ status_report() {
   if [ -n "$tunnel_name" ]; then
     if check_cloudflared; then
       say "cloudflared  : OK (running, tunnel: ${tunnel_name})"
-      if is_tos_nas; then
-        say "cloudflared  : (systemd cloudflared.service)"
+      if has_systemd; then
+        say "cloudflared  : (systemd $(cloudflared_service_unit "$tunnel_name"))"
       elif tmux has-session -t "$CF_TMUX_SESSION" 2>/dev/null; then
         say "tmux session : OK (${CF_TMUX_SESSION})"
-      else
-        say "tmux session : WARN (not in tmux - may be systemd/nohup)"
       fi
     else
       say "cloudflared  : FAIL (not running, tunnel: ${tunnel_name})"
