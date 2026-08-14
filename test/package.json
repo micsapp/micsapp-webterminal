@@ -18,7 +18,8 @@
     "cy:run:security": "cypress run --spec 'cypress/e2e/09-security.cy.js'",
     "cy:run:mobile": "cypress run --spec 'cypress/e2e/10-mobile.cy.js'",
     "cy:run:api": "cypress run --spec 'cypress/e2e/11-api-endpoints.cy.js'",
-    "cy:run:desktop": "cypress run --spec 'cypress/e2e/12-desktop-vnc.cy.js'"
+    "cy:run:desktop": "cypress run --spec 'cypress/e2e/12-desktop-vnc.cy.js'",
+    "cy:run:notes": "cypress run --spec 'cypress/e2e/13-session-notes.cy.js'"
   },
   "devDependencies": {
     "cypress": "^13.17.0"

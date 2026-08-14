@@ -228,6 +228,33 @@ class RemoteTabTests(unittest.TestCase):
         self.assertNotIn("StrictHostKeyChecking=no", tunnel_script)
         self.assertNotIn("StrictHostKeyChecking=no", direct_script)
 
+    def test_remote_window_uses_and_returns_the_browser_tab_name(self):
+        server = auth.validate_server_repository(repository_document())[0]
+        script = auth.build_remote_window_script(server, 4, name="Custom Shell 4")
+        self.assertIn("Custom Shell 4", script)
+        self.assertIn('"display-message", "-p", "-t", target', script)
+        self.assertIn('"name": window_name', script)
+        self.assertIn('"name": cfg["name"]', script)
+
+    def test_ttyd_launcher_keeps_name_sync_out_of_terminal_startup(self):
+        process = mock.Mock()
+        popen = mock.Mock(return_value=process)
+        username = "session-name-sync-test"
+        auth.user_instances.pop(username, None)
+        try:
+            with mock.patch.object(auth, "allocate_port", return_value=7799), mock.patch.object(
+                auth, "wait_for_ttyd_ready", return_value=True
+            ), mock.patch.object(auth.subprocess, "Popen", popen):
+                self.assertEqual(auth.spawn_user_ttyd(username, "password"), 7799)
+        finally:
+            auth.user_instances.pop(username, None)
+
+        launcher = popen.call_args.args[0][-1]
+        self.assertIn('RAW="$1"; case "$RAW"', launcher)
+        self.assertIn("|| exec tmux new-session", launcher)
+        self.assertNotIn('NAME="$2"', launcher)
+        self.assertNotIn("rename-window", launcher)
+
     def test_catalog_sync_passes_only_tunnel_hosts_once(self):
         servers = auth.validate_server_repository(repository_document())
         fake_run = mock.Mock(
@@ -272,6 +299,25 @@ class RemoteTabTests(unittest.TestCase):
         self.assertIn("serverId: t.serverId", auth.APP_HTML)
         self.assertNotIn("sshHostname: t.sshHostname", auth.APP_HTML)
         self.assertNotIn("webHostname: t.webHostname", auth.APP_HTML)
+
+    def test_spa_reconciles_tab_names_with_tmux(self):
+        self.assertNotIn("params.append('arg', (tab && tab.name) ? tab.name : '')", auth.APP_HTML)
+        self.assertIn("#{automatic-rename}", auth.APP_HTML)
+        self.assertIn("function reconcileSessionNames(sessions)", auth.APP_HTML)
+        self.assertIn("if (live && !live.autoRename && live.name) tabObj.name = live.name", auth.APP_HTML)
+        self.assertIn("reconcileSessionNames(sessions);\n  sessLast = sessions;", auth.APP_HTML)
+        self.assertIn("data.exit_code !== 0", auth.APP_HTML)
+
+    def test_installer_contains_session_name_sync_contract(self):
+        installer = pathlib.Path(auth.__file__).with_name("cf_tunnel_install.sh").read_text(encoding="utf-8")
+        for fragment in (
+            "function reconcileSessionNames(sessions)",
+            'RAW="$1"; case "$RAW"',
+            "|| exec tmux new-session",
+            "def build_remote_window_script(server, slot, name=None):",
+        ):
+            self.assertIn(fragment, installer)
+        self.assertNotIn('NAME="$2"', installer)
 
     def test_trusted_origins_can_embed_web_terminal_html(self):
         headers = auth.HTML_ONLY_SECURITY_HEADERS

@@ -164,13 +164,32 @@ at once, without having to switch to each tab.
 1. Type the command in the input, or click **⚡** to pick one from your
    [Quick Commands](#quick-commands) library — a searchable list pops up and the
    command you click is placed in the input so you can edit it first.
-2. Click **Send to selected** to run it in the checked sessions, or **Send to
-   all** for every session. Sending to all asks for confirmation first.
+2. With no sessions checked, click **Send to active** to target the currently
+   focused terminal tab. Checking session rows changes that primary action to
+   **Send to selected (N)**. Use **Send to all** to target every local session;
+   sending to all asks for confirmation first.
 
 ![Quick command picker in the send bar](images/sessions-send.png)
 
-Keyboard: `Enter` sends to the selected sessions, `Ctrl+Enter` (`Cmd+Enter` on
-macOS) sends to all.
+### Composing with Notes
+
+Click **📝** beside the Quick Commands button to open a larger, mobile-friendly
+text area. Autocorrect, auto-capitalization, and spellcheck are disabled in the
+editor so command text stays exactly as entered.
+
+- **Save note** stores a new note; select a saved note to modify or delete it.
+- **Send to active** is the default. If session rows are checked, it changes to
+  **Send to selected (N)**; **Send to all** remains available separately.
+- Every note send saves the latest edits first, then sends the note directly to
+  the resolved terminal sessions.
+- Notes are stored per user on the server, so they survive refreshes and are
+  available from the user's other devices.
+
+Nothing reaches a terminal while a note is being edited. Send submits the text
+with Enter; remote SSH and desktop tabs are skipped just like the command bar.
+
+Keyboard: `Enter` uses the adaptive default (active tab, or checked sessions if
+any are selected). `Ctrl+Enter` (`Cmd+Enter` on macOS) sends to all.
 
 The command is delivered server-side and submitted with Enter, so it also runs
 in sessions that are not currently attached in this browser. Remote SSH tabs and

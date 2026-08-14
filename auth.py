@@ -2840,19 +2840,45 @@ __PWA_HEAD__
       <div class="session-send-row">
         <div class="session-send-input-wrap">
           <input type="text" id="sessSendInput" class="session-send-input" placeholder="Command to send…"
-                 autocomplete="off" spellcheck="false" onkeydown="sessSendKeydown(event)">
+                 autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"
+                 onkeydown="sessSendKeydown(event)">
           <button class="fp-btn" id="sessQcBtn" onclick="toggleSessQuickPicker(event)"
-                  title="Pick a quick command">&#9889;</button>
+                  title="Pick a quick command" aria-label="Pick a quick command">&#9889;</button>
+          <button class="fp-btn" id="sessNoteBtn" onclick="toggleSessNotes(event)"
+                  title="Open saved notes" aria-label="Open saved notes">&#128221;</button>
         </div>
-        <button class="fp-btn" id="sessSendSelectedBtn" onclick="sendToSessions(false)"
-                title="Send to checked sessions" disabled>Send to selected</button>
-        <button class="fp-btn" onclick="sendToSessions(true)" title="Send to every local session">Send to all</button>
+        <button class="fp-btn" id="sessSendDefaultBtn" onclick="sendToSessions()"
+                title="Send to the active terminal tab">Send to active</button>
+        <button class="fp-btn" onclick="sendToSessions('all')" title="Send to every local session">Send to all</button>
       </div>
-      <div class="session-send-hint">Sent with Enter to the tmux window. Remote SSH and desktop tabs are skipped.</div>
+      <div class="session-send-hint">Default target: active tab. Checked sessions override it. Text is sent with Enter; remote tabs are skipped.</div>
       <div class="sess-qc-popover" id="sessQcPopover">
         <input type="text" id="sessQcSearch" class="session-send-input" placeholder="Search quick commands…"
                autocomplete="off" oninput="sessQcRender()">
         <div class="sess-qc-list" id="sessQcList"></div>
+      </div>
+      <div class="sess-notes-popover" id="sessNotesPopover">
+        <div class="sess-notes-header">
+          <strong>&#128221; Notes</strong>
+          <button class="fp-btn" onclick="sessNoteNew()">New</button>
+          <button class="fp-btn" onclick="closeSessNotes()" aria-label="Close notes">&#10005;</button>
+        </div>
+        <div class="sess-notes-editor">
+          <input type="text" id="sessNoteTitle" class="session-send-input" maxlength="200"
+                 placeholder="Note title (optional)" autocomplete="off" autocorrect="off">
+          <textarea id="sessNoteContent" maxlength="32768" placeholder="Type or paste text here. Nothing is sent until you tap Send."
+                    autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"></textarea>
+          <div class="sess-notes-actions">
+            <button class="fp-btn" id="sessNoteSaveBtn" onclick="sessNoteSave()">Save note</button>
+            <button class="fp-btn sess-note-delete" id="sessNoteDeleteBtn" onclick="sessNoteDelete()" disabled>Delete</button>
+            <span class="sess-notes-action-spacer"></span>
+            <button class="fp-btn" id="sessNoteSendDefaultBtn" onclick="sessNoteSend()">Send to active</button>
+            <button class="fp-btn" onclick="sessNoteSend('all')">Send to all</button>
+          </div>
+          <div class="session-send-hint">Send saves your latest edits first. Default target: active tab; checked sessions override it.</div>
+        </div>
+        <div class="sess-notes-list-label">Saved notes</div>
+        <div class="sess-notes-list" id="sessNotesList"></div>
       </div>
     </div>
   </div>
@@ -2885,6 +2911,35 @@ __PWA_HEAD__
   .sess-qc-cmd { font-size:11px; color:#9a9abf; font-family:ui-monospace,Menlo,Consolas,monospace;
     white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   .sess-qc-empty { color:#7a7a9e; font-size:12px; padding:8px; }
+  .sess-notes-popover { display:none; position:absolute; left:16px; right:16px; bottom:100%; margin-bottom:6px;
+    max-height:min(560px,70vh); overflow-y:auto; background:#16213e; border:1px solid #2a2a4a; border-radius:8px;
+    padding:10px; z-index:31; box-shadow:0 8px 24px rgba(0,0,0,0.45); }
+  .sess-notes-popover.open { display:block; }
+  .sess-notes-header { display:flex; align-items:center; gap:6px; margin-bottom:8px; }
+  .sess-notes-header strong { flex:1; color:#e2e2e2; font-size:14px; }
+  .sess-notes-editor { display:flex; flex-direction:column; gap:7px; }
+  .sess-notes-editor textarea { width:100%; min-height:130px; resize:vertical; background:#101828;
+    border:1px solid #2a2a4a; border-radius:6px; color:#e2e2e2; padding:9px; outline:none;
+    font:13px/1.4 ui-monospace,Menlo,Consolas,monospace; }
+  .sess-notes-editor textarea:focus { border-color:#e94560; }
+  .sess-notes-actions { display:flex; align-items:center; gap:6px; flex-wrap:wrap; }
+  .sess-notes-action-spacer { flex:1; }
+  .sess-note-delete { color:#e94560; border-color:#6b2b42; }
+  .sess-notes-list-label { color:#7a7a9e; font-size:11px; margin:11px 2px 4px; text-transform:uppercase; }
+  .sess-notes-list { max-height:150px; overflow-y:auto; border-top:1px solid #2a2a4a; }
+  .sess-note-item { padding:7px 8px; border-bottom:1px solid #202b45; cursor:pointer; border-radius:4px; }
+  .sess-note-item:hover, .sess-note-item.active { background:#0f3460; }
+  .sess-note-item-title { color:#e2e2e2; font-size:13px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .sess-note-item-preview { color:#7a7a9e; font-size:11px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  @media (max-width:600px) {
+    .session-send-row { flex-wrap:wrap; }
+    .session-send-input-wrap { flex-basis:100%; }
+    .session-send-row > .fp-btn { flex:1; }
+    .sess-notes-popover { left:6px; right:6px; max-height:72vh; }
+    .sess-notes-editor textarea { min-height:170px; font-size:16px; }
+    .sess-notes-actions .fp-btn { flex:1 1 auto; }
+    .sess-notes-action-spacer { display:none; }
+  }
 </style>
 
 <div id="toast" class="toast"></div>
@@ -3688,10 +3743,16 @@ async function ensureRemoteWindow(tab) {
   const response = await fetch('/api/remote-tab', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ server_id: tab.serverId, slot: tab.windowSlot })
+    body: JSON.stringify({ server_id: tab.serverId, slot: tab.windowSlot, name: tab.name })
   });
   const data = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(data.error || ('HTTP ' + response.status));
+  // An already-live remote window keeps its server-side name. This can differ
+  // from stale localStorage on another device, so adopt it before rendering.
+  if (typeof data.name === 'string' && data.name && tab.name !== data.name) {
+    tab.name = data.name;
+    if (tabs.includes(tab)) { renderTabs(); saveTabs(); }
+  }
   return true;
 }
 
@@ -3703,7 +3764,9 @@ async function addRemoteTab(serverId) {
     return;
   }
   const slot = nextTabWindowSlot();
+  const remoteNumber = tabs.filter(tab => tab.type === 'ssh' && tab.serverId === server.id).length + 1;
   const candidate = {
+    name: server.name + ' · Shell ' + remoteNumber,
     type: 'ssh',
     serverId: server.id,
     sshMode: server.ssh_mode,
@@ -3718,10 +3781,9 @@ async function addRemoteTab(serverId) {
   }
 
   tabCounter++;
-  const remoteNumber = tabs.filter(tab => tab.type === 'ssh' && tab.serverId === server.id).length + 1;
   const tab = {
     id: 'tab-' + tabCounter,
-    name: server.name + ' · Shell ' + remoteNumber,
+    name: candidate.name,
     type: 'ssh',
     serverId: server.id,
     sshMode: server.ssh_mode,
@@ -3978,6 +4040,7 @@ function renderTabs() {
 function startRename(id, labelEl) {
   const t = tabs.find(t => t.id === id);
   if (!t) return;
+  const oldName = t.name;
   const input = document.createElement('input');
   input.type = 'text';
   input.value = t.name;
@@ -3987,7 +4050,27 @@ function startRename(id, labelEl) {
     if (done) return;
     done = true;
     const val = input.value.trim();
-    if (val) { t.name = val; if (isTerminalTab(t)) syncWindowName(t.windowSlot, val); }
+    if (val) {
+      t.name = val;
+      if (isTerminalTab(t) && val !== oldName) {
+        syncWindowName(t.windowSlot, val).catch(async (error) => {
+          showToast('Could not sync tab name: ' + (error.message || error), true);
+          // tmux is authoritative. If the rename failed, restore whatever name
+          // the server currently has; only fall back to the old local value if
+          // even that read is unavailable.
+          try {
+            const sessions = await fetchSessions();
+            reconcileSessionNames(sessions);
+            const overlay = document.getElementById('sessionsModal');
+            if (overlay && overlay.classList.contains('open')) renderSessionList(sessions);
+          } catch (e) {
+            t.name = oldName;
+            renderTabs();
+            saveTabs();
+          }
+        });
+      }
+    }
     renderTabs();
     saveTabs();
   };
@@ -4029,32 +4112,51 @@ function updateTileSelectedBtn() {
     btn.disabled = n === 0;
     btn.innerHTML = '&#9707; Tile selected' + (n ? ' (' + n + ')' : '');
   }
-  const send = document.getElementById('sessSendSelectedBtn');
-  if (send) {
-    const n = sessLast.filter(s => sessSelected.has(s.slot) && sessIsSendable(s)).length;
-    send.disabled = n === 0;
-    send.textContent = 'Send to selected' + (n ? ' (' + n + ')' : '');
-  }
+
+  const selectedTotal = sessSelected.size;
+  const selectedSendable = sessLast.filter(s => sessSelected.has(s.slot) && sessIsSendable(s)).length;
+  const activeAvailable = sessSendTargets('active').ok.length > 0;
+  ['sessSendDefaultBtn', 'sessNoteSendDefaultBtn'].forEach(id => {
+    const send = document.getElementById(id);
+    if (!send) return;
+    if (selectedTotal) {
+      send.disabled = selectedSendable === 0;
+      send.textContent = 'Send to selected' + (selectedSendable ? ' (' + selectedSendable + ')' : '');
+      send.title = selectedSendable ? 'Send to checked sessions' : 'No checked local terminal sessions';
+    } else {
+      send.disabled = !activeAvailable;
+      send.textContent = 'Send to active';
+      send.title = activeAvailable ? 'Send to the active terminal tab' : 'The active tab is not a local terminal';
+    }
+  });
 }
 
 function sessEscHtml(s) {
   return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
 
-function sessShq(s) { return "'" + String(s).replace(/'/g, "'\\''") + "'"; }
-
 // Persist a tab's name as the tmux window name so it shows identically on every
 // device. automatic-rename is turned off so the chosen label sticks instead of
 // reverting to the running command.
-function syncWindowName(slot, name) {
-  if (!Number.isInteger(slot) || !name) return;
+async function syncWindowName(slot, name, refreshOpenManager) {
+  if (!Number.isInteger(slot) || !name) throw new Error('invalid session name');
   const cmd = 'tmux setw -t ' + TMUX_SESSION + ':' + slot + ' automatic-rename off 2>/dev/null; '
-            + 'tmux rename-window -t ' + TMUX_SESSION + ':' + slot + ' ' + sessShq(name) + ' 2>/dev/null || true';
-  fetch('/api/exec', {
+            + 'tmux rename-window -t ' + TMUX_SESSION + ':' + slot + ' ' + sessShqStrict(name) + ' 2>/dev/null';
+  const res = await fetch('/api/exec', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ command: cmd })
-  }).catch(() => {});
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || data.exit_code !== 0) throw new Error(data.stderr || ('HTTP ' + res.status));
+
+  const cached = sessLast.find(s => s.slot === slot);
+  if (cached) { cached.name = name; cached.autoRename = false; }
+  const overlay = document.getElementById('sessionsModal');
+  if (refreshOpenManager !== false && overlay && overlay.classList.contains('open')) {
+    renderSessionList(await fetchSessions());
+  }
+  return true;
 }
 
 function sessFmtAgo(epoch) {
@@ -4069,7 +4171,7 @@ function sessFmtAgo(epoch) {
 }
 
 async function fetchSessions() {
-  const fmt = '#{window_index}\\t#{window_name}\\t#{pane_current_command}\\t#{window_activity}\\t#{window_panes}\\t#{@webterminal_server_id}';
+  const fmt = '#{window_index}\\t#{window_name}\\t#{pane_current_command}\\t#{window_activity}\\t#{window_panes}\\t#{@webterminal_server_id}\\t#{automatic-rename}';
   const res = await fetch('/api/exec', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -4083,10 +4185,39 @@ async function fetchSessions() {
     const slot = parseInt(p[0], 10);
     if (!Number.isInteger(slot)) return;
     out.push({ slot: slot, name: p[1] || ('Shell ' + slot), cmd: p[2] || '', activity: p[3] || '',
-               panes: p[4] || '1', serverId: (p[5] || '').trim() });
+               panes: p[4] || '1', serverId: (p[5] || '').trim(),
+               autoRename: p[6] === '1' || p[6] === 'on' });
   });
   out.sort((a, b) => a.slot - b.slot);
   return out;
+}
+
+// Keep the browser and tmux views of a terminal name identical. tmux is the
+// source of truth once a window has an explicit name. Legacy windows that are
+// still automatically named (usually "bash", "node", etc.) are migrated once
+// from the saved browser label, then automatic rename is disabled.
+function reconcileSessionNames(sessions) {
+  const bySlot = new Map(sessions.map(s => [s.slot, s]));
+  let changed = false;
+  tabs.filter(isTerminalTab).forEach(tab => {
+    const session = bySlot.get(tab.windowSlot);
+    if (!session || !session.name) return;
+    if (session.autoRename && tab.name) {
+      session.name = tab.name;
+      session.autoRename = false;
+      syncWindowName(tab.windowSlot, tab.name, false).catch((error) => {
+        console.warn('Could not migrate tmux window name for slot ' + tab.windowSlot, error);
+      });
+    } else if (tab.name !== session.name) {
+      tab.name = session.name;
+      changed = true;
+    }
+  });
+  if (changed) {
+    renderTabs();
+    saveTabs();
+  }
+  return changed;
 }
 
 // A tmux window created for a remote SSH tab carries @webterminal_server_id.
@@ -4109,11 +4240,13 @@ function closeSessions() {
   const overlay = document.getElementById('sessionsModal');
   if (overlay) overlay.classList.remove('open');
   closeSessQuickPicker();
+  closeSessNotes();
 }
 
 function renderSessionList(sessions) {
   const body = document.getElementById('sessionsList');
   if (!body) return;
+  reconcileSessionNames(sessions);
   sessLast = sessions;
   if (!sessions.length) {
     body.innerHTML = '<div style="color:#9a9abf;padding:16px">No live sessions found.</div>';
@@ -4183,39 +4316,70 @@ async function killSession(slot, name) {
   setTimeout(async () => { try { renderSessionList(await fetchSessions()); } catch (e) {} }, 250);
 }
 
-// --- Send a command into sessions from the picker ---------------------------
-// Delivery is server-side (`tmux send-keys`), not through the iframe, so a
-// session that isn't attached on this device still receives it.
+// --- Send reviewed text into terminal sessions ------------------------------
+// Delivery is server-side through tmux, not through the iframe, so a session
+// that isn't attached on this device still receives it.
 
 function sessShqStrict(s) { return "'" + String(s).replace(/'/g, "'\\\\''") + "'"; }
 
-function sessSendTargets(all) {
-  const chosen = all ? sessLast.slice() : sessLast.filter(s => sessSelected.has(s.slot));
-  return { ok: chosen.filter(sessIsSendable), skipped: chosen.filter(s => !sessIsSendable(s)).length };
+function sessResolveSendScope(scope) {
+  if (scope === 'all' || scope === 'selected' || scope === 'active') return scope;
+  return sessSelected.size ? 'selected' : 'active';
 }
 
-async function sendToSessions(all) {
-  const input = document.getElementById('sessSendInput');
-  if (!input) return;
-  const cmd = (input.value || '').replace(/\\r/g, '');
-  if (!cmd.trim()) { showToast('Type a command first', true); input.focus(); return; }
-  const { ok, skipped } = sessSendTargets(all);
+function sessSendTargets(scope) {
+  const resolved = sessResolveSendScope(scope);
+  let chosen = [];
+  let error = '';
+  if (resolved === 'all') {
+    chosen = sessLast.slice();
+  } else if (resolved === 'selected') {
+    chosen = sessLast.filter(s => sessSelected.has(s.slot));
+    if (!chosen.length) error = 'Check the sessions you want first';
+  } else {
+    const tab = tabs.find(item => item.id === activeTabId);
+    if (!tab || !isTerminalTab(tab) || !Number.isInteger(tab.windowSlot)) {
+      error = 'The active tab is not a terminal session';
+    } else {
+      const live = sessLast.find(s => s.slot === tab.windowSlot);
+      chosen = [live || { slot: tab.windowSlot, serverId: tab.serverId || '' }];
+    }
+  }
+  const ok = chosen.filter(sessIsSendable);
+  const skipped = chosen.filter(s => !sessIsSendable(s)).length;
+  if (!ok.length && skipped && resolved === 'active') error = 'The active tab is a remote session and cannot receive text here';
+  return { scope: resolved, ok: ok, skipped: skipped, error: error };
+}
+
+async function sendSessionText(raw, scope) {
+  const text = String(raw || '').replace(/\\r/g, '');
+  if (!text.trim()) { showToast('Type some text first', true); return false; }
+  const targets = sessSendTargets(scope);
+  const { ok, skipped } = targets;
   if (!ok.length) {
-    if (skipped) showToast('Only remote sessions matched — nothing sent', true);
-    else showToast(all ? 'No sessions to send to' : 'Check the sessions you want first', true);
-    return;
+    if (targets.error) showToast(targets.error, true);
+    else if (skipped) showToast('Only remote sessions matched — nothing sent', true);
+    else showToast(targets.scope === 'all' ? 'No sessions to send to' : 'Check the sessions you want first', true);
+    return false;
   }
-  if (all && ok.length > 1) {
+  if (targets.scope === 'all' && ok.length > 1) {
+    const preview = text.length > 1200 ? text.slice(0, 1200) + '…' : text;
     const go = await dlgOpen({ kind: 'confirm', title: 'Send to all sessions', okText: 'Send',
-      message: 'Run this in ' + ok.length + ' sessions?\\n\\n' + cmd });
-    if (!go) return;
+      message: 'Send this text to ' + ok.length + ' sessions and press Enter?\\n\\n' + preview });
+    if (!go) return false;
   }
-  const q = sessShqStrict(cmd);
-  const parts = ok.map(s => {
+
+  // Load the text into one temporary tmux buffer and paste it to every target.
+  // This handles multiline/Unicode notes and avoids duplicating a long payload
+  // once per session in the /api/exec command.
+  const buffer = 'webterminal-' + Date.now() + '-' + Math.floor(Math.random() * 100000);
+  const parts = ['tmux set-buffer -b ' + buffer + ' -- ' + sessShqStrict(text)];
+  ok.forEach(s => {
     const t = TMUX_SESSION + ':' + s.slot;
-    return 'tmux send-keys -t ' + t + ' -l -- ' + q + ' 2>/dev/null; '
-         + 'tmux send-keys -t ' + t + ' Enter 2>/dev/null';
+    parts.push('tmux paste-buffer -b ' + buffer + ' -t ' + t + ' 2>/dev/null');
+    parts.push('tmux send-keys -t ' + t + ' Enter 2>/dev/null');
   });
+  parts.push('tmux delete-buffer -b ' + buffer + ' 2>/dev/null');
   try {
     const res = await fetch('/api/exec', {
       method: 'POST',
@@ -4225,17 +4389,25 @@ async function sendToSessions(all) {
     if (!res.ok) throw new Error('HTTP ' + res.status);
   } catch (e) {
     showToast('Send failed: ' + (e.message || e), true);
-    return;
+    return false;
   }
-  input.value = '';
-  showToast('Sent to ' + ok.length + ' session' + (ok.length > 1 ? 's' : '')
-            + (skipped ? ' · ' + skipped + ' remote skipped' : ''));
+  const destination = targets.scope === 'active'
+    ? 'active tab'
+    : ok.length + ' session' + (ok.length > 1 ? 's' : '');
+  showToast('Sent to ' + destination + (skipped ? ' · ' + skipped + ' remote skipped' : ''));
+  return true;
+}
+
+async function sendToSessions(scope) {
+  const input = document.getElementById('sessSendInput');
+  if (!input) return;
+  if (await sendSessionText(input.value, scope)) input.value = '';
 }
 
 function sessSendKeydown(ev) {
   if (ev.key !== 'Enter') return;
   ev.preventDefault();
-  sendToSessions(ev.ctrlKey || ev.metaKey);
+  sendToSessions(ev.ctrlKey || ev.metaKey ? 'all' : undefined);
 }
 
 // Quick-command picker for the send box: same catalog as the Quick Commands
@@ -4249,6 +4421,7 @@ function closeSessQuickPicker() {
 
 async function toggleSessQuickPicker(ev) {
   if (ev) ev.stopPropagation();
+  closeSessNotes();
   const pop = document.getElementById('sessQcPopover');
   if (!pop) return;
   if (pop.classList.contains('open')) { closeSessQuickPicker(); return; }
@@ -4295,6 +4468,159 @@ function sessQcRender() {
     };
     list.appendChild(el);
   });
+}
+
+// Persistent notes for composing/reviewing text before it reaches a terminal.
+let sessNotesCache = null;
+let sessNoteEditingId = null;
+
+function closeSessNotes() {
+  const pop = document.getElementById('sessNotesPopover');
+  if (pop) pop.classList.remove('open');
+}
+
+async function toggleSessNotes(ev) {
+  if (ev) ev.stopPropagation();
+  const pop = document.getElementById('sessNotesPopover');
+  if (!pop) return;
+  if (pop.classList.contains('open')) { closeSessNotes(); return; }
+  closeSessQuickPicker();
+  pop.classList.add('open');
+  await sessNotesLoad(true);
+  const content = document.getElementById('sessNoteContent');
+  // Keep an unsaved draft when the popover is closed accidentally.
+  if (!sessNoteEditingId && content && !content.value) sessNoteNew();
+  if (content) content.focus();
+}
+
+async function sessNotesLoad(force) {
+  const list = document.getElementById('sessNotesList');
+  if (!list) return;
+  if (!force && sessNotesCache) { sessNotesRender(); return; }
+  list.innerHTML = '<div class="sess-qc-empty">Loading…</div>';
+  try {
+    const res = await fetch('/api/notes');
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || data.error) throw new Error(data.error || ('HTTP ' + res.status));
+    sessNotesCache = Array.isArray(data.notes) ? data.notes : [];
+    sessNotesRender();
+  } catch (e) {
+    list.innerHTML = '<div class="sess-qc-empty" style="color:#e94560">Error: '
+      + sessEscHtml(e.message || e) + '</div>';
+  }
+}
+
+function sessNotesRender() {
+  const list = document.getElementById('sessNotesList');
+  if (!list) return;
+  list.innerHTML = '';
+  if (!sessNotesCache || !sessNotesCache.length) {
+    list.innerHTML = '<div class="sess-qc-empty">No saved notes yet.</div>';
+    return;
+  }
+  sessNotesCache.forEach(note => {
+    const item = document.createElement('div');
+    item.className = 'sess-note-item' + (note.id === sessNoteEditingId ? ' active' : '');
+    const title = document.createElement('div');
+    title.className = 'sess-note-item-title';
+    title.textContent = note.title || 'Untitled note';
+    const preview = document.createElement('div');
+    preview.className = 'sess-note-item-preview';
+    preview.textContent = (note.content || '').replace(/\\s+/g, ' ').trim();
+    item.appendChild(title);
+    item.appendChild(preview);
+    item.onclick = () => sessNoteSelect(note.id);
+    list.appendChild(item);
+  });
+}
+
+function sessNoteSelect(id) {
+  const note = (sessNotesCache || []).find(item => item.id === id);
+  if (!note) return;
+  sessNoteEditingId = note.id;
+  document.getElementById('sessNoteTitle').value = note.title || '';
+  document.getElementById('sessNoteContent').value = note.content || '';
+  document.getElementById('sessNoteDeleteBtn').disabled = false;
+  document.getElementById('sessNoteSaveBtn').textContent = 'Save changes';
+  sessNotesRender();
+}
+
+function sessNoteNew() {
+  sessNoteEditingId = null;
+  const title = document.getElementById('sessNoteTitle');
+  const content = document.getElementById('sessNoteContent');
+  if (title) title.value = '';
+  if (content) { content.value = ''; content.focus(); }
+  const del = document.getElementById('sessNoteDeleteBtn');
+  if (del) del.disabled = true;
+  const save = document.getElementById('sessNoteSaveBtn');
+  if (save) save.textContent = 'Save note';
+  sessNotesRender();
+}
+
+async function sessNoteSave(silent) {
+  const title = document.getElementById('sessNoteTitle');
+  const content = document.getElementById('sessNoteContent');
+  const save = document.getElementById('sessNoteSaveBtn');
+  const body = content ? content.value : '';
+  if (!body.trim()) { showToast('Type note text first', true); if (content) content.focus(); return false; }
+  const payload = { action: sessNoteEditingId ? 'update' : 'add',
+    title: title ? title.value : '', content: body };
+  if (sessNoteEditingId) payload.id = sessNoteEditingId;
+  if (save) save.disabled = true;
+  try {
+    const res = await fetch('/api/notes', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || data.error) throw new Error(data.error || ('HTTP ' + res.status));
+    if (data.id) sessNoteEditingId = data.id;
+    await sessNotesLoad(true);
+    if (sessNoteEditingId) sessNoteSelect(sessNoteEditingId);
+    if (!silent) showToast(payload.action === 'add' ? 'Note saved' : 'Note updated');
+    return true;
+  } catch (e) {
+    showToast('Could not save note: ' + (e.message || e), true);
+    return false;
+  } finally {
+    if (save) save.disabled = false;
+  }
+}
+
+async function sessNoteDelete() {
+  if (!sessNoteEditingId) return;
+  const note = (sessNotesCache || []).find(item => item.id === sessNoteEditingId);
+  const ok = await dlgOpen({ kind: 'confirm', danger: true, title: 'Delete note', okText: 'Delete',
+    message: 'Delete "' + ((note && note.title) || 'this note') + '"?' });
+  if (!ok) return;
+  try {
+    const res = await fetch('/api/notes', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'delete', id: sessNoteEditingId })
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || data.error) throw new Error(data.error || ('HTTP ' + res.status));
+    sessNoteEditingId = null;
+    await sessNotesLoad(true);
+    sessNoteNew();
+    showToast('Note deleted');
+  } catch (e) {
+    showToast('Could not delete note: ' + (e.message || e), true);
+  }
+}
+
+async function sessNoteSend(scope) {
+  const content = document.getElementById('sessNoteContent');
+  if (!content || !content.value.trim()) {
+    showToast('Type note text first', true);
+    if (content) content.focus();
+    return;
+  }
+  if (!await sessNoteSave(true)) return;
+  await sendSessionText(content.value, scope);
 }
 
 function getSettings() {
@@ -5149,9 +5475,9 @@ document.getElementById('aboutModal').addEventListener('click', (e) => {
   if (e.target.id === 'aboutModal') closeAbout();
 });
 document.getElementById('sessionsModal').addEventListener('click', (e) => {
-  if (e.target.id === 'sessionsModal') closeSessions();
-  // Any click inside the modal that isn't on the picker itself dismisses it.
-  else if (!e.target.closest('#sessQcPopover') && !e.target.closest('#sessQcBtn')) closeSessQuickPicker();
+  if (e.target.id === 'sessionsModal') { closeSessions(); return; }
+  if (!e.target.closest('#sessQcPopover') && !e.target.closest('#sessQcBtn')) closeSessQuickPicker();
+  if (!e.target.closest('#sessNotesPopover') && !e.target.closest('#sessNoteBtn')) closeSessNotes();
 });
 
 // Keyboard shortcuts
@@ -5455,6 +5781,12 @@ async function init() {
     return true;
   });
   if (saved.length > 0) {
+    // Resolve existing slots before rebuilding the tab bar. Explicit tmux
+    // names win over stale per-device localStorage; legacy auto-named windows
+    // are migrated in the opposite direction by reconcileSessionNames().
+    let initialSessions = [];
+    try { initialSessions = await fetchSessions(); } catch (e) {}
+    const initialBySlot = new Map(initialSessions.map(s => [s.slot, s]));
     saved.forEach((t, idx) => {
       tabCounter++;
       const tabObj = { id: 'tab-' + tabCounter, name: t.name || ('Shell ' + tabCounter) };
@@ -5462,6 +5794,8 @@ async function init() {
         const slot = Number.isInteger(t.windowSlot) && t.windowSlot >= 0 ? t.windowSlot : idx;
         tabObj.windowSlot = slot;
         nextWindowSlot = Math.max(nextWindowSlot, slot + 1);
+        const live = initialBySlot.get(slot);
+        if (live && !live.autoRename && live.name) tabObj.name = live.name;
       }
       if (t.type === 'desktop') { tabObj.type = 'desktop'; }
       if (t.type === 'ssh') {
@@ -5476,6 +5810,7 @@ async function init() {
       }
       tabs.push(tabObj);
     });
+    reconcileSessionNames(initialSessions);
     renderTabs();
     switchTab(tabs[0].id);
     // Clear stale split state — tab IDs are regenerated on reload so
@@ -7254,12 +7589,13 @@ def spawn_user_ttyd(username, password):
         # don't share/clobber each other's windows. Set it once as shell var $S.
         tmux_cmd = (
             f'S={shlex.quote(TMUX_SESSION)};'
+            # Keep terminal startup independent from tab-name synchronization.
+            # A failed name operation must never prevent ttyd from attaching.
+            # Names are reconciled through /api/exec after the window is live.
             r' tmux has-session -t "$S" 2>/dev/null || exec tmux new-session -s "$S" \; set -g mouse on \; set -g history-limit 10000 \; set -s set-clipboard on \; setw -g aggressive-resize on;'
             r' tmux set -g mouse on 2>/dev/null; tmux set -g history-limit 10000 2>/dev/null; tmux set -s set-clipboard on 2>/dev/null; tmux set -g set-clipboard on 2>/dev/null; tmux setw -g aggressive-resize on 2>/dev/null;'
-            # Parse arg format "SLOT:ACTIVE_SLOTS" (e.g. "0:0,2,3") or plain "SLOT"
             r' RAW="$1"; case "$RAW" in *:*) SLOT="${RAW%%:*}"; ACTIVE="${RAW#*:}" ;; *) SLOT="$RAW"; ACTIVE="" ;; esac;'
             r' case "$SLOT" in (""|*[!0-9]*) SLOT=0 ;; esac;'
-            # Create window at exact SLOT index (no gap-filling)
             r' tmux list-windows -t "$S" -F "#{window_index}" | grep -q "^${SLOT}$" || tmux new-window -t "$S":${SLOT};'
             # NOTE: ACTIVE (a single client's tab list) is intentionally NOT used to kill
             # windows. A second device (phone/laptop) has its own tab layout, so trusting
@@ -7592,7 +7928,7 @@ def run_as_user(username, python_script, timeout=10):
         return (1, b"", str(e).encode())
 
 
-def build_remote_window_script(server, slot):
+def build_remote_window_script(server, slot, name=None):
     """Build a fixed tmux operation for one already-validated catalog entry."""
     ssh_args = [
         SSH_BIN,
@@ -7612,7 +7948,7 @@ def build_remote_window_script(server, slot):
         # iframe attached to an empty slot in ours.
         "session": TMUX_SESSION,
         "server_id": server["id"],
-        "name": server["name"],
+        "name": (name or server["name"]).strip(),
         "ssh_mode": server["ssh_mode"],
         "ssh_args": ssh_args,
     }
@@ -7642,7 +7978,9 @@ if has_main:
         ])
         current = marker.stdout.decode(errors="replace").strip()
         if current == cfg["server_id"]:
-            print(json.dumps({{"ok": True, "existing": True, "slot": slot}}))
+            shown = run(["tmux", "display-message", "-p", "-t", target, "#{{window_name}}"])
+            window_name = shown.stdout.decode(errors="replace").strip() or cfg["name"]
+            print(json.dumps({{"ok": True, "existing": True, "slot": slot, "name": window_name}}))
             raise SystemExit(0)
         print("tmux slot is already used by another tab", file=sys.stderr)
         raise SystemExit(17)
@@ -7681,12 +8019,12 @@ for option, value in (
         raise SystemExit(result.returncode or 1)
 run(["tmux", "set-window-option", "-t", target, "automatic-rename", "off"])
 run(["tmux", "rename-window", "-t", target, cfg["name"]])
-print(json.dumps({{"ok": True, "existing": False, "slot": slot}}))
+print(json.dumps({{"ok": True, "existing": False, "slot": slot, "name": cfg["name"]}}))
 """
 
 
-def create_remote_window(username, server, slot):
-    return run_as_user(username, build_remote_window_script(server, slot), timeout=15)
+def create_remote_window(username, server, slot, name=None):
+    return run_as_user(username, build_remote_window_script(server, slot, name=name), timeout=15)
 
 
 # --- Minimal WebSocket helpers (RFC 6455, server-side only) -----------------
@@ -8373,6 +8711,144 @@ except Exception as ex:
         else:
             self._send_json(200, data)
 
+    # --- Session Notes API handlers ---
+
+    def _handle_notes_list(self):
+        username = self._get_authenticated_user()
+        if not username:
+            self._send_error(401, "not authenticated")
+            return
+        script = '''
+import os, json
+p = os.path.expanduser("~/.ttyd_notes.json")
+try:
+    if os.path.exists(p):
+        with open(p, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, list):
+            data = []
+    else:
+        data = []
+    print(json.dumps({"ok": True, "notes": data}))
+except Exception as ex:
+    print(json.dumps({"error": str(ex)}))
+'''
+        rc, out, err = run_as_user(username, script)
+        if rc != 0:
+            self._send_error(500, err.decode(errors="replace"))
+            return
+        try:
+            data = json.loads(out)
+        except Exception:
+            self._send_error(500, out.decode(errors="replace"))
+            return
+        if "error" in data:
+            self._send_error(400, data["error"])
+        else:
+            self._send_json(200, data)
+
+    def _handle_notes_action(self):
+        username = self._get_authenticated_user()
+        if not username:
+            self._send_error(401, "not authenticated")
+            return
+        length = int(self.headers.get("Content-Length", 0))
+        if length > 64 * 1024:
+            self._send_error(413, "payload too large")
+            return
+        body = self.rfile.read(length) if length > 0 else b""
+        try:
+            req = json.loads(body)
+        except Exception:
+            self._send_error(400, "invalid json")
+            return
+        if not isinstance(req, dict):
+            self._send_error(400, "body must be a JSON object")
+            return
+        action = req.get("action", "")
+        if action not in ("add", "update", "delete"):
+            self._send_error(400, "invalid action (must be add, update, or delete)")
+            return
+        req_b64 = base64.b64encode(json.dumps(req).encode()).decode()
+        script = f'''
+import os, json, time, secrets, base64
+p = os.path.expanduser("~/.ttyd_notes.json")
+req = json.loads(base64.b64decode({req_b64!r}).decode())
+action = req.get("action", "")
+try:
+    notes = []
+    if os.path.exists(p):
+        with open(p, "r", encoding="utf-8") as f:
+            notes = json.load(f)
+        if not isinstance(notes, list):
+            notes = []
+
+    if action in ("add", "update"):
+        title = req.get("title", "")
+        content = req.get("content", "")
+        if not isinstance(title, str) or not isinstance(content, str):
+            raise Exception("title and content must be strings")
+        title = title.strip()[:200]
+        if not content.strip():
+            raise Exception("note content is required")
+        if len(content.encode("utf-8")) > 32 * 1024:
+            raise Exception("note content is too large (maximum 32 KB)")
+        if not title:
+            title = next((line.strip() for line in content.splitlines() if line.strip()), "Untitled note")[:200]
+
+    if action == "add":
+        if len(notes) >= 200:
+            raise Exception("note limit reached (maximum 200)")
+        now = int(time.time())
+        note_id = secrets.token_hex(6)
+        notes.insert(0, {{"id": note_id, "title": title, "content": content,
+                         "created": now, "updated": now}})
+        result = {{"ok": True, "id": note_id}}
+
+    elif action == "update":
+        note_id = req.get("id", "")
+        found = False
+        for note in notes:
+            if note.get("id") == note_id:
+                note["title"] = title
+                note["content"] = content
+                note["updated"] = int(time.time())
+                found = True
+                break
+        if not found:
+            raise Exception("note not found")
+        result = {{"ok": True}}
+
+    else:
+        note_id = req.get("id", "")
+        new_notes = [note for note in notes if note.get("id") != note_id]
+        if len(new_notes) == len(notes):
+            raise Exception("note not found")
+        notes = new_notes
+        result = {{"ok": True}}
+
+    tmp = p + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(notes, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, p)
+    print(json.dumps(result))
+except Exception as ex:
+    print(json.dumps({{"error": str(ex)}}))
+'''
+        rc, out, err = run_as_user(username, script)
+        if rc != 0:
+            self._send_error(500, err.decode(errors="replace"))
+            return
+        try:
+            data = json.loads(out)
+        except Exception:
+            self._send_error(500, out.decode(errors="replace"))
+            return
+        if "error" in data:
+            self._send_error(400, data["error"])
+        else:
+            self._send_json(200, data)
+
     # --- Quick Commands API handlers ---
 
     def _handle_quick_commands_sync(self):
@@ -8977,19 +9453,25 @@ except Exception as ex:
 
         server_id = req.get("server_id")
         slot = req.get("slot")
+        name = req.get("name")
         if not isinstance(server_id, str) or not SERVER_ID_RE.fullmatch(server_id):
             self._send_error(400, "invalid server id")
             return
         if isinstance(slot, bool) or not isinstance(slot, int) or not 0 <= slot <= 4095:
             self._send_error(400, "invalid terminal window slot")
             return
+        if name is not None:
+            if not isinstance(name, str) or not name.strip() or len(name) > 200:
+                self._send_error(400, "invalid terminal window name")
+                return
+            name = name.strip()
 
         server = find_server_target(server_id)
         if not server:
             self._send_error(404, "server is not enabled in the remote catalog")
             return
 
-        returncode, stdout, stderr = create_remote_window(username, server, slot)
+        returncode, stdout, stderr = create_remote_window(username, server, slot, name=name)
         if returncode == 17:
             self._send_error(409, "terminal window slot is already in use")
             return
@@ -9418,6 +9900,8 @@ except Exception as ex:
             self._handle_quick_commands_list()
         elif path == "/api/quick-commands/export":
             self._handle_quick_commands_export()
+        elif path == "/api/notes":
+            self._handle_notes_list()
         elif path == "/api/settings":
             self._handle_settings_get()
         elif path == "/api/tokens":
@@ -9501,6 +9985,8 @@ except Exception as ex:
             self._handle_quick_commands_import()
         elif path == "/api/quick-commands/sync":
             self._handle_quick_commands_sync()
+        elif path == "/api/notes":
+            self._handle_notes_action()
         elif path == "/api/settings":
             self._handle_settings_set()
         elif path == "/api/tokens":

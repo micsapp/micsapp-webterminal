@@ -342,8 +342,8 @@ Binary tree: each node is either `{type:'pane', tabId}` or `{type:'split', direc
 ## Session Manager (`#sessionsModal`)
 
 Lists every live session for the user by enumerating tmux windows in
-`TMUX_SESSION`, so sessions opened on other devices show up too. All data flows
-through `/api/exec`; there is no dedicated backend route.
+`TMUX_SESSION`, so sessions opened on other devices show up too. Session
+discovery and terminal delivery use `/api/exec`; persistent notes use `/api/notes`.
 
 ### Key Functions (auth.py, "Session picker" block)
 | Function | Purpose |
@@ -355,20 +355,22 @@ through `/api/exec`; there is no dedicated backend route.
 | `killSession(slot,name)` | `tmux kill-window` — removes it on every device |
 | `syncWindowName(slot,name)` | Renames the tmux window so tab names match everywhere |
 | `tileSessions(slotFilter)` | Attach + lay sessions out in a grid of split panes |
-| `sendToSessions(all)` | Broadcast a command to selected/all sessions |
+| `sendSessionText(text,scope)` / `sendToSessions(scope)` | Send to active (default), selected, or all sessions |
 | `toggleSessQuickPicker()` / `sessQcRender()` | Quick-command popover over `/api/quick-commands` |
+| `toggleSessNotes()` / `sessNoteSave()` / `sessNoteDelete()` | Persistent note editor and CRUD over `/api/notes` |
 
 ### Send-command bar
-- Delivery is server-side: one `/api/exec` call batching, per target slot,
-  `tmux send-keys -t <session>:<slot> -l -- '<cmd>'` then `send-keys ... Enter`.
+- Delivery is server-side: one `/api/exec` call loads the reviewed text into a
+  temporary tmux buffer, pastes that buffer into each target, then sends Enter.
   Going through tmux (not the iframe) reaches sessions not attached here.
-- Quoting uses `sessShqStrict()` — POSIX `'\''` escaping. (The older
-  `sessShq()`, used only for window names, escapes differently.)
+- Quoting uses `sessShqStrict()` — POSIX `'\''` escaping for both command text
+  and tmux window names.
 - Skipped targets: rows with `serverId` set (remote SSH). Desktop (`type:'desktop'`)
   and remote-web (`type:'web'`) tabs are iframes with no tmux window, so they
   never appear in the list at all.
-- `sessSelected` (Set of slots) is shared with "Tile selected"; the send buttons
-  count only sendable rows.
+- `sessSelected` (Set of slots) is shared with "Tile selected". With no checked
+  rows, the primary send target is the active tab; checked rows override that
+  default, while "Send to all" remains explicit.
 
 ---
 
