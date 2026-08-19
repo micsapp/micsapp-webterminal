@@ -342,6 +342,7 @@ def validate_server_repository(document):
             "web_hostname": web_hostname,
             "ssh_mode": ssh_mode,
             "ssh_hostname": ssh_hostname,
+            "gpu": raw.get("gpu") is True,
         })
         seen.add(server_id)
     return servers
@@ -664,13 +665,19 @@ def load_server_catalog(force=False):
 
 
 def public_server_catalog(servers):
-    """Return browser-safe metadata; SSH targets remain server-side."""
+    """Return picker metadata for authenticated clients.
+
+    Hostnames are display-only: the browser never opens SSH itself. Sessions
+    still go through /api/remote-tab, and saved tab state stores only serverId.
+    """
     return [
         {
             "id": server["id"],
             "name": server["name"],
             "web_hostname": server["web_hostname"],
             "ssh_mode": server["ssh_mode"],
+            "ssh_hostname": server["ssh_hostname"],
+            "gpu": bool(server.get("gpu")),
         }
         for server in servers
     ]
@@ -695,8 +702,7 @@ def server_status_snapshot(servers, force=False):
     honest signal there. Web terminals are always fronted by HTTPS.
 
     Probes are TCP-only: nothing is sent, nothing is authenticated, and the
-    result deliberately never includes ssh_hostname, so the browser still cannot
-    learn SSH targets (see public_server_catalog).
+    status payload is only up/down. Hostnames come from public_server_catalog.
     """
     now = time.monotonic()
     with SERVER_STATUS_LOCK:
@@ -1380,7 +1386,7 @@ __PWA_HEAD__
     text-decoration: none;
   }
   .remote-tab-item:hover { background: #0f3460; }
-  .remote-tab-item small { display: block; color: #7a7a9e; margin-top: 2px; }
+  .remote-tab-item small { display: block; color: #7a7a9e; margin-top: 2px; overflow-wrap: anywhere; }
   .remote-tab-item:disabled { cursor: default; opacity: 0.45; }
   .remote-tab-item:disabled:hover { background: transparent; }
   .remote-server-group { padding: 4px 0; }
@@ -3504,9 +3510,14 @@ function getAllIframes() {
 
 // Every token of the query must appear somewhere in the server's searchable
 // text, so "prod db" matches a "db-01 (production)" host in either order.
+function remoteServerLabel(server) {
+  const name = (server && (server.name || server.id)) || 'server';
+  return server && server.gpu ? name + ' (gpu)' : name;
+}
+
 function remoteServerMatches(server, tokens) {
   if (!tokens.length) return true;
-  const haystack = [server.name, server.id, server.web_hostname, server.ssh_host, server.ssh_mode]
+  const haystack = [remoteServerLabel(server), server.name, server.id, server.web_hostname, server.ssh_hostname, server.ssh_mode, server.gpu ? 'gpu' : '']
     .filter(Boolean).join(' ').toLowerCase();
   return tokens.every(token => haystack.includes(token));
 }
@@ -3568,7 +3579,7 @@ function renderRemoteTabMenu() {
           : (health.web === 'down' || health.ssh === 'down') ? 'down'
           : undefined
       ));
-      title.appendChild(document.createTextNode(server.name));
+      title.appendChild(document.createTextNode(remoteServerLabel(server)));
       const detail = document.createElement('small');
       detail.textContent = server.web_hostname || server.id;
       title.appendChild(detail);
@@ -3583,7 +3594,7 @@ function renderRemoteTabMenu() {
         const webDetail = document.createElement('small');
         webDetail.textContent = health.web === 'down'
           ? 'Unreachable — ' + server.web_hostname
-          : 'Open in an internal tab';
+          : server.web_hostname;
         webItem.appendChild(webDetail);
         webItem.addEventListener('click', () => addRemoteWebTab(server.id));
         group.appendChild(webItem);
@@ -3606,7 +3617,12 @@ function renderRemoteTabMenu() {
       sshItem.appendChild(document.createTextNode('SSH Session'));
       const sshDetail = document.createElement('small');
       const sshWhere = server.ssh_mode === 'tunnel' ? 'Cloudflare tunnel' : 'Direct SSH';
-      sshDetail.textContent = health.ssh === 'down' ? sshWhere + ' — unreachable' : sshWhere;
+      const sshHost = server.ssh_hostname || '';
+      if (sshHost) {
+        sshDetail.textContent = (health.ssh === 'down' ? 'Unreachable — ' : '') + sshHost + ' · ' + sshWhere;
+      } else {
+        sshDetail.textContent = health.ssh === 'down' ? sshWhere + ' — unreachable' : sshWhere;
+      }
       sshItem.appendChild(sshDetail);
       sshItem.addEventListener('click', () => addRemoteTab(server.id));
       group.appendChild(sshItem);

@@ -27,6 +27,7 @@ def repository_document():
                 "web_hostname": "minipc2.micstec.com",
                 "ssh_mode": "tunnel",
                 "ssh_hostname": "ssh-minipc2.micstec.com",
+                "gpu": False,
                 "enabled": True,
             },
             {
@@ -35,6 +36,7 @@ def repository_document():
                 "web_hostname": "dev-ssh.wetigu.com",
                 "ssh_mode": "direct",
                 "ssh_hostname": "dev.wetigu.com",
+                "gpu": True,
                 "enabled": True,
             },
             {
@@ -79,8 +81,13 @@ class RemoteTabTests(unittest.TestCase):
         self.assertEqual(servers[2]["ssh_mode"], "tunnel")
         self.assertEqual(servers[2]["web_hostname"], "")
         public = auth.public_server_catalog(servers)
-        self.assertNotIn("ssh_hostname", public[0])
+        self.assertEqual(public[0]["ssh_hostname"], "ssh-minipc2.micstec.com")
+        self.assertEqual(public[0]["web_hostname"], "minipc2.micstec.com")
         self.assertEqual(public[1]["ssh_mode"], "direct")
+        self.assertEqual(public[1]["ssh_hostname"], "dev.wetigu.com")
+        self.assertFalse(public[0]["gpu"])
+        self.assertTrue(public[1]["gpu"])
+        self.assertFalse(public[2]["gpu"])
 
     def test_protected_fetch_is_cached(self):
         payload = json.dumps(repository_document()).encode()
@@ -295,6 +302,9 @@ class RemoteTabTests(unittest.TestCase):
         self.assertIn("function addRemoteWebTab(serverId)", auth.APP_HTML)
         self.assertIn("type: 'web'", auth.APP_HTML)
         self.assertIn("'https://' + server.web_hostname + '/'", auth.APP_HTML)
+        self.assertIn("server.ssh_hostname", auth.APP_HTML)
+        self.assertIn("function remoteServerLabel(server)", auth.APP_HTML)
+        self.assertIn("' (gpu)'", auth.APP_HTML)
         self.assertIn("tabs.filter(isTerminalTab)", auth.APP_HTML)
         self.assertIn("serverId: t.serverId", auth.APP_HTML)
         self.assertNotIn("sshHostname: t.sshHostname", auth.APP_HTML)
