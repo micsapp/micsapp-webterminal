@@ -53,10 +53,66 @@ def env_bool(name, default=False):
     return val.strip().lower() in ("1", "true", "yes", "on")
 
 
+def load_or_create_session_secret():
+    """Return a stable key for signing browser session cookies.
+
+    An explicit TTYD_SECRET remains authoritative. Otherwise persist a
+    generated key beside auth.py so routine service/deploy restarts do not
+    invalidate every open browser session. O_EXCL makes first-start creation
+    safe if two service processes briefly race.
+    """
+    configured = os.environ.get("TTYD_SECRET", "")
+    if configured:
+        return configured
+
+    secret_path = os.environ.get(
+        "TTYD_SECRET_FILE", os.path.join(BASE_DIR, ".ttyd_secret")
+    )
+
+    def read_secret():
+        with open(secret_path, "r", encoding="ascii") as f:
+            value = f.read().strip()
+        if not value:
+            raise ValueError("session secret file is empty")
+        try:
+            os.chmod(secret_path, 0o600)
+        except OSError:
+            pass
+        return value
+
+    try:
+        return read_secret()
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError) as exc:
+        print(f"Warning: could not read session secret file {secret_path}: {exc}", flush=True)
+        return secrets.token_hex(32)
+
+    generated = secrets.token_hex(32)
+    try:
+        fd = os.open(secret_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        try:
+            return read_secret()
+        except (OSError, ValueError) as exc:
+            print(f"Warning: could not read session secret file {secret_path}: {exc}", flush=True)
+            return generated
+    except OSError as exc:
+        print(f"Warning: could not persist session secret file {secret_path}: {exc}", flush=True)
+        return generated
+
+    try:
+        with os.fdopen(fd, "w", encoding="ascii") as f:
+            f.write(generated + "\n")
+    except OSError as exc:
+        print(f"Warning: could not persist session secret file {secret_path}: {exc}", flush=True)
+    return generated
+
+
 load_dotenv(os.path.join(BASE_DIR, ".env"))
 
 # --- Config ---
-SECRET_KEY = os.environ.get("TTYD_SECRET", secrets.token_hex(32))
+SECRET_KEY = load_or_create_session_secret()
 SESSION_MAX_AGE = int(os.environ.get("SESSION_MAX_AGE", "86400"))  # 24h default
 PORT = int(os.environ.get("AUTH_PORT", "7682"))
 # Base tmux session name. Override per-deployment (TMUX_SESSION) so multiple
@@ -1081,7 +1137,17 @@ document.getElementById('form').addEventListener('submit', async (e) => {
     })
   });
   if (res.ok) {
-    window.location.href = '/';
+    // A stale outer SPA can outlive an auth-service restart while a newly
+    // opened terminal iframe is redirected here. Refresh that same-origin
+    // parent so it receives the new cookie and ttyd port. Cross-origin peers
+    // intentionally remain framed and navigate only their own login page.
+    try {
+      if (window.parent !== window && window.parent.location.origin === window.location.origin) {
+        window.parent.location.replace('/');
+        return;
+      }
+    } catch (e2) {}
+    window.location.replace('/');
   } else {
     try {
       const data = await res.json();
