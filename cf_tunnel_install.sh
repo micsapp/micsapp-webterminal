@@ -8836,19 +8836,20 @@ def run_as_user(username, python_script, timeout=10):
 
     Prefers SSH with the login password (full login environment). When the
     password is unavailable — user_instances is in-memory, so a service restart
-    empties it while the session cookie stays valid — fall back to `sudo -u`
-    when running as root, exactly like /api/exec does. Without the fallback,
-    remote tabs failed with "failed to create remote SSH session" after every
-    deploy until the user logged out and back in.
+    empties it while the session cookie stays valid — fall back to `sudo -u`,
+    exactly like /api/exec does. As root that needs no password; as a non-root
+    service user it works when passwordless sudo is configured for the target
+    (e.g. mli NOPASSWD:ALL). -n guarantees a missing password never blocks the
+    request waiting on a prompt. Without the fallback, file browsing, uploads
+    and remote tabs failed with "no session" after every deploy until the user
+    logged out and back in.
     """
     info = user_instances.get(username)
     password = info.get("password") if info else None
     if not password:
-        if os.geteuid() != 0:
-            return (1, b"", b"no session")
         try:
             result = subprocess.run(
-                ["sudo", "-u", username, "python3", "-"],
+                ["sudo", "-n", "-u", username, "python3", "-"],
                 input=python_script.encode(),
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout
             )
