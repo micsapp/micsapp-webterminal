@@ -1315,6 +1315,116 @@ TERM_HOOK_JS = r"""// ttyd term hook (injected by nginx into /ut/... HTML)
       }
     }, true);
   });
+
+  // --- WebSocket Keepalive & Auto-Reconnect ---
+  function _reloadTerm() {
+    try {
+      window.onbeforeunload = null;
+      if (window.document) window.document.onbeforeunload = null;
+      window.addEventListener('beforeunload', function (e) {
+        try { e.stopImmediatePropagation(); e.stopPropagation(); } catch (err) {}
+      }, true);
+    } catch (e) {}
+    try {
+      var u = new URL(window.location.href);
+      u.searchParams.set('_t', String(Date.now()));
+      window.location.replace(u.toString());
+    } catch (e) {
+      window.location.reload();
+    }
+  }
+
+  // Hook WebSocket to send periodic heartbeat and track status
+  try {
+    var OrigWebSocket = window.WebSocket;
+    if (OrigWebSocket) {
+      window.WebSocket = function (url, protocols) {
+        var ws = (protocols !== undefined) ? new OrigWebSocket(url, protocols) : new OrigWebSocket(url);
+        window._activeTermWs = ws;
+        var hbInterval = null;
+
+        function startHb() {
+          stopHb();
+          // Heartbeat every 25s to keep Cloudflare 100s idle timeout alive
+          hbInterval = setInterval(function () {
+            if (ws.readyState === 1 /* OPEN */) {
+              try {
+                // Opcode '3' (RESUME) is flow control in ttyd — harmless no-op that keeps socket active
+                ws.send('3');
+              } catch (err) {}
+            } else if (ws.readyState > 1) {
+              stopHb();
+            }
+          }, 25000);
+        }
+
+        function stopHb() {
+          if (hbInterval) { clearInterval(hbInterval); hbInterval = null; }
+        }
+
+        ws.addEventListener('open', startHb);
+        ws.addEventListener('close', function () {
+          stopHb();
+          _attachOverlayClickHandler();
+        });
+        ws.addEventListener('error', function () {
+          stopHb();
+          _attachOverlayClickHandler();
+        });
+
+        return ws;
+      };
+      window.WebSocket.prototype = OrigWebSocket.prototype;
+      window.WebSocket.CONNECTING = OrigWebSocket.CONNECTING;
+      window.WebSocket.OPEN = OrigWebSocket.OPEN;
+      window.WebSocket.CLOSING = OrigWebSocket.CLOSING;
+      window.WebSocket.CLOSED = OrigWebSocket.CLOSED;
+    }
+  } catch (e) {}
+
+  // Make "Press ⏎ to Reconnect" or "Connection Closed" overlay clickable
+  function _attachOverlayClickHandler() {
+    var checkCount = 0;
+    var timer = setInterval(function () {
+      checkCount++;
+      var el = document.querySelector('.xterm');
+      if (el) {
+        var divs = el.querySelectorAll('div');
+        for (var i = 0; i < divs.length; i++) {
+          var d = divs[i];
+          if (d.textContent && (d.textContent.indexOf('Reconnect') !== -1 || d.textContent.indexOf('Closed') !== -1)) {
+            d.style.cursor = 'pointer';
+            d.title = 'Click to reconnect';
+            if (!d._hasClickHook) {
+              d._hasClickHook = true;
+              d.addEventListener('click', function (e) {
+                e.stopPropagation();
+                e.preventDefault();
+                _reloadTerm();
+              });
+            }
+          }
+        }
+      }
+      if (checkCount > 30) clearInterval(timer);
+    }, 200);
+  }
+
+  // Also listen for parent window reconnect message
+  window.addEventListener('message', function (e) {
+    if (e.data && e.data.action === 'reconnect') {
+      _reloadTerm();
+    }
+  });
+
+  // Auto-reconnect when tab/device becomes visible again if WebSocket dropped
+  document.addEventListener('visibilitychange', function () {
+    if (document.visibilityState === 'visible') {
+      if (window._activeTermWs && (window._activeTermWs.readyState === 2 || window._activeTermWs.readyState === 3)) {
+        _reloadTerm();
+      }
+    }
+  });
 })();
 """
 
@@ -3902,6 +4012,7 @@ function buildTermUrl(tab, overrides) {
   if (!s.cursorBlink) params.set('cursorBlink', 'false');
   if (s.scrollback && s.scrollback !== '10000') params.set('scrollback', s.scrollback);
   if (s.disableLeaveAlert) params.set('disableLeaveAlert', 'true');
+  if (s._t) params.set('_t', String(s._t));
   // Mobile/touch: use DOM renderer so terminal text exists in the DOM (enables selection/copy readback).
   if (isCoarsePointer && isCoarsePointer()) params.set('rendererType', 'dom');
   params.set('theme', JSON.stringify({
@@ -5319,12 +5430,16 @@ function suppressLeaveAlertInFrame(frame) {
 function reconnectAllTabsNoLeaveAlert() {
   // Fallback path: apply without browser "leave alert".
   const activeSlots = tabs.filter(isTerminalTab).map(t => t.windowSlot).join(',');
+  const ts = Date.now();
   getAllIframes().forEach((f) => {
     const tabId = f.id.replace('frame-', '');
     const tab = tabs.find(t => t.id === tabId);
     if (!isTerminalTab(tab)) return;
     suppressLeaveAlertInFrame(f);
-    f.src = buildTermUrl(tab, { disableLeaveAlert: true, _activeSlots: activeSlots });
+    try {
+      if (f.contentWindow) f.contentWindow.postMessage({ action: 'reconnect' }, '*');
+    } catch (e) {}
+    f.src = buildTermUrl(tab, { disableLeaveAlert: true, _activeSlots: activeSlots, _t: ts });
   });
 }
 
@@ -5491,16 +5606,30 @@ function fullscreen() {
 }
 
 function reconnect() {
-  const f = document.getElementById('frame-' + activeTabId);
-  if (f) {
-    const tab = tabs.find(t => t.id === activeTabId);
-    if (tab && tab.type === 'web') {
+  showToast('Reconnecting...', false);
+  const activeSlots = tabs.filter(isTerminalTab).map(t => t.windowSlot).join(',');
+  const ts = Date.now();
+  getAllIframes().forEach((f) => {
+    const tabId = f.id.replace('frame-', '');
+    const tab = tabs.find(t => t.id === tabId);
+    if (!tab) return;
+    suppressLeaveAlertInFrame(f);
+    try {
+      if (f.contentWindow) f.contentWindow.postMessage({ action: 'reconnect' }, '*');
+    } catch (e) {}
+    if (tab.type === 'web') {
       const server = remoteServers.find(item => item.id === tab.serverId);
-      f.src = buildRemoteWebUrl(server);
+      if (server) {
+        const u = new URL(buildRemoteWebUrl(server), window.location.href);
+        u.searchParams.set('_t', String(ts));
+        f.src = u.toString();
+      }
+    } else if (tab.type === 'desktop') {
+      if (tab.wsPort) f.src = buildDesktopUrl(tab.wsPort) + '&_t=' + ts;
     } else {
-      f.src = buildTermUrl(tab);
+      f.src = buildTermUrl(tab, { disableLeaveAlert: true, _activeSlots: activeSlots, _t: ts });
     }
-  }
+  });
 }
 
 function logout() {
@@ -5840,6 +5969,28 @@ async function init() {
 
   // Override the cached localStorage tab-title with the shared server value.
   loadTitleTemplateFromServer();
+
+  // Auto-reconnect if terminal WebSocket disconnected while tab/device was asleep
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') {
+      const activeSlots = tabs.filter(isTerminalTab).map(t => t.windowSlot).join(',');
+      const ts = Date.now();
+      getAllIframes().forEach((f) => {
+        try {
+          const w = f.contentWindow;
+          if (w && w._activeTermWs && (w._activeTermWs.readyState === 2 || w._activeTermWs.readyState === 3)) {
+            const tabId = f.id.replace('frame-', '');
+            const tab = tabs.find(t => t.id === tabId);
+            if (tab && isTerminalTab(tab)) {
+              suppressLeaveAlertInFrame(f);
+              try { if (w.postMessage) w.postMessage({ action: 'reconnect' }, '*'); } catch (e) {}
+              f.src = buildTermUrl(tab, { disableLeaveAlert: true, _activeSlots: activeSlots, _t: ts });
+            }
+          }
+        } catch (e) {}
+      });
+    }
+  });
 
   document.getElementById('fontSize').addEventListener('input', () => {
     const input = document.getElementById('fontSize');
