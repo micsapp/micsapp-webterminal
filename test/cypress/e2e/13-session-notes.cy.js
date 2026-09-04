@@ -31,14 +31,29 @@ describe('Session Notes', () => {
     });
   });
 
-  it('dictates speech into the note at the cursor and can stop listening', () => {
+  it('records one continuous clip and inserts its server transcript at the cursor', () => {
+    cy.intercept('POST', '/api/transcribe', (req) => {
+      expect(req.headers['content-type']).to.include('audio/webm');
+      req.reply({ statusCode: 200, body: { ok: true, text: 'voice text continues', language: 'en' } });
+    }).as('transcribeVoice');
     cy.window().then((win) => {
-      win.SpeechRecognition = class FakeSpeechRecognition {
-        start() {
-          this.onresult({ results: [[{ transcript: 'voice text' }]] });
+      const stream = { getTracks: () => [{ stop() {} }] };
+      Object.defineProperty(win.navigator, 'mediaDevices', {
+        configurable: true,
+        value: { getUserMedia: () => Promise.resolve(stream) }
+      });
+      win.MediaRecorder = class FakeMediaRecorder {
+        static isTypeSupported(type) { return type.startsWith('audio/webm'); }
+        constructor() {
+          this.mimeType = 'audio/webm;codecs=opus';
+          this.state = 'inactive';
         }
-        stop() { this.onend(); }
-        abort() { this.onend(); }
+        start() { this.state = 'recording'; }
+        stop() {
+          this.state = 'inactive';
+          this.ondataavailable({ data: new win.Blob(['recorded audio'], { type: 'audio/webm' }) });
+          this.onstop();
+        }
       };
       win.sessNoteVoiceInit();
     });
@@ -49,8 +64,10 @@ describe('Session Notes', () => {
       $content[0].setSelectionRange(6, 6);
     });
     cy.get('#sessNoteVoiceBtn').click().should('have.attr', 'aria-pressed', 'true');
-    cy.get('#sessNoteContent').should('have.value', 'before voice text after');
-    cy.get('#sessNoteVoiceBtn').click().should('have.attr', 'aria-pressed', 'false');
+    cy.get('#sessNoteVoiceBtn').click();
+    cy.wait('@transcribeVoice');
+    cy.get('#sessNoteContent').should('have.value', 'before voice text continues after');
+    cy.get('#sessNoteVoiceBtn').should('have.attr', 'aria-pressed', 'false').and('not.be.disabled');
   });
 
   it('adds, updates, lists, and deletes a persistent note', () => {

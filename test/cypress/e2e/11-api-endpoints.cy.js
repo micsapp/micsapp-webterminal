@@ -9,7 +9,7 @@
  *        /api/quick-commands, /api/quick-commands/export
  * - POST /api/login, /api/files/upload, /api/files/write,
  *        /api/files/mkdir, /api/files/delete, /api/files/rename,
- *        /api/quick-commands, /api/quick-commands/import
+ *        /api/quick-commands, /api/quick-commands/import, /api/transcribe
  */
 
 describe('API Endpoints', () => {
@@ -298,6 +298,26 @@ describe('API Endpoints', () => {
         failOnStatusCode: false,
       }).then((resp) => {
         expect([200, 201]).to.include(resp.status);
+      });
+    });
+  });
+
+  describe('Authenticated POST Endpoint — Voice Transcription', () => {
+
+    beforeEach(() => {
+      cy.loginViaApi();
+    });
+
+    it('POST /api/transcribe — rejects unsupported audio without invoking transcription', () => {
+      cy.request({
+        method: 'POST',
+        url: '/api/transcribe',
+        body: 'not audio',
+        headers: { 'Content-Type': 'text/plain' },
+        failOnStatusCode: false,
+      }).then((resp) => {
+        expect(resp.status).to.eq(415);
+        expect(resp.body.error).to.include('unsupported audio format');
       });
     });
   });

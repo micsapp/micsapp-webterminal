@@ -163,6 +163,43 @@ SSH_CONFIG_FILE = os.environ.get(
     "WEBTERMINAL_SSH_CONFIG", os.path.expanduser("~/.ssh/config")
 )
 REMOTE_SSH_USER = os.environ.get("WEBTERMINAL_REMOTE_SSH_USER") or getpass.getuser()
+VOICE_TRANSCRIPTION_MODEL = os.environ.get("VOICE_TRANSCRIPTION_MODEL", "small")
+VOICE_AUDIO_MAX_BYTES = 25 * 1024 * 1024
+_voice_model = None
+_voice_model_lock = threading.Lock()
+
+
+def transcribe_voice_audio(path, language=None):
+    """Transcribe one complete recording locally with Faster-Whisper."""
+    global _voice_model
+    try:
+        from faster_whisper import WhisperModel
+    except ImportError as exc:
+        raise RuntimeError("local transcription runtime is not installed") from exc
+
+    lang = (language or "").split("-", 1)[0].lower()
+    if not re.fullmatch(r"[a-z]{2,3}", lang):
+        lang = None
+    with _voice_model_lock:
+        if _voice_model is None:
+            _voice_model = WhisperModel(
+                VOICE_TRANSCRIPTION_MODEL,
+                device="cpu",
+                compute_type="int8",
+                cpu_threads=min(4, os.cpu_count() or 1),
+            )
+        segments, info = _voice_model.transcribe(
+            path,
+            language=lang,
+            beam_size=5,
+            vad_filter=True,
+            vad_parameters={"min_silence_duration_ms": 500},
+            # Independent windows avoid the repetition loops that can occur
+            # when a previous Whisper window is fed back into the next one.
+            condition_on_previous_text=False,
+        )
+        text = " ".join(segment.text.strip() for segment in segments if segment.text.strip()).strip()
+    return text, getattr(info, "language", lang or "")
 
 # --- App version / build info (shown in the SPA's About dialog) ---
 APP_VERSION = "1.2.0"
@@ -4678,92 +4715,165 @@ function sessQcRender() {
 // Persistent notes for composing/reviewing text before it reaches a terminal.
 let sessNotesCache = null;
 let sessNoteEditingId = null;
-let sessNoteRecognition = null;
+let sessNoteVoiceSession = null;
 
-function sessNoteVoiceButton(listening) {
+function sessNoteVoiceButton(state) {
   const btn = document.getElementById('sessNoteVoiceBtn');
   if (!btn) return;
-  btn.classList.toggle('listening', !!listening);
-  btn.setAttribute('aria-pressed', listening ? 'true' : 'false');
-  btn.setAttribute('aria-label', listening ? 'Stop voice input' : 'Start voice input');
-  btn.innerHTML = listening ? '&#9632; Stop' : '&#127908; Voice';
+  const supported = !!(window.MediaRecorder && navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
+  const recording = state === 'recording';
+  btn.classList.toggle('listening', recording);
+  btn.setAttribute('aria-pressed', recording ? 'true' : 'false');
+  btn.disabled = !supported || state === 'starting' || state === 'transcribing';
+  btn.setAttribute('aria-label', recording ? 'Stop and transcribe voice input' : 'Start voice input');
+  btn.innerHTML = state === 'starting' ? '&#127908; Starting…'
+    : state === 'recording' ? '&#9632; Stop'
+    : state === 'transcribing' ? '&#8987; Transcribing…'
+    : '&#127908; Voice';
 }
 
-function sessNoteVoiceStop(abort) {
-  const recognition = sessNoteRecognition;
-  sessNoteRecognition = null;
-  sessNoteVoiceButton(false);
-  if (!recognition) return;
-  try { abort ? recognition.abort() : recognition.stop(); } catch (e) { /* already stopped */ }
+function sessNoteVoiceInsert(session, transcript) {
+  const content = document.getElementById('sessNoteContent');
+  if (!content) return;
+  let before = session.prefix;
+  let spoken = String(transcript || '').trim();
+  if (before && spoken && !/\\s$/.test(before)) before += ' ';
+  if (session.suffix && spoken && !/^\\s/.test(session.suffix)) spoken += ' ';
+  const maxLength = parseInt(content.getAttribute('maxlength'), 10) || 32768;
+  content.value = (before + spoken + session.suffix).slice(0, maxLength);
+  const caret = Math.min(before.length + spoken.length, content.value.length);
+  content.setSelectionRange(caret, caret);
+  content.dispatchEvent(new Event('input', { bubbles: true }));
+}
+
+function sessNoteVoiceRelease(session) {
+  if (session.timer) clearTimeout(session.timer);
+  session.timer = null;
+  if (session.stream) session.stream.getTracks().forEach(track => track.stop());
+  session.stream = null;
+}
+
+async function sessNoteVoiceUpload(session) {
+  sessNoteVoiceRelease(session);
+  if (session.discard || sessNoteVoiceSession !== session || !session.chunks.length) {
+    if (sessNoteVoiceSession === session) sessNoteVoiceSession = null;
+    sessNoteVoiceButton('idle');
+    return;
+  }
+  sessNoteVoiceButton('transcribing');
+  try {
+    const blob = new Blob(session.chunks, { type: session.mimeType });
+    const res = await fetch('/api/transcribe', {
+      method: 'POST',
+      headers: {
+        'Content-Type': session.mimeType,
+        'X-Audio-Language': navigator.language || document.documentElement.lang || ''
+      },
+      body: blob
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || data.error) throw new Error(data.error || ('HTTP ' + res.status));
+    if (sessNoteVoiceSession !== session || session.discard) return;
+    if (!String(data.text || '').trim()) throw new Error('No speech was detected');
+    sessNoteVoiceInsert(session, data.text);
+  } catch (e) {
+    if (!session.discard) await modalAlert(e.message || 'Voice transcription failed', 'Voice input');
+  } finally {
+    if (sessNoteVoiceSession === session) sessNoteVoiceSession = null;
+    sessNoteVoiceButton('idle');
+  }
+}
+
+function sessNoteVoiceStop(discard) {
+  const session = sessNoteVoiceSession;
+  if (!session) { sessNoteVoiceButton('idle'); return; }
+  session.discard = !!discard;
+  if (session.pending) {
+    if (discard) {
+      sessNoteVoiceSession = null;
+      sessNoteVoiceButton('idle');
+    }
+    return;
+  }
+  if (!session.recorder || session.recorder.state === 'inactive') {
+    sessNoteVoiceUpload(session);
+    return;
+  }
+  if (!discard) sessNoteVoiceButton('transcribing');
+  try { session.recorder.stop(); }
+  catch (e) { sessNoteVoiceUpload(session); }
+}
+
+async function sessNoteVoiceStart() {
+  const content = document.getElementById('sessNoteContent');
+  if (!content) return;
+  const selectionStart = typeof content.selectionStart === 'number' ? content.selectionStart : content.value.length;
+  const selectionEnd = typeof content.selectionEnd === 'number' ? content.selectionEnd : selectionStart;
+  const session = {
+    pending: true,
+    discard: false,
+    recorder: null,
+    stream: null,
+    chunks: [],
+    timer: null,
+    mimeType: '',
+    prefix: content.value.slice(0, selectionStart),
+    suffix: content.value.slice(selectionEnd)
+  };
+  sessNoteVoiceSession = session;
+  sessNoteVoiceButton('starting');
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+    });
+    if (sessNoteVoiceSession !== session || session.discard) {
+      stream.getTracks().forEach(track => track.stop());
+      return;
+    }
+    session.stream = stream;
+    const mimeTypes = ['audio/webm;codecs=opus', 'audio/mp4', 'audio/webm', 'audio/ogg;codecs=opus'];
+    const mimeType = mimeTypes.find(type => !MediaRecorder.isTypeSupported || MediaRecorder.isTypeSupported(type)) || '';
+    const recorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
+    session.pending = false;
+    session.recorder = recorder;
+    session.mimeType = (recorder.mimeType || mimeType || 'audio/webm').split(';', 1)[0];
+    recorder.ondataavailable = (event) => { if (event.data && event.data.size) session.chunks.push(event.data); };
+    recorder.onerror = () => {
+      session.discard = true;
+      sessNoteVoiceRelease(session);
+      if (sessNoteVoiceSession === session) sessNoteVoiceSession = null;
+      sessNoteVoiceButton('idle');
+      modalAlert('The browser could not record microphone audio.', 'Voice input');
+    };
+    recorder.onstop = () => sessNoteVoiceUpload(session);
+    recorder.start(1000);
+    session.timer = setTimeout(() => sessNoteVoiceStop(false), 10 * 60 * 1000);
+    sessNoteVoiceButton('recording');
+  } catch (e) {
+    if (session.discard || sessNoteVoiceSession !== session) return;
+    if (sessNoteVoiceSession === session) sessNoteVoiceSession = null;
+    sessNoteVoiceButton('idle');
+    const denied = e && (e.name === 'NotAllowedError' || e.name === 'SecurityError');
+    await modalAlert(
+      denied
+        ? 'Open this site\\'s browser settings (or the installed app\\'s system settings), set Microphone to Allow, reload, and tap Voice again.'
+        : 'The browser could not open the microphone: ' + (e.message || e),
+      denied ? 'Microphone permission needed' : 'Voice input'
+    );
+  }
 }
 
 function sessNoteVoiceToggle() {
-  if (sessNoteRecognition) { sessNoteVoiceStop(false); return; }
-  const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-  if (!Recognition) {
-    showToast('Voice input is not supported by this browser', true);
-    return;
-  }
-  const content = document.getElementById('sessNoteContent');
-  if (!content) return;
-
-  const recognition = new Recognition();
-  const selectionStart = typeof content.selectionStart === 'number' ? content.selectionStart : content.value.length;
-  const selectionEnd = typeof content.selectionEnd === 'number' ? content.selectionEnd : selectionStart;
-  const prefix = content.value.slice(0, selectionStart);
-  const suffix = content.value.slice(selectionEnd);
-  recognition.lang = navigator.language || document.documentElement.lang || 'en-US';
-  recognition.continuous = true;
-  recognition.interimResults = true;
-  recognition.maxAlternatives = 1;
-  recognition.onresult = (event) => {
-    let transcript = '';
-    for (let i = 0; i < event.results.length; i++) transcript += event.results[i][0].transcript;
-    let before = prefix;
-    let spoken = transcript.trim();
-    if (before && spoken && !/\\s$/.test(before)) before += ' ';
-    if (suffix && spoken && !/^\\s/.test(suffix)) spoken += ' ';
-    const maxLength = parseInt(content.getAttribute('maxlength'), 10) || 32768;
-    content.value = (before + spoken + suffix).slice(0, maxLength);
-    const caret = Math.min(before.length + spoken.length, content.value.length);
-    content.setSelectionRange(caret, caret);
-    content.dispatchEvent(new Event('input', { bubbles: true }));
-  };
-  recognition.onerror = (event) => {
-    if (event.error === 'not-allowed' || event.error === 'service-not-allowed') {
-      modalAlert(
-        'Open this site\\'s browser settings (or the installed app\\'s system settings), set Microphone to Allow, reload, and tap Voice again.',
-        'Microphone permission needed'
-      );
-      return;
-    }
-    const messages = {
-      'audio-capture': 'No microphone is available',
-      'network': 'Voice recognition could not reach its service'
-    };
-    if (messages[event.error]) showToast(messages[event.error], true);
-  };
-  recognition.onend = () => {
-    if (sessNoteRecognition === recognition) sessNoteRecognition = null;
-    sessNoteVoiceButton(false);
-  };
-
-  sessNoteRecognition = recognition;
-  sessNoteVoiceButton(true);
-  try { recognition.start(); }
-  catch (e) {
-    sessNoteRecognition = null;
-    sessNoteVoiceButton(false);
-    showToast('Could not start voice input', true);
-  }
+  if (sessNoteVoiceSession) { sessNoteVoiceStop(false); return; }
+  sessNoteVoiceStart();
 }
 
 function sessNoteVoiceInit() {
   const btn = document.getElementById('sessNoteVoiceBtn');
   if (!btn) return;
-  const supported = !!(window.SpeechRecognition || window.webkitSpeechRecognition);
+  const supported = !!(window.MediaRecorder && navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
   btn.disabled = !supported;
-  btn.title = supported ? 'Dictate into this note' : 'Voice input is not supported by this browser';
+  btn.title = supported ? 'Record and transcribe into this note' : 'Audio recording is not supported by this browser';
 }
 
 function closeSessNotes() {
@@ -9070,6 +9180,58 @@ except Exception as ex:
 
     # --- Session Notes API handlers ---
 
+    def _handle_voice_transcription(self):
+        username = self._get_authenticated_user()
+        if not username:
+            self._send_error(401, "not authenticated")
+            return
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except ValueError:
+            self._send_error(400, "invalid content length")
+            return
+        if length <= 0:
+            self._send_error(400, "audio recording is empty")
+            return
+        if length > VOICE_AUDIO_MAX_BYTES:
+            self._send_error(413, "audio recording is too large (maximum 25 MB)")
+            return
+        content_type = self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+        suffixes = {
+            "audio/webm": ".webm",
+            "audio/mp4": ".m4a",
+            "audio/ogg": ".ogg",
+            "audio/wav": ".wav",
+            "audio/x-wav": ".wav",
+        }
+        suffix = suffixes.get(content_type)
+        if not suffix:
+            self._send_error(415, "unsupported audio format")
+            return
+        body = self.rfile.read(length)
+        if len(body) != length:
+            self._send_error(400, "incomplete audio upload")
+            return
+        language = self.headers.get("X-Audio-Language", "")[:32]
+        temp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(prefix="webterminal-voice-", suffix=suffix, delete=False) as tmp:
+                tmp.write(body)
+                temp_path = tmp.name
+            text, detected_language = transcribe_voice_audio(temp_path, language)
+            self._send_json(200, {"ok": True, "text": text, "language": detected_language})
+        except RuntimeError as exc:
+            self._send_error(503, str(exc))
+        except Exception as exc:
+            print(f"Voice transcription failed for {username}: {exc}", file=sys.stderr, flush=True)
+            self._send_error(500, "voice transcription failed")
+        finally:
+            if temp_path:
+                try:
+                    os.unlink(temp_path)
+                except OSError:
+                    pass
+
     def _handle_notes_list(self):
         username = self._get_authenticated_user()
         if not username:
@@ -10344,6 +10506,8 @@ except Exception as ex:
             self._handle_quick_commands_sync()
         elif path == "/api/notes":
             self._handle_notes_action()
+        elif path == "/api/transcribe":
+            self._handle_voice_transcription()
         elif path == "/api/settings":
             self._handle_settings_set()
         elif path == "/api/tokens":

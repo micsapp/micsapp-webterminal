@@ -27,6 +27,7 @@ describe('Security', () => {
       '/api/quick-commands/export',
       '/api/quick-commands/sync',
       '/api/notes',
+      '/api/transcribe',
       '/api/desktop',
       '/api/help',
     ];

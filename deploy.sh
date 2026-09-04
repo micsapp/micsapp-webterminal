@@ -29,6 +29,7 @@ fi
 
 NGINX_SRC_CONF="${PROJECT_DIR}/nginx/ttyd.conf"
 AUTH_PY="${PROJECT_DIR}/auth.py"
+TRANSCRIPTION_REQUIREMENTS="${PROJECT_DIR}/requirements-transcription.txt"
 if [ "$(uname -s)" = "Darwin" ]; then
   AUTH_LOG="${HOME}/Library/Logs/ttyd-auth.log"
 else
@@ -70,6 +71,18 @@ need_cmd() {
     err "Missing required command: $1"
     exit 1
   }
+}
+
+ensure_transcription_runtime() {
+  [ -f "$TRANSCRIPTION_REQUIREMENTS" ] || {
+    err "Missing ${TRANSCRIPTION_REQUIREMENTS}"
+    return 1
+  }
+  if python3 -c 'import faster_whisper' >/dev/null 2>&1; then
+    return 0
+  fi
+  say "Installing local voice transcription runtime..."
+  python3 -m pip install -r "$TRANSCRIPTION_REQUIREMENTS"
 }
 
 normalize_server_repo_url() {
@@ -1296,6 +1309,7 @@ refresh_web_services() {
 
   need_cmd python3
   need_cmd nginx
+  ensure_transcription_runtime || return 1
   dest_conf="$(detect_nginx_conf_dest)"
 
   say ""
@@ -1402,6 +1416,7 @@ main() {
 
   ensure_linux_deps
   need_cmd python3
+  ensure_transcription_runtime || return 1
   need_cmd nginx
   need_cmd sshpass
   need_cmd ttyd
