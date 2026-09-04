@@ -1108,7 +1108,7 @@ def content_disposition(disp, filename):
 DEFAULT_SECURITY_HEADERS = {
     "X-Content-Type-Options": "nosniff",
     "Referrer-Policy": "no-referrer",
-    "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
+    "Permissions-Policy": "camera=(), microphone=(self), geolocation=()",
     "Cache-Control": "no-store",
     "Pragma": "no-cache",
 }
@@ -2296,7 +2296,7 @@ APP_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content">
 __PWA_HEAD__
 <title>Web Terminal</title>
 <style>
@@ -3906,6 +3906,8 @@ __PWA_HEAD__
       <div class="sess-notes-popover" id="sessNotesPopover">
         <div class="sess-notes-header">
           <strong>&#128221; Notes</strong>
+          <button class="fp-btn sess-note-voice" id="sessNoteVoiceBtn" onclick="sessNoteVoiceToggle()"
+                  title="Dictate into this note" aria-label="Start voice input" aria-pressed="false">&#127908; Voice</button>
           <button class="fp-btn" onclick="sessNoteNew()">New</button>
           <button class="fp-btn" onclick="closeSessNotes()" aria-label="Close notes">&#10005;</button>
         </div>
@@ -3970,6 +3972,7 @@ __PWA_HEAD__
   .sess-notes-editor textarea:focus { border-color:#e94560; }
   .sess-notes-actions { display:flex; align-items:center; gap:6px; flex-wrap:wrap; }
   .sess-notes-action-spacer { flex:1; }
+  .sess-note-voice.listening { color:#fff; background:#b3263f; border-color:#e94560; }
   .sess-note-delete { color:#e94560; border-color:#6b2b42; }
   .sess-notes-list-label { color:#7a7a9e; font-size:11px; margin:11px 2px 4px; text-transform:uppercase; }
   .sess-notes-list { max-height:150px; overflow-y:auto; border-top:1px solid #2a2a4a; }
@@ -3981,8 +3984,17 @@ __PWA_HEAD__
     .session-send-row { flex-wrap:wrap; }
     .session-send-input-wrap { flex-basis:100%; }
     .session-send-row > .fp-btn { flex:1; }
-    .sess-notes-popover { left:6px; right:6px; max-height:72vh; }
-    .sess-notes-editor textarea { min-height:170px; font-size:16px; }
+    .sess-notes-popover {
+      position:fixed; left:0; right:0; top:var(--sess-notes-viewport-top, 0);
+      bottom:auto; width:auto; height:var(--sess-notes-viewport-height, 100dvh); max-height:none;
+      margin:0; border-radius:0; overflow-y:auto; overscroll-behavior:contain;
+      -webkit-overflow-scrolling:touch;
+      padding:max(10px, env(safe-area-inset-top, 0px))
+              max(10px, env(safe-area-inset-right, 0px))
+              max(10px, env(safe-area-inset-bottom, 0px))
+              max(10px, env(safe-area-inset-left, 0px));
+    }
+    .sess-notes-editor textarea { min-height:clamp(140px, 34dvh, 260px); font-size:16px; resize:none; }
     .sess-notes-actions .fp-btn { flex:1 1 auto; }
     .sess-notes-action-spacer { display:none; }
   }
@@ -5530,10 +5542,113 @@ function sessQcRender() {
 // Persistent notes for composing/reviewing text before it reaches a terminal.
 let sessNotesCache = null;
 let sessNoteEditingId = null;
+let sessNoteRecognition = null;
+
+function sessNoteVoiceButton(listening) {
+  const btn = document.getElementById('sessNoteVoiceBtn');
+  if (!btn) return;
+  btn.classList.toggle('listening', !!listening);
+  btn.setAttribute('aria-pressed', listening ? 'true' : 'false');
+  btn.setAttribute('aria-label', listening ? 'Stop voice input' : 'Start voice input');
+  btn.innerHTML = listening ? '&#9632; Stop' : '&#127908; Voice';
+}
+
+function sessNoteVoiceStop(abort) {
+  const recognition = sessNoteRecognition;
+  sessNoteRecognition = null;
+  sessNoteVoiceButton(false);
+  if (!recognition) return;
+  try { abort ? recognition.abort() : recognition.stop(); } catch (e) { /* already stopped */ }
+}
+
+function sessNoteVoiceToggle() {
+  if (sessNoteRecognition) { sessNoteVoiceStop(false); return; }
+  const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!Recognition) {
+    showToast('Voice input is not supported by this browser', true);
+    return;
+  }
+  const content = document.getElementById('sessNoteContent');
+  if (!content) return;
+
+  const recognition = new Recognition();
+  const selectionStart = typeof content.selectionStart === 'number' ? content.selectionStart : content.value.length;
+  const selectionEnd = typeof content.selectionEnd === 'number' ? content.selectionEnd : selectionStart;
+  const prefix = content.value.slice(0, selectionStart);
+  const suffix = content.value.slice(selectionEnd);
+  recognition.lang = navigator.language || document.documentElement.lang || 'en-US';
+  recognition.continuous = true;
+  recognition.interimResults = true;
+  recognition.maxAlternatives = 1;
+  recognition.onresult = (event) => {
+    let transcript = '';
+    for (let i = 0; i < event.results.length; i++) transcript += event.results[i][0].transcript;
+    let before = prefix;
+    let spoken = transcript.trim();
+    if (before && spoken && !/\\s$/.test(before)) before += ' ';
+    if (suffix && spoken && !/^\\s/.test(suffix)) spoken += ' ';
+    const maxLength = parseInt(content.getAttribute('maxlength'), 10) || 32768;
+    content.value = (before + spoken + suffix).slice(0, maxLength);
+    const caret = Math.min(before.length + spoken.length, content.value.length);
+    content.setSelectionRange(caret, caret);
+    content.dispatchEvent(new Event('input', { bubbles: true }));
+  };
+  recognition.onerror = (event) => {
+    if (event.error === 'not-allowed' || event.error === 'service-not-allowed') {
+      modalAlert(
+        'Open this site\\'s browser settings (or the installed app\\'s system settings), set Microphone to Allow, reload, and tap Voice again.',
+        'Microphone permission needed'
+      );
+      return;
+    }
+    const messages = {
+      'audio-capture': 'No microphone is available',
+      'network': 'Voice recognition could not reach its service'
+    };
+    if (messages[event.error]) showToast(messages[event.error], true);
+  };
+  recognition.onend = () => {
+    if (sessNoteRecognition === recognition) sessNoteRecognition = null;
+    sessNoteVoiceButton(false);
+  };
+
+  sessNoteRecognition = recognition;
+  sessNoteVoiceButton(true);
+  try { recognition.start(); }
+  catch (e) {
+    sessNoteRecognition = null;
+    sessNoteVoiceButton(false);
+    showToast('Could not start voice input', true);
+  }
+}
+
+function sessNoteVoiceInit() {
+  const btn = document.getElementById('sessNoteVoiceBtn');
+  if (!btn) return;
+  const supported = !!(window.SpeechRecognition || window.webkitSpeechRecognition);
+  btn.disabled = !supported;
+  btn.title = supported ? 'Dictate into this note' : 'Voice input is not supported by this browser';
+}
 
 function closeSessNotes() {
+  sessNoteVoiceStop(true);
   const pop = document.getElementById('sessNotesPopover');
-  if (pop) pop.classList.remove('open');
+  if (pop) {
+    pop.classList.remove('open');
+    pop.style.removeProperty('--sess-notes-viewport-height');
+    pop.style.removeProperty('--sess-notes-viewport-top');
+  }
+}
+
+// Mobile browser chrome and the on-screen keyboard change the visual viewport
+// without consistently changing CSS vh units (notably in installed PWAs).
+// Size the full-screen note editor to the actually visible area.
+function syncSessNotesViewport() {
+  const pop = document.getElementById('sessNotesPopover');
+  if (!pop || !pop.classList.contains('open') || !window.matchMedia('(max-width: 600px)').matches) return;
+  const viewport = window.visualViewport;
+  pop.style.setProperty('--sess-notes-viewport-height', Math.round(viewport ? viewport.height : window.innerHeight) + 'px');
+  pop.style.setProperty('--sess-notes-viewport-top', Math.round(viewport ? viewport.offsetTop : 0) + 'px');
 }
 
 async function toggleSessNotes(ev) {
@@ -5543,12 +5658,20 @@ async function toggleSessNotes(ev) {
   if (pop.classList.contains('open')) { closeSessNotes(); return; }
   closeSessQuickPicker();
   pop.classList.add('open');
+  syncSessNotesViewport();
   await sessNotesLoad(true);
   const content = document.getElementById('sessNoteContent');
   // Keep an unsaved draft when the popover is closed accidentally.
   if (!sessNoteEditingId && content && !content.value) sessNoteNew();
   if (content) content.focus();
 }
+
+window.addEventListener('resize', syncSessNotesViewport);
+if (window.visualViewport) {
+  window.visualViewport.addEventListener('resize', syncSessNotesViewport);
+  window.visualViewport.addEventListener('scroll', syncSessNotesViewport);
+}
+sessNoteVoiceInit();
 
 async function sessNotesLoad(force) {
   const list = document.getElementById('sessNotesList');

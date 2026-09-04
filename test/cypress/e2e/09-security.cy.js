@@ -146,6 +146,14 @@ describe('Security', () => {
       });
     });
 
+    it('should allow same-origin microphone access for note dictation', () => {
+      cy.request('/login').then((resp) => {
+        const policy = resp.headers['permissions-policy'];
+        expect(policy).to.include('microphone=(self)');
+        expect(policy).to.include('camera=()');
+      });
+    });
+
     it('should set Content-Security-Policy or X-Content-Security-Policy', () => {
       cy.request({
         url: '/login',
