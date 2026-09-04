@@ -31,6 +31,25 @@ describe('Session Notes', () => {
     });
   });
 
+  it('shows Notes as a stable desktop subview instead of overlapping Sessions', () => {
+    cy.get('#sessionsBtn').click();
+    cy.get('#sessNoteBtn').click();
+    cy.get('#sessionsModal').should('have.class', 'sess-notes-mode');
+    cy.get('#sessionsModal > .fp-modal > .fp-modal-header').should('not.be.visible');
+    cy.get('#sessionsModal > .fp-modal > .fp-modal-body').should('not.be.visible');
+    cy.get('#sessNotesPopover').should('be.visible').then(($notes) => {
+      const noteRect = $notes[0].getBoundingClientRect();
+      const modalRect = $notes[0].closest('.fp-modal').getBoundingClientRect();
+      expect(noteRect.left).to.be.at.least(modalRect.left);
+      expect(noteRect.right).to.be.at.most(modalRect.right + 1);
+      expect(noteRect.top).to.be.at.least(modalRect.top);
+      expect(noteRect.bottom).to.be.at.most(modalRect.bottom + 1);
+    });
+    cy.get('#sessNotesPopover .sess-notes-header button[aria-label="Close notes"]').click();
+    cy.get('#sessionsModal').should('not.have.class', 'sess-notes-mode');
+    cy.get('#sessionsModal > .fp-modal > .fp-modal-body').should('be.visible');
+  });
+
   it('uses the original live browser dictation on desktop', () => {
     cy.window().then((win) => {
       win.SpeechRecognition = class FakeSpeechRecognition {

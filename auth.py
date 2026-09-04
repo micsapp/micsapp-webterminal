@@ -3153,6 +3153,27 @@ __PWA_HEAD__
   .sess-note-item:hover, .sess-note-item.active { background:#0f3460; }
   .sess-note-item-title { color:#e2e2e2; font-size:13px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   .sess-note-item-preview { color:#7a7a9e; font-size:11px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  @media (min-width:601px) {
+    #sessionsModal.sess-notes-mode > .fp-modal {
+      width:min(700px,95vw); max-width:95vw !important;
+      height:min(680px,90vh) !important; max-height:90vh !important;
+      resize:none;
+    }
+    #sessionsModal.sess-notes-mode > .fp-modal > .fp-modal-header,
+    #sessionsModal.sess-notes-mode > .fp-modal > .fp-modal-body,
+    #sessionsModal.sess-notes-mode .session-send-bar > .session-send-row,
+    #sessionsModal.sess-notes-mode .session-send-bar > .session-send-hint {
+      display:none;
+    }
+    #sessionsModal.sess-notes-mode .session-send-bar {
+      flex:1; min-height:0; padding:0; border-top:0; display:flex;
+    }
+    #sessionsModal.sess-notes-mode .sess-notes-popover {
+      position:static; inset:auto; flex:1; min-height:0; width:100%; max-height:none; margin:0;
+      padding:14px; border:0; border-radius:0; box-shadow:none;
+      overflow-y:auto;
+    }
+  }
   @media (max-width:600px) {
     .session-send-row { flex-wrap:wrap; }
     .session-send-input-wrap { flex-basis:100%; }
@@ -5100,7 +5121,9 @@ function sessNoteVoiceInit() {
 
 function closeSessNotes() {
   sessNoteVoiceStop(true);
+  const overlay = document.getElementById('sessionsModal');
   const pop = document.getElementById('sessNotesPopover');
+  if (overlay) overlay.classList.remove('sess-notes-mode');
   if (pop) {
     pop.classList.remove('open');
     pop.style.removeProperty('--sess-notes-viewport-height');
@@ -5121,10 +5144,12 @@ function syncSessNotesViewport() {
 
 async function toggleSessNotes(ev) {
   if (ev) ev.stopPropagation();
+  const overlay = document.getElementById('sessionsModal');
   const pop = document.getElementById('sessNotesPopover');
   if (!pop) return;
   if (pop.classList.contains('open')) { closeSessNotes(); return; }
   closeSessQuickPicker();
+  if (overlay) overlay.classList.add('sess-notes-mode');
   pop.classList.add('open');
   syncSessNotesViewport();
   await sessNotesLoad(true);
