@@ -4715,19 +4715,36 @@ function sessQcRender() {
 // Persistent notes for composing/reviewing text before it reaches a terminal.
 let sessNotesCache = null;
 let sessNoteEditingId = null;
-let sessNoteVoiceSession = null;
+let sessNoteRecognition = null;
+let sessNoteMobileVoice = null;
+
+function sessNoteUsesMobileVoice() {
+  const ua = navigator.userAgent || '';
+  return !!((navigator.userAgentData && navigator.userAgentData.mobile)
+    || /Android|iPhone|iPad|iPod|Mobile/i.test(ua)
+    || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1));
+}
+
+function sessNoteVoiceSupported() {
+  if (sessNoteUsesMobileVoice()) {
+    const AudioCtx = window.AudioContext || window.webkitAudioContext;
+    return !!(window.MediaRecorder && navigator.mediaDevices
+      && navigator.mediaDevices.getUserMedia && AudioCtx);
+  }
+  return !!(window.SpeechRecognition || window.webkitSpeechRecognition);
+}
 
 function sessNoteVoiceButton(state) {
   const btn = document.getElementById('sessNoteVoiceBtn');
   if (!btn) return;
-  const supported = !!(window.MediaRecorder && navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
   const recording = state === 'recording';
+  const addingBatch = recording && sessNoteMobileVoice && sessNoteMobileVoice.pendingUploads > 0;
   btn.classList.toggle('listening', recording);
   btn.setAttribute('aria-pressed', recording ? 'true' : 'false');
-  btn.disabled = !supported || state === 'starting' || state === 'transcribing';
-  btn.setAttribute('aria-label', recording ? 'Stop and transcribe voice input' : 'Start voice input');
+  btn.disabled = !sessNoteVoiceSupported() || state === 'starting' || state === 'transcribing';
+  btn.setAttribute('aria-label', recording ? 'Stop voice input' : 'Start voice input');
   btn.innerHTML = state === 'starting' ? '&#127908; Starting…'
-    : state === 'recording' ? '&#9632; Stop'
+    : state === 'recording' ? (addingBatch ? '&#9632; Stop · Adding…' : '&#9632; Stop')
     : state === 'transcribing' ? '&#8987; Transcribing…'
     : '&#127908; Voice';
 }
@@ -4735,123 +4752,318 @@ function sessNoteVoiceButton(state) {
 function sessNoteVoiceInsert(session, transcript) {
   const content = document.getElementById('sessNoteContent');
   if (!content) return;
-  let before = session.prefix;
+  const insertAt = Math.min(session.insertAt, content.value.length);
+  const replaceUntil = session.replaceUntil == null
+    ? insertAt
+    : Math.max(insertAt, Math.min(session.replaceUntil, content.value.length));
+  let before = content.value.slice(0, insertAt);
+  const suffix = content.value.slice(replaceUntil);
   let spoken = String(transcript || '').trim();
   if (before && spoken && !/\\s$/.test(before)) before += ' ';
-  if (session.suffix && spoken && !/^\\s/.test(session.suffix)) spoken += ' ';
+  if (suffix && spoken && !/^\\s/.test(suffix)) spoken += ' ';
   const maxLength = parseInt(content.getAttribute('maxlength'), 10) || 32768;
-  content.value = (before + spoken + session.suffix).slice(0, maxLength);
+  content.value = (before + spoken + suffix).slice(0, maxLength);
   const caret = Math.min(before.length + spoken.length, content.value.length);
+  session.insertAt = caret;
+  session.replaceUntil = null;
   content.setSelectionRange(caret, caret);
   content.dispatchEvent(new Event('input', { bubbles: true }));
 }
 
-function sessNoteVoiceRelease(session) {
-  if (session.timer) clearTimeout(session.timer);
-  session.timer = null;
+function sessNoteDesktopVoiceStop(abort) {
+  const recognition = sessNoteRecognition;
+  sessNoteRecognition = null;
+  sessNoteVoiceButton('idle');
+  if (!recognition) return;
+  try { abort ? recognition.abort() : recognition.stop(); } catch (e) { /* already stopped */ }
+}
+
+function sessNoteDesktopVoiceStart() {
+  const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!Recognition) {
+    showToast('Voice input is not supported by this browser', true);
+    return;
+  }
+  const content = document.getElementById('sessNoteContent');
+  if (!content) return;
+
+  const recognition = new Recognition();
+  const selectionStart = typeof content.selectionStart === 'number' ? content.selectionStart : content.value.length;
+  const selectionEnd = typeof content.selectionEnd === 'number' ? content.selectionEnd : selectionStart;
+  const prefix = content.value.slice(0, selectionStart);
+  const suffix = content.value.slice(selectionEnd);
+  recognition.lang = navigator.language || document.documentElement.lang || 'en-US';
+  recognition.continuous = true;
+  recognition.interimResults = true;
+  recognition.maxAlternatives = 1;
+  recognition.onresult = (event) => {
+    let transcript = '';
+    for (let i = 0; i < event.results.length; i++) transcript += event.results[i][0].transcript;
+    let before = prefix;
+    let spoken = transcript.trim();
+    if (before && spoken && !/\\s$/.test(before)) before += ' ';
+    if (suffix && spoken && !/^\\s/.test(suffix)) spoken += ' ';
+    const maxLength = parseInt(content.getAttribute('maxlength'), 10) || 32768;
+    content.value = (before + spoken + suffix).slice(0, maxLength);
+    const caret = Math.min(before.length + spoken.length, content.value.length);
+    content.setSelectionRange(caret, caret);
+    content.dispatchEvent(new Event('input', { bubbles: true }));
+  };
+  recognition.onerror = (event) => {
+    if (event.error === 'not-allowed' || event.error === 'service-not-allowed') {
+      modalAlert(
+        'Open this site\\'s browser settings (or the installed app\\'s system settings), set Microphone to Allow, reload, and tap Voice again.',
+        'Microphone permission needed'
+      );
+      return;
+    }
+    const messages = {
+      'audio-capture': 'No microphone is available',
+      'network': 'Voice recognition could not reach its service'
+    };
+    if (messages[event.error]) showToast(messages[event.error], true);
+  };
+  recognition.onend = () => {
+    if (sessNoteRecognition === recognition) sessNoteRecognition = null;
+    sessNoteVoiceButton('idle');
+  };
+
+  sessNoteRecognition = recognition;
+  sessNoteVoiceButton('recording');
+  try { recognition.start(); }
+  catch (e) {
+    sessNoteRecognition = null;
+    sessNoteVoiceButton('idle');
+    showToast('Could not start voice input', true);
+  }
+}
+
+function sessNoteMobileRelease(session) {
+  if (session.frame) cancelAnimationFrame(session.frame);
+  session.frame = null;
+  if (session.audioContext) session.audioContext.close().catch(() => {});
+  session.audioContext = null;
   if (session.stream) session.stream.getTracks().forEach(track => track.stop());
   session.stream = null;
 }
 
-async function sessNoteVoiceUpload(session) {
-  sessNoteVoiceRelease(session);
-  if (session.discard || sessNoteVoiceSession !== session || !session.chunks.length) {
-    if (sessNoteVoiceSession === session) sessNoteVoiceSession = null;
-    sessNoteVoiceButton('idle');
-    return;
-  }
-  sessNoteVoiceButton('transcribing');
-  try {
-    const blob = new Blob(session.chunks, { type: session.mimeType });
+function sessNoteMobileQueueUpload(session, blob, mimeType) {
+  session.pendingUploads++;
+  if (!session.stopped) sessNoteVoiceButton('recording');
+  session.queue = session.queue.then(async () => {
+    if (session.discard) return;
     const res = await fetch('/api/transcribe', {
       method: 'POST',
       headers: {
-        'Content-Type': session.mimeType,
+        'Content-Type': mimeType,
         'X-Audio-Language': navigator.language || document.documentElement.lang || ''
       },
       body: blob
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok || data.error) throw new Error(data.error || ('HTTP ' + res.status));
-    if (sessNoteVoiceSession !== session || session.discard) return;
-    if (!String(data.text || '').trim()) throw new Error('No speech was detected');
-    sessNoteVoiceInsert(session, data.text);
-  } catch (e) {
-    if (!session.discard) await modalAlert(e.message || 'Voice transcription failed', 'Voice input');
-  } finally {
-    if (sessNoteVoiceSession === session) sessNoteVoiceSession = null;
+    if (sessNoteMobileVoice === session && !session.discard && String(data.text || '').trim()) {
+      sessNoteVoiceInsert(session, data.text);
+    }
+  }).catch((error) => {
+    if (!session.discard) showToast(error.message || 'Voice transcription failed', true);
+  }).finally(() => {
+    session.pendingUploads--;
+    if (sessNoteMobileVoice === session && !session.stopped) sessNoteVoiceButton('recording');
+  });
+}
+
+function sessNoteMobileFinish(session) {
+  if (session.finalizing) return;
+  session.finalizing = true;
+  sessNoteMobileRelease(session);
+  session.queue.finally(() => {
+    if (sessNoteMobileVoice === session) sessNoteMobileVoice = null;
     sessNoteVoiceButton('idle');
+  });
+}
+
+function sessNoteMobileStartRecorder(session) {
+  let recorder;
+  try {
+    recorder = session.recorderMime
+      ? new MediaRecorder(session.stream, { mimeType: session.recorderMime })
+      : new MediaRecorder(session.stream);
+  } catch (error) {
+    recorder = new MediaRecorder(session.stream);
+  }
+  const chunks = [];
+  recorder.ondataavailable = (event) => { if (event.data && event.data.size) chunks.push(event.data); };
+  recorder.onerror = () => {
+    if (session.discard) return;
+    sessNoteMobileVoiceStop(true);
+    modalAlert('The browser could not record microphone audio.', 'Voice input');
+  };
+  recorder.onstop = () => {
+    const reason = recorder._voiceStopReason || 'rotate';
+    const hadSpeech = recorder._voiceHadSpeech;
+    const mimeType = (recorder.mimeType || session.recorderMime || 'audio/webm').split(';', 1)[0];
+    const blob = new Blob(chunks, { type: mimeType });
+    session.rotating = false;
+
+    if (!session.discard && blob.size && (hadSpeech || reason === 'silence' || reason === 'final')) {
+      sessNoteMobileQueueUpload(session, blob, mimeType);
+    }
+    if (session.discard) {
+      sessNoteMobileRelease(session);
+    } else if (session.stopped) {
+      sessNoteMobileFinish(session);
+    } else {
+      sessNoteMobileStartRecorder(session);
+      sessNoteVoiceButton('recording');
+    }
+  };
+  session.recorder = recorder;
+  session.batchHasSpeech = false;
+  session.loudFrames = 0;
+  session.lastLoudAt = 0;
+  session.noiseFloor = 0.008;
+  session.batchStartedAt = performance.now();
+  recorder.start(500);
+}
+
+function sessNoteMobileFlush(finalBatch) {
+  const session = sessNoteMobileVoice;
+  if (!session || session.discard || session.rotating) return;
+  if (finalBatch) {
+    session.stopped = true;
+    if (session.frame) cancelAnimationFrame(session.frame);
+    session.frame = null;
+    sessNoteVoiceButton('transcribing');
+  }
+  const recorder = session.recorder;
+  if (!recorder || recorder.state === 'inactive') {
+    if (finalBatch) sessNoteMobileFinish(session);
+    return;
+  }
+  session.rotating = true;
+  recorder._voiceStopReason = finalBatch ? 'final' : 'silence';
+  recorder._voiceHadSpeech = session.batchHasSpeech;
+  try { recorder.stop(); }
+  catch (error) {
+    session.rotating = false;
+    if (finalBatch) sessNoteMobileFinish(session);
   }
 }
 
-function sessNoteVoiceStop(discard) {
-  const session = sessNoteVoiceSession;
+function sessNoteMobileMonitor(session) {
+  if (sessNoteMobileVoice !== session || session.stopped || session.discard) return;
+  session.analyser.getByteTimeDomainData(session.levelData);
+  let energy = 0;
+  for (let i = 0; i < session.levelData.length; i++) {
+    const sample = (session.levelData[i] - 128) / 128;
+    energy += sample * sample;
+  }
+  const rms = Math.sqrt(energy / session.levelData.length);
+  const now = performance.now();
+  if (!session.batchHasSpeech) {
+    const startThreshold = Math.max(0.025, session.noiseFloor * 2.8);
+    if (rms > startThreshold) session.loudFrames++;
+    else {
+      session.loudFrames = 0;
+      session.noiseFloor = session.noiseFloor * 0.96 + rms * 0.04;
+    }
+    if (session.loudFrames >= 3) {
+      session.batchHasSpeech = true;
+      session.lastLoudAt = now;
+    }
+  } else if (rms > Math.max(0.014, session.noiseFloor * 1.6)) {
+    session.lastLoudAt = now;
+  }
+
+  if (session.batchHasSpeech && !session.rotating && now - session.lastLoudAt >= 1600) {
+    sessNoteMobileFlush(false);
+  } else if (!session.batchHasSpeech && !session.rotating && now - session.batchStartedAt >= 30000) {
+    // Rotate an idle recorder without uploading it so leaving dictation open
+    // during a long pause cannot build an indefinitely large in-memory blob.
+    session.rotating = true;
+    session.recorder._voiceStopReason = 'idle';
+    session.recorder._voiceHadSpeech = false;
+    try { session.recorder.stop(); }
+    catch (error) {
+      session.rotating = false;
+      session.batchStartedAt = now;
+    }
+  }
+  session.frame = requestAnimationFrame(() => sessNoteMobileMonitor(session));
+}
+
+function sessNoteMobileVoiceStop(discard) {
+  const session = sessNoteMobileVoice;
   if (!session) { sessNoteVoiceButton('idle'); return; }
   session.discard = !!discard;
-  if (session.pending) {
-    if (discard) {
-      sessNoteVoiceSession = null;
-      sessNoteVoiceButton('idle');
+  session.stopped = true;
+  if (session.frame) cancelAnimationFrame(session.frame);
+  session.frame = null;
+  if (discard) {
+    if (session.recorder && session.recorder.state !== 'inactive') {
+      session.recorder._voiceStopReason = 'discard';
+      try { session.recorder.stop(); } catch (error) { sessNoteMobileRelease(session); }
+    } else {
+      sessNoteMobileRelease(session);
     }
+    if (sessNoteMobileVoice === session) sessNoteMobileVoice = null;
+    sessNoteVoiceButton('idle');
     return;
   }
-  if (!session.recorder || session.recorder.state === 'inactive') {
-    sessNoteVoiceUpload(session);
-    return;
-  }
-  if (!discard) sessNoteVoiceButton('transcribing');
-  try { session.recorder.stop(); }
-  catch (e) { sessNoteVoiceUpload(session); }
+  sessNoteMobileFlush(true);
 }
 
-async function sessNoteVoiceStart() {
+async function sessNoteMobileVoiceStart() {
   const content = document.getElementById('sessNoteContent');
   if (!content) return;
   const selectionStart = typeof content.selectionStart === 'number' ? content.selectionStart : content.value.length;
   const selectionEnd = typeof content.selectionEnd === 'number' ? content.selectionEnd : selectionStart;
   const session = {
-    pending: true,
     discard: false,
+    stopped: false,
+    finalizing: false,
+    rotating: false,
     recorder: null,
     stream: null,
-    chunks: [],
-    timer: null,
-    mimeType: '',
-    prefix: content.value.slice(0, selectionStart),
-    suffix: content.value.slice(selectionEnd)
+    audioContext: null,
+    analyser: null,
+    frame: null,
+    queue: Promise.resolve(),
+    pendingUploads: 0,
+    insertAt: selectionStart,
+    replaceUntil: selectionEnd,
+    recorderMime: ''
   };
-  sessNoteVoiceSession = session;
+  sessNoteMobileVoice = session;
   sessNoteVoiceButton('starting');
   try {
     const stream = await navigator.mediaDevices.getUserMedia({
       audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
     });
-    if (sessNoteVoiceSession !== session || session.discard) {
+    if (sessNoteMobileVoice !== session || session.discard) {
       stream.getTracks().forEach(track => track.stop());
       return;
     }
     session.stream = stream;
     const mimeTypes = ['audio/webm;codecs=opus', 'audio/mp4', 'audio/webm', 'audio/ogg;codecs=opus'];
-    const mimeType = mimeTypes.find(type => !MediaRecorder.isTypeSupported || MediaRecorder.isTypeSupported(type)) || '';
-    const recorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
-    session.pending = false;
-    session.recorder = recorder;
-    session.mimeType = (recorder.mimeType || mimeType || 'audio/webm').split(';', 1)[0];
-    recorder.ondataavailable = (event) => { if (event.data && event.data.size) session.chunks.push(event.data); };
-    recorder.onerror = () => {
-      session.discard = true;
-      sessNoteVoiceRelease(session);
-      if (sessNoteVoiceSession === session) sessNoteVoiceSession = null;
-      sessNoteVoiceButton('idle');
-      modalAlert('The browser could not record microphone audio.', 'Voice input');
-    };
-    recorder.onstop = () => sessNoteVoiceUpload(session);
-    recorder.start(1000);
-    session.timer = setTimeout(() => sessNoteVoiceStop(false), 10 * 60 * 1000);
+    session.recorderMime = mimeTypes.find(type => !MediaRecorder.isTypeSupported || MediaRecorder.isTypeSupported(type)) || '';
+    const AudioCtx = window.AudioContext || window.webkitAudioContext;
+    session.audioContext = new AudioCtx();
+    session.analyser = session.audioContext.createAnalyser();
+    session.analyser.fftSize = 512;
+    session.analyser.smoothingTimeConstant = 0.2;
+    session.levelData = new Uint8Array(session.analyser.fftSize);
+    session.audioContext.createMediaStreamSource(stream).connect(session.analyser);
+    await session.audioContext.resume();
+    if (sessNoteMobileVoice !== session || session.discard) return;
+    sessNoteMobileStartRecorder(session);
     sessNoteVoiceButton('recording');
+    sessNoteMobileMonitor(session);
   } catch (e) {
-    if (session.discard || sessNoteVoiceSession !== session) return;
-    if (sessNoteVoiceSession === session) sessNoteVoiceSession = null;
+    if (session.discard || sessNoteMobileVoice !== session) return;
+    sessNoteMobileRelease(session);
+    if (sessNoteMobileVoice === session) sessNoteMobileVoice = null;
     sessNoteVoiceButton('idle');
     const denied = e && (e.name === 'NotAllowedError' || e.name === 'SecurityError');
     await modalAlert(
@@ -4864,16 +5076,26 @@ async function sessNoteVoiceStart() {
 }
 
 function sessNoteVoiceToggle() {
-  if (sessNoteVoiceSession) { sessNoteVoiceStop(false); return; }
-  sessNoteVoiceStart();
+  if (sessNoteMobileVoice) { sessNoteMobileVoiceStop(false); return; }
+  if (sessNoteRecognition) { sessNoteDesktopVoiceStop(false); return; }
+  if (sessNoteUsesMobileVoice()) sessNoteMobileVoiceStart();
+  else sessNoteDesktopVoiceStart();
+}
+
+function sessNoteVoiceStop(abort) {
+  if (sessNoteMobileVoice) sessNoteMobileVoiceStop(abort);
+  if (sessNoteRecognition) sessNoteDesktopVoiceStop(abort);
+  if (!sessNoteMobileVoice && !sessNoteRecognition) sessNoteVoiceButton('idle');
 }
 
 function sessNoteVoiceInit() {
   const btn = document.getElementById('sessNoteVoiceBtn');
   if (!btn) return;
-  const supported = !!(window.MediaRecorder && navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
+  const supported = sessNoteVoiceSupported();
   btn.disabled = !supported;
-  btn.title = supported ? 'Record and transcribe into this note' : 'Audio recording is not supported by this browser';
+  btn.title = supported
+    ? (sessNoteUsesMobileVoice() ? 'Dictate in automatic speech batches' : 'Dictate into this note')
+    : 'Voice input is not supported by this browser';
 }
 
 function closeSessNotes() {

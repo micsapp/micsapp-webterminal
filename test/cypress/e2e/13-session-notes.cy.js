@@ -31,17 +31,65 @@ describe('Session Notes', () => {
     });
   });
 
-  it('records one continuous clip and inserts its server transcript at the cursor', () => {
+  it('uses the original live browser dictation on desktop', () => {
+    cy.window().then((win) => {
+      win.SpeechRecognition = class FakeSpeechRecognition {
+        start() {
+          this.onresult({ results: [[{ transcript: 'desktop voice' }]] });
+        }
+        stop() { this.onend(); }
+        abort() { this.onend(); }
+      };
+      win.sessNoteVoiceInit();
+    });
+
+    cy.get('#sessionsBtn').click();
+    cy.get('#sessNoteBtn').click();
+    cy.get('#sessNoteContent').clear().type('before after').then(($content) => {
+      $content[0].setSelectionRange(6, 6);
+    });
+    cy.get('#sessNoteVoiceBtn').click().should('have.attr', 'aria-pressed', 'true');
+    cy.get('#sessNoteContent').should('have.value', 'before desktop voice after');
+    cy.get('#sessNoteVoiceBtn').click().should('have.attr', 'aria-pressed', 'false');
+  });
+
+  it('automatically transcribes ordered mobile batches after silence and keeps listening', () => {
+    let requestCount = 0;
     cy.intercept('POST', '/api/transcribe', (req) => {
       expect(req.headers['content-type']).to.include('audio/webm');
-      req.reply({ statusCode: 200, body: { ok: true, text: 'voice text continues', language: 'en' } });
+      const text = requestCount++ === 0 ? 'mobile voice batch' : '';
+      req.reply({ statusCode: 200, body: { ok: true, text, language: 'en' } });
     }).as('transcribeVoice');
     cy.window().then((win) => {
       const stream = { getTracks: () => [{ stop() {} }] };
+      Object.defineProperty(win.navigator, 'userAgent', {
+        configurable: true,
+        value: 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) Mobile'
+      });
       Object.defineProperty(win.navigator, 'mediaDevices', {
         configurable: true,
         value: { getUserMedia: () => Promise.resolve(stream) }
       });
+      let levelReads = 0;
+      win.AudioContext = class FakeAudioContext {
+        createAnalyser() {
+          return {
+            fftSize: 512,
+            smoothingTimeConstant: 0,
+            getByteTimeDomainData(data) {
+              data.fill(levelReads++ < 3 ? 180 : 128);
+            }
+          };
+        }
+        createMediaStreamSource() { return { connect() {} }; }
+        resume() { return Promise.resolve(); }
+        close() { return Promise.resolve(); }
+      };
+      win.requestAnimationFrame = (callback) => {
+        win.__voiceFrame = callback;
+        return 1;
+      };
+      win.cancelAnimationFrame = () => {};
       win.MediaRecorder = class FakeMediaRecorder {
         static isTypeSupported(type) { return type.startsWith('audio/webm'); }
         constructor() {
@@ -58,15 +106,22 @@ describe('Session Notes', () => {
       win.sessNoteVoiceInit();
     });
 
+    cy.viewport(375, 667);
     cy.get('#sessionsBtn').click();
     cy.get('#sessNoteBtn').click();
     cy.get('#sessNoteContent').clear().type('before after').then(($content) => {
       $content[0].setSelectionRange(6, 6);
     });
     cy.get('#sessNoteVoiceBtn').click().should('have.attr', 'aria-pressed', 'true');
+    cy.window().then((win) => win.__voiceFrame());
+    cy.window().then((win) => win.__voiceFrame());
+    cy.wait(1700);
+    cy.window().then((win) => win.__voiceFrame());
+    cy.wait('@transcribeVoice');
+    cy.get('#sessNoteContent').should('have.value', 'before mobile voice batch after');
+    cy.get('#sessNoteVoiceBtn').should('have.attr', 'aria-pressed', 'true');
     cy.get('#sessNoteVoiceBtn').click();
     cy.wait('@transcribeVoice');
-    cy.get('#sessNoteContent').should('have.value', 'before voice text continues after');
     cy.get('#sessNoteVoiceBtn').should('have.attr', 'aria-pressed', 'false').and('not.be.disabled');
   });
 

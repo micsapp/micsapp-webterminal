@@ -178,9 +178,11 @@ text area. Autocorrect, auto-capitalization, and spellcheck are disabled in the
 editor so command text stays exactly as entered.
 
 - **Save note** stores a new note; select a saved note to modify or delete it.
-- **Voice** records continuously until you tap **Stop**, then transcribes the
-  complete recording and inserts it at the cursor. Audio is processed locally
-  on the Web Terminal server and the temporary recording is deleted afterward.
+- **Voice** uses the browser's live dictation on desktop. On mobile, it listens
+  continuously and automatically transcribes each phrase after about 1.6
+  seconds of silence; you only tap **Stop** when dictation is finished. Mobile
+  audio is processed locally on the Web Terminal server and each temporary
+  batch is deleted afterward.
 - **Send to active** is the default. If session rows are checked, it changes to
   **Send to selected (N)**; **Send to all** remains available separately.
 - Every note send saves the latest edits first, then sends the note directly to
