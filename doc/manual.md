@@ -179,7 +179,7 @@ editor so command text stays exactly as entered.
 
 - **Save note** stores a new note; select a saved note to modify or delete it.
 - **Voice** uses the browser's live dictation on desktop. On mobile, it listens
-  continuously and automatically transcribes each phrase after about 1.6
+  continuously and automatically transcribes each phrase after about 0.9
   seconds of silence; you only tap **Stop** when dictation is finished. Mobile
   audio is processed locally on the Web Terminal server and each temporary
   batch is deleted afterward.

@@ -163,35 +163,51 @@ SSH_CONFIG_FILE = os.environ.get(
     "WEBTERMINAL_SSH_CONFIG", os.path.expanduser("~/.ssh/config")
 )
 REMOTE_SSH_USER = os.environ.get("WEBTERMINAL_REMOTE_SSH_USER") or getpass.getuser()
-VOICE_TRANSCRIPTION_MODEL = os.environ.get("VOICE_TRANSCRIPTION_MODEL", "small")
+VOICE_TRANSCRIPTION_MODEL = os.environ.get("VOICE_TRANSCRIPTION_MODEL", "base")
 VOICE_AUDIO_MAX_BYTES = 25 * 1024 * 1024
 _voice_model = None
 _voice_model_lock = threading.Lock()
 
 
+def _load_voice_transcription_model():
+    """Load the shared model. Caller must hold _voice_model_lock."""
+    global _voice_model
+    if _voice_model is None:
+        try:
+            from faster_whisper import WhisperModel
+        except ImportError as exc:
+            raise RuntimeError("local transcription runtime is not installed") from exc
+        _voice_model = WhisperModel(
+            VOICE_TRANSCRIPTION_MODEL,
+            device="cpu",
+            compute_type="int8",
+            cpu_threads=min(8, os.cpu_count() or 1),
+        )
+    return _voice_model
+
+
+def preload_voice_transcription_model():
+    """Warm model weights in the background so first dictation is responsive."""
+    try:
+        with _voice_model_lock:
+            _load_voice_transcription_model()
+        print(f"Voice transcription model ready: {VOICE_TRANSCRIPTION_MODEL}", flush=True)
+    except Exception as exc:
+        print(f"Voice transcription preload failed: {exc}", file=sys.stderr, flush=True)
+
+
 def transcribe_voice_audio(path, language=None):
     """Transcribe one complete recording locally with Faster-Whisper."""
-    global _voice_model
-    try:
-        from faster_whisper import WhisperModel
-    except ImportError as exc:
-        raise RuntimeError("local transcription runtime is not installed") from exc
 
     lang = (language or "").split("-", 1)[0].lower()
     if not re.fullmatch(r"[a-z]{2,3}", lang):
         lang = None
     with _voice_model_lock:
-        if _voice_model is None:
-            _voice_model = WhisperModel(
-                VOICE_TRANSCRIPTION_MODEL,
-                device="cpu",
-                compute_type="int8",
-                cpu_threads=min(4, os.cpu_count() or 1),
-            )
-        segments, info = _voice_model.transcribe(
+        model = _load_voice_transcription_model()
+        segments, info = model.transcribe(
             path,
             language=lang,
-            beam_size=5,
+            beam_size=1,
             vad_filter=True,
             vad_parameters={"min_silence_duration_ms": 500},
             # Independent windows avoid the repetition loops that can occur
@@ -4997,7 +5013,7 @@ function sessNoteMobileMonitor(session) {
     session.lastLoudAt = now;
   }
 
-  if (session.batchHasSpeech && !session.rotating && now - session.lastLoudAt >= 1600) {
+  if (session.batchHasSpeech && !session.rotating && now - session.lastLoudAt >= 900) {
     sessNoteMobileFlush(false);
   } else if (!session.batchHasSpeech && !session.rotating && now - session.batchStartedAt >= 30000) {
     // Rotate an idle recorder without uploading it so leaving dictation open
@@ -10778,4 +10794,9 @@ if __name__ == "__main__":
     server = http.server.ThreadingHTTPServer(("127.0.0.1", PORT), AuthHandler)
     server.daemon_threads = True
     print(f"Auth service running on http://127.0.0.1:{PORT}")
+    threading.Thread(
+        target=preload_voice_transcription_model,
+        name="voice-model-preload",
+        daemon=True,
+    ).start()
     server.serve_forever()

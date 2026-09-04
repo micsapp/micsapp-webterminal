@@ -134,7 +134,7 @@ describe('Session Notes', () => {
     cy.get('#sessNoteVoiceBtn').click().should('have.attr', 'aria-pressed', 'true');
     cy.window().then((win) => win.__voiceFrame());
     cy.window().then((win) => win.__voiceFrame());
-    cy.wait(1700);
+    cy.wait(1000);
     cy.window().then((win) => win.__voiceFrame());
     cy.wait('@transcribeVoice');
     cy.get('#sessNoteContent').should('have.value', 'before mobile voice batch after');

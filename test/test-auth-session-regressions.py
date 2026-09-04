@@ -65,6 +65,15 @@ class AuthSessionRegressionTests(unittest.TestCase):
 
         self.assertEqual(AUTH_PY.read_text(encoding="utf-8").rstrip("\n"), embedded)
 
+    def test_mobile_voice_latency_settings_remain_fast(self):
+        source = AUTH_PY.read_text(encoding="utf-8")
+
+        self.assertIn("now - session.lastLoudAt >= 900", source)
+        self.assertIn("beam_size=1", source)
+        self.assertIn("cpu_threads=min(8, os.cpu_count() or 1)", source)
+        self.assertIn('VOICE_TRANSCRIPTION_MODEL", "base"', source)
+        self.assertIn("target=preload_voice_transcription_model", source)
+
 
 if __name__ == "__main__":
     unittest.main()
