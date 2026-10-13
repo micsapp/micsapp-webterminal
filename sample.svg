@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 560 160" role="img" aria-labelledby="title desc">
+  <title id="title">SVG preview works</title>
+  <desc id="desc">Blue card with a white check mark and SVG preview text.</desc>
+  <rect width="560" height="160" rx="20" fill="#174ea6"/>
+  <circle cx="80" cy="80" r="37" fill="#2db77b"/>
+  <path d="M62 80l13 13 25-28" fill="none" stroke="#fff" stroke-width="9" stroke-linecap="round" stroke-linejoin="round"/>
+  <text x="140" y="75" fill="#fff" font-family="Arial, sans-serif" font-size="29" font-weight="700">SVG preview works</text>
+  <text x="140" y="111" fill="#c9dcff" font-family="Arial, sans-serif" font-size="19">Relative file image</text>
+</svg>

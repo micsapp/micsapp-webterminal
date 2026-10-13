@@ -7584,6 +7584,18 @@ function renderMarkdown(src, imgBaseUrl) {
     placeholders.push(content);
     return '\\x00PH' + (placeholders.length - 1) + '\\x00';
   }
+  function escapeAttr(value) {
+    return String(value).replace(/&/g, '&amp;').replace(/"/g, '&quot;')
+      .replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  }
+  function imageHtml(src, alt) {
+    src = src.trim();
+    if (!/^(?:https?:\\/\\/|data:image\\/|blob:|\\/)/i.test(src)) {
+      if (/^[a-z][a-z0-9+.-]*:/i.test(src)) return escapeAttr(alt);
+      if (imgBaseUrl) src = imgBaseUrl + encodeURIComponent(src);
+    }
+    return '<img src="' + escapeAttr(src) + '" alt="' + escapeAttr(alt) + '">';
+  }
   var h = src.replace(/\\r\\n/g, '\\n').replace(/\\r/g, '\\n');
   // 1. Extract raw HTML/SVG blocks (opening tag at line start, closing tag at line start)
   h = h.replace(/^(<(?:svg|div|details|figure|picture|section)(?:\\s[^>]*)?>(?:[\\s\\S]*?)\\n<\\/(?:svg|div|details|figure|picture|section)>)/gm, function(m) {
@@ -7603,9 +7615,18 @@ function renderMarkdown(src, imgBaseUrl) {
     var escaped = code.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
     return ph('<code>' + escaped + '</code>');
   });
-  // 4. Escape remaining HTML
+  // 4. Images are protected before HTML escaping so URLs with & stay intact.
+  h = h.replace(/<img\\b[^>]*>/gi, function(tag) {
+    var src = tag.match(/\\bsrc\\s*=\\s*(?:"([^"]*)"|'([^']*)'|([^\\s>]+))/i);
+    var alt = tag.match(/\\balt\\s*=\\s*(?:"([^"]*)"|'([^']*)'|([^\\s>]+))/i);
+    return src ? ph(imageHtml(src[1] || src[2] || src[3], alt ? (alt[1] || alt[2] || alt[3]) : '')) : tag;
+  });
+  h = h.replace(/!\\[([^\\]]*)\\]\\(([^)]+)\\)/g, function(m, alt, src) {
+    return ph(imageHtml(src, alt));
+  });
+  // 5. Escape remaining HTML
   h = h.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-  // 5. Tables (must be before lists/hr to avoid conflicts with | and ---)
+  // 6. Tables (must be before lists/hr to avoid conflicts with | and ---)
   h = h.replace(/^(\\|.+\\|)\\n(\\|[\\s:|-]+\\|)\\n((\\|.+\\|(?:\\n|$))*)/gm, function(m, hdr, sep, body) {
     var cols = hdr.split('|').slice(1, -1);
     var aligns = sep.split('|').slice(1, -1).map(function(c) {
@@ -7648,13 +7669,6 @@ function renderMarkdown(src, imgBaseUrl) {
   h = h.replace(/^[ \\t]*[-]{3,}[ \\t]*$/gm, function(m){ return ph('<hr>'); });
   h = h.replace(/^[ \\t]*[*]{3,}[ \\t]*$/gm, function(m){ return ph('<hr>'); });
   h = h.replace(/^[ \\t]*[_]{3,}[ \\t]*$/gm, function(m){ return ph('<hr>'); });
-  // 9. Images (resolve relative paths via file API when imgBaseUrl provided)
-  h = h.replace(/!\\[([^\\]]*)\\]\\(([^)]+)\\)/g, function(m, alt, src) {
-    if (imgBaseUrl && !/^(?:https?:\\/\\/|data:|\\/)/.test(src)) {
-      src = imgBaseUrl + encodeURIComponent(src);
-    }
-    return '<img src="' + src + '" alt="' + alt + '">';
-  });
   // 10. Links
   h = h.replace(/\\[([^\\]]+)\\]\\(([^)]+)\\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
   // 11. Bold + italic (order matters)
@@ -7723,23 +7737,31 @@ function _mdImgBase() {
     : '';
 }
 
-var _mermaidMod = null, _mermaidLoading = false;
+var _mermaidLoading = null;
 function renderMermaidIn(container) {
   var els = container.querySelectorAll('pre.mermaid:not([data-processed])');
   if (!els.length) return;
   function doRender() {
     var targets = container.querySelectorAll('pre.mermaid:not([data-processed])');
     if (!targets.length) return;
-    _mermaidMod.run({nodes: targets, suppressErrors: true});
+    return window.mermaid.run({nodes: targets, suppressErrors: true});
   }
-  if (_mermaidMod) { doRender(); return; }
-  if (_mermaidLoading) { var iv = setInterval(function() { if (_mermaidMod) { clearInterval(iv); doRender(); } }, 200); return; }
-  _mermaidLoading = true;
-  import('https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs').then(function(mod) {
-    _mermaidMod = mod.default;
-    _mermaidMod.initialize({startOnLoad: false, theme: 'dark', securityLevel: 'loose'});
-    doRender();
-  }).catch(function(e) { console.error('Mermaid load failed:', e); _mermaidLoading = false; });
+  if (!_mermaidLoading) {
+    _mermaidLoading = new Promise(function(resolve, reject) {
+      var script = document.createElement('script');
+      script.src = '/api/files/preview/mermaid.js';
+      script.onload = function() {
+        window.mermaid.initialize({startOnLoad: false, theme: 'dark', securityLevel: 'strict'});
+        resolve();
+      };
+      script.onerror = function() { reject(new Error('Mermaid script could not be loaded')); };
+      document.head.appendChild(script);
+    });
+  }
+  _mermaidLoading.then(doRender).catch(function(e) {
+    console.error('Mermaid render failed:', e);
+    _mermaidLoading = null;
+  });
 }
 
 function getInlinePreviewUrl(pathToken) {
@@ -7847,7 +7869,7 @@ function _fmToggleMd(st) {
   var pre = _fmEl(st, '.fp-modal-body pre');
   var md = _fmEl(st, '.fp-modal-md-render');
   if (st.mdRendered) {
-    md.innerHTML = renderMarkdown(st.text, _mdImgBase());
+    md.innerHTML = renderMarkdown(st.text, st.mdImgBase);
     renderMermaidIn(md);
     md.style.display = 'block';
     pre.style.display = 'none';
@@ -7969,7 +7991,7 @@ function _fmSetEditing(st, editing) {
       mdToggle.style.display = 'inline-block';
       mdToggle.innerHTML = st.mdRendered ? '&#60;/&#62; Source' : '&#128196; Rendered';
       if (st.mdRendered) {
-        mdRender.innerHTML = renderMarkdown(st.text, _mdImgBase());
+        mdRender.innerHTML = renderMarkdown(st.text, st.mdImgBase);
         renderMermaidIn(mdRender);
         mdRender.style.display = 'block';
       } else {
@@ -8244,6 +8266,7 @@ async function previewFile(pathToken, name) {
   var lowerName = (name || '').toLowerCase();
   var st = _fmCreate(name);
   st.path = pathToken;
+  st.mdImgBase = _mdImgBase();
 
   _fmEl(st, '.fp-btn-download').onclick = function() { downloadFile(pathToken, name); };
   _fmEl(st, '.fp-btn-save').onclick = function() { _fmSave(st); };
@@ -10135,6 +10158,7 @@ except Exception as ex:
                     ".jpeg": "image/jpeg",
                     ".png": "image/png",
                     ".gif": "image/gif",
+                    ".svg": "image/svg+xml",
                     ".webp": "image/webp",
                 }
                 content_type = fallback_types.get(ext, "application/octet-stream")
@@ -11486,6 +11510,21 @@ except Exception as ex:
             self.send_header("Content-Length", str(len(_resp_body)))
             self.end_headers()
             self.wfile.write(_resp_body)
+        elif path == "/api/files/preview/mermaid.js":
+            if not self._get_authenticated_user():
+                self._send_error(401, "not authenticated")
+                return
+            asset_path = os.path.join(BASE_DIR, "static", "mermaid.min.js")
+            try:
+                asset_size = os.path.getsize(asset_path)
+                with open(asset_path, "rb") as asset:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/javascript; charset=utf-8")
+                    self.send_header("Content-Length", str(asset_size))
+                    self.end_headers()
+                    shutil.copyfileobj(asset, self.wfile)
+            except FileNotFoundError:
+                self._send_error(404, "Mermaid asset not found")
         elif path == "/api/term-hook.js":
             token = get_cookie_token(self.headers)
             username, _port = verify_token(token)
