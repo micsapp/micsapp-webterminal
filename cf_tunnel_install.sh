@@ -860,7 +860,9 @@ deploy_auth_service() {
 
   if ! python3 -c 'import faster_whisper' >/dev/null 2>&1; then
     say "Installing local voice transcription runtime..."
-    python3 -m pip install 'faster-whisper==1.2.1'
+    # NOTE: 1.1.0 is the last release supporting Python 3.8 (Ubuntu 20.04
+    # deploy targets). 1.1.1+ requires Python >=3.9.
+    python3 -m pip install 'faster-whisper==1.1.0'
   fi
 
   # Resolve ttyd full path at install time

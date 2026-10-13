@@ -1,1 +1,7 @@
-faster-whisper==1.2.1
+# NOTE: 1.1.0 is the last release supporting Python 3.8 (Ubuntu 20.04
+# deploy targets). 1.1.1+ requires Python >=3.9, so do NOT bump this pin
+# without also dropping/upgrading those hosts.
+faster-whisper==1.1.0
+# NOTE: tokenizers 0.21.0+ ships no cp38 wheels (build from source fails on
+# py3.8), so cap it. 0.20.1 is the last release with cp38 manylinux wheels.
+tokenizers==0.20.1
