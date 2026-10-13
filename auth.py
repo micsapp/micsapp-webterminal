@@ -9217,17 +9217,22 @@ except Exception as ex:
     sys.stdout.buffer.flush()
 '''
         info = user_instances.get(username)
-        if not info or "password" not in info:
-            self._send_error(500, "no session")
-            return
-        password = info["password"]
+        password = info.get("password") if info else None
+        if password:
+            command = [
+                SSHPASS_BIN, "-p", password, SSH_BIN,
+                "-o", "StrictHostKeyChecking=no",
+                "-o", "PubkeyAuthentication=no",
+                "-o", "ConnectTimeout=5",
+                f"{username}@127.0.0.1", "python3", "-",
+            ]
+        else:
+            # The cookie can outlive an auth service restart. Match run_as_user's
+            # passwordless fallback without buffering a potentially large file.
+            command = ["sudo", "-n", "-u", username, "python3", "-"]
         try:
             proc = subprocess.Popen(
-                [SSHPASS_BIN, "-p", password, SSH_BIN,
-                 "-o", "StrictHostKeyChecking=no",
-                 "-o", "PubkeyAuthentication=no",
-                 "-o", "ConnectTimeout=5",
-                 f"{username}@127.0.0.1", "python3", "-"],
+                command,
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
             )
